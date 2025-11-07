@@ -1,22 +1,22 @@
+mod api_client;
+mod climate;
 mod config;
 
+use crate::climate::ClimateEntity;
 use reqwest;
-use serde_json::Value;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = config::Config::from_env();
-    let client = reqwest::Client::new();
+    let api_client = api_client::ApiClient::new(
+        reqwest::Url::parse(&config.ha_url)?,
+        config.ha_token.clone(),
+    );
 
-    // Get all states
-    let response = client
-        .get(format!("{}/api/states", config.ha_url))
-        .header("Authorization", format!("Bearer {}", config.ha_token))
-        .send()
-        .await?;
+    let mut lounge_trv = ClimateEntity::new("climate.lounge_trv".to_string());
+    lounge_trv.get_state(&api_client).await.unwrap();
 
-    let states: Value = response.json().await?;
-    println!("{:#}", states);
+    println!("{:?}", lounge_trv);
 
     Ok(())
 }
