@@ -1,9 +1,8 @@
-mod api_client;
-mod climate;
-mod config;
-
-use crate::climate::ClimateEntity;
-use reqwest;
+use ha_heating_scheduler::api_client;
+use ha_heating_scheduler::climate::ClimateEntity;
+use ha_heating_scheduler::config;
+use ha_heating_scheduler::schedule::Schedule;
+use ha_heating_scheduler::server::start_server;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -13,10 +12,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         config.ha_token.clone(),
     );
 
+    // Get climate state
     let mut lounge_trv = ClimateEntity::new("climate.lounge_trv".to_string());
-    lounge_trv.get_state(&api_client).await.unwrap();
+    lounge_trv.get_state(&api_client).await?;
 
-    println!("{:?}", lounge_trv);
+    // Create a heating schedule
+    let schedule = Schedule::new("Lounge Heating Schedule");
 
+    start_server(schedule).await;
     Ok(())
 }
