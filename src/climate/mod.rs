@@ -45,6 +45,64 @@ impl ClimateEntity {
         self.info = Some(self.fetch(api_client).await?);
         Ok(())
     }
+
+    /// Turn heating on by setting HVAC mode to 'heat'
+    pub async fn turn_on(&self, api_client: &ApiClient) -> Result<(), anyhow::Error> {
+        let endpoint = "/api/services/climate/set_hvac_mode";
+        let body = serde_json::json!({
+            "entity_id": self.entity_id,
+            "hvac_mode": "heat"
+        });
+
+        api_client
+            .post(endpoint)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| anyhow!(e))?;
+
+        Ok(())
+    }
+
+    /// Turn heating off by setting HVAC mode to 'off'
+    pub async fn turn_off(&self, api_client: &ApiClient) -> Result<(), anyhow::Error> {
+        let endpoint = "/api/services/climate/set_hvac_mode";
+        let body = serde_json::json!({
+            "entity_id": self.entity_id,
+            "hvac_mode": "off"
+        });
+
+        api_client
+            .post(endpoint)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| anyhow!(e))?;
+
+        Ok(())
+    }
+
+    /// Set temperature target
+    pub async fn set_temperature(
+        &self,
+        api_client: &ApiClient,
+        temperature: f64,
+    ) -> Result<(), anyhow::Error> {
+        let endpoint = "/api/services/climate/set_temperature";
+        let body = serde_json::json!({
+            "entity_id": self.entity_id,
+            "temperature": temperature
+        });
+
+        api_client
+            .post(endpoint)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| anyhow!(e))?;
+
+        Ok(())
+    }
 }
 
 impl From<ClimateState> for ClimateInfo {

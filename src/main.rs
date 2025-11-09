@@ -1,8 +1,9 @@
-use ha_heating_scheduler::api_client;
-use ha_heating_scheduler::climate::ClimateEntity;
 use ha_heating_scheduler::config;
 use ha_heating_scheduler::schedule::{HeatingState, Schedule, ScheduleEntry, TimePeriod};
+use ha_heating_scheduler::scheduler::{run_scheduler, SchedulerState};
 use ha_heating_scheduler::server::start_server;
+use ha_heating_scheduler::{api_client, ScheduleState};
+use std::sync::{Arc, RwLock};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -11,10 +12,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         reqwest::Url::parse(&config.ha_url)?,
         config.ha_token.clone(),
     );
-
-    // Get climate state
-    let mut lounge_trv = ClimateEntity::new("climate.lounge_trv".to_string());
-    lounge_trv.get_state(&api_client).await?;
 
     // Create a heating schedule with automatic full-day coverage
     let mut schedule = Schedule::new("Lounge Heating Schedule");
@@ -57,7 +54,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("=== Adding Evening Heating (17:00-22:00) ===");
     schedule.add_entry(ScheduleEntry::new(
         "Evening Heating",
-        TimePeriod::new(17, 0, 22, 0),
+        TimePeriod::new(21, 50, 21, 55),
         HeatingState::On,
     ));
 
@@ -78,7 +75,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "The schedule automatically maintains full 24-hour coverage by splitting existing entries!"
     );
     println!();
+    let schedule: ScheduleState = Arc::new(RwLock::new(schedule));
+    let api_task = tokio::spawn(start_server(Arc::clone(&schedule)));
+    let scheduler_task = tokio::spawn(run_scheduler(SchedulerState { api_client, schedule }));
 
-    start_server(schedule).await;
+    tokio::try_join!(api_task, scheduler_task).unwrap();
     Ok(())
 }

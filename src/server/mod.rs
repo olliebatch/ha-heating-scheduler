@@ -1,20 +1,24 @@
-use crate::schedule::Schedule;
-use crate::server::handlers::get_schedule;
+use crate::server::handlers::{add_schedule_entry, get_schedule};
+use crate::ScheduleState;
+use axum::routing::post;
 use axum::{routing::get, Router};
-use std::sync::{Arc, Mutex};
 use tower_http::cors::CorsLayer;
 
 mod handlers;
 
-pub type AppState = Arc<Mutex<Schedule>>;
+#[derive(Clone, Debug)]
+pub struct AppState {
+    schedule: ScheduleState,
+}
 
-pub async fn start_server(schedule: Schedule) {
-    let state: AppState = Arc::new(Mutex::new(schedule));
+pub async fn start_server(schedule: ScheduleState) {
+    let app_state = AppState { schedule };
     let cors_layer = CorsLayer::permissive();
-    let app = Router::new().route("/", get(|| async { "Hello, World!" }))
+    let app = Router::new()
         .route("/schedule", get(get_schedule))
+        .route("/schedule", post(add_schedule_entry))
         .layer(cors_layer)
-        .with_state(state);
+        .with_state(app_state);
 
     // run our app with hyper, listening globally on port 3000
     let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();

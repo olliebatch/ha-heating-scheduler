@@ -21,4 +21,12 @@ impl ApiClient {
             .get(url)
             .header("Authorization", format!("Bearer {}", self.token))
     }
+
+    pub fn post(&self, endpoint: &str) -> RequestBuilder {
+        let url = self.base_url.join(endpoint).expect("Invalid endpoint");
+        self.client
+            .post(url)
+            .header("Authorization", format!("Bearer {}", self.token))
+            .header("Content-Type", "application/json")
+    }
 }
