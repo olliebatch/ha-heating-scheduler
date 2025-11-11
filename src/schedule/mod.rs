@@ -249,7 +249,6 @@ impl Default for ScheduleEntry {
     }
 }
 
-/// A complete heating schedule containing multiple entries
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Schedule {
     pub name: String,
@@ -257,7 +256,6 @@ pub struct Schedule {
 }
 
 impl Schedule {
-    /// Create a new empty schedule
     pub fn new(name: impl Into<String>) -> Self {
         Schedule {
             name: name.into(),
@@ -265,22 +263,19 @@ impl Schedule {
         }
     }
 
-    /// Get the active schedule entry for a given time
     pub fn get_active_entry(&self, time: &chrono::DateTime<chrono::Local>) -> Option<&ScheduleEntry> {
         let naive_time = time.time();
         self.entries
             .iter()
             .find(|entry| entry.time_period.contains(naive_time))
     }
-
-    /// Get the current heating state based on the schedule at a given time
+    
     pub fn get_current_state(&self, time: &chrono::DateTime<chrono::Local>) -> HeatingState {
         self.get_active_entry(time)
             .map(|entry| entry.heating_state.clone())
             .unwrap_or(HeatingState::Off)
     }
 
-    /// Add an entry to the schedule, automatically splitting existing entries to maintain full coverage
     pub fn add_entry(&mut self, entry: ScheduleEntry) {
         let mut new_entries = Vec::new();
 

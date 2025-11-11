@@ -77,7 +77,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!();
     let schedule: ScheduleState = Arc::new(RwLock::new(schedule));
     let api_task = tokio::spawn(start_server(Arc::clone(&schedule)));
-    let scheduler_task = tokio::spawn(run_scheduler(SchedulerState { api_client, schedule }));
+    let scheduler_task = tokio::spawn(run_scheduler(SchedulerState { api_client, schedule, climate_entity_id: config.climate_entity.clone() }));
 
     tokio::try_join!(api_task, scheduler_task).unwrap();
     Ok(())

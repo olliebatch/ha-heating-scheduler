@@ -9,6 +9,7 @@ use tokio::time::interval;
 pub struct SchedulerState {
     pub api_client: ApiClient,
     pub schedule: ScheduleState,
+    pub climate_entity_id: String,
 }
 
 /// Represents an action to be taken on a climate entity
@@ -66,10 +67,10 @@ pub async fn run_scheduler(state: SchedulerState) {
     let mut interval = interval(Duration::from_secs(5));
     let mut last_state: Option<HeatingState>;
 
-    let mut office_trv = ClimateEntity::new("climate.office_thermostat".to_string());
-    office_trv.get_state(&state.api_client).await.unwrap();
+    let mut climate_entity = ClimateEntity::new(state.climate_entity_id.to_string());
+    climate_entity.get_state(&state.api_client).await.unwrap();
 
-    last_state = Some(office_trv.info.clone().unwrap().state);
+    last_state = Some(climate_entity.info.clone().unwrap().state);
 
     println!("\n=== Heating Scheduler Started ===");
     println!("Checking schedule every 5 seconds...\n");
@@ -108,9 +109,9 @@ pub async fn run_scheduler(state: SchedulerState) {
             // for entity_id in &climate_entities {
             //     let entity = ClimateEntity::new(entity_id.clone());
 
-            if let Err(e) = apply_heating_action(&office_trv, action.clone(), &state.api_client).await
+            if let Err(e) = apply_heating_action(&climate_entity, action.clone(), &state.api_client).await
             {
-                eprintln!("  ✗ Error applying action to {}: {}", &office_trv.entity_id, e);
+                eprintln!("  ✗ Error applying action to {}: {}", &climate_entity.entity_id, e);
             } else {
                 // Update last state only if successful
                 last_state = Some(desired_state.clone());
