@@ -6,10 +6,10 @@ use chrono::Local;
 use std::time::Duration;
 use tokio::time::interval;
 
-pub struct SchedulerState {
+pub struct SchedulerState<T: ClimateEntity> {
     pub api_client: ApiClient,
     pub schedule: ScheduleState,
-    pub climate_entity_id: String,
+    pub climate_entity: T,
 }
 
 /// Represents an action to be taken on a climate entity
@@ -42,37 +42,43 @@ pub fn calculate_heating_action(
 
 /// Apply heating action to a climate entity
 async fn apply_heating_action(
-    entity: &ClimateEntity,
+    entity: &impl ClimateEntity,
     action: HeatingAction,
     api_client: &ApiClient,
 ) -> Result<(), Box<dyn std::error::Error>> {
     match action {
         HeatingAction::TurnOn => {
-            println!("  → Turning ON: {}", entity.entity_id);
             entity.turn_on(api_client).await?;
         }
         HeatingAction::TurnOff => {
-            println!("  → Turning OFF: {}", entity.entity_id);
             entity.turn_off(api_client).await?;
         }
         HeatingAction::NoChange => {
-            println!("  ✓ No change needed: {}", entity.entity_id);
+            println!("  ✓ No change needed: {}", entity.get_entity_id());
         }
     }
     Ok(())
 }
 
 /// Main scheduler loop that runs periodically and applies schedule
-pub async fn run_scheduler(state: SchedulerState) {
+pub async fn run_scheduler<T: ClimateEntity>(mut state: SchedulerState<T>) {
     let mut interval = interval(Duration::from_secs(5));
-    let mut last_state: Option<HeatingState>;
 
-    let mut climate_entity = ClimateEntity::new(state.climate_entity_id.to_string());
-    climate_entity.get_state(&state.api_client).await.unwrap();
-
-    last_state = Some(climate_entity.info.clone().unwrap().state);
-
+    // Fetch initial state from the entity
     println!("\n=== Heating Scheduler Started ===");
+    println!("Fetching initial state for {}...", state.climate_entity.get_entity_id());
+
+    if let Err(e) = state.climate_entity.fetch_and_update_state(&state.api_client).await {
+        eprintln!("Warning: Failed to fetch initial state: {}", e);
+    }
+
+    let mut last_state = state
+        .climate_entity
+        .get_cached_state()
+        .as_ref()
+        .map(|info| info.state.clone());
+
+    println!("Initial state: {:?}", last_state);
     println!("Checking schedule every 5 seconds...\n");
 
     loop {
@@ -90,36 +96,30 @@ pub async fn run_scheduler(state: SchedulerState) {
         let action = calculate_heating_action(last_state.as_ref(), &desired_state);
 
         println!(
-            "{} Action determined {:?}",
+            "[{}] Action: {:?}",
             now.format("%Y-%m-%d %H:%M:%S"),
             action
         );
 
-        //todo turning off triggered twice, it retriggered the turning on.. // first check of last state should be a value from an entity
-        // Only log and apply changes when action is needed
+        // Only apply changes when action is needed
         if action != HeatingAction::NoChange {
             println!(
-                "[{}] Schedule change detected: {:?} → {:?}",
-                now.format("%Y-%m-%d %H:%M:%S"),
+                "  Schedule change: {:?} → {:?}",
                 last_state,
                 desired_state
             );
 
-            // Apply to all climate entities
-            // for entity_id in &climate_entities {
-            //     let entity = ClimateEntity::new(entity_id.clone());
-
-            if let Err(e) = apply_heating_action(&climate_entity, action.clone(), &state.api_client).await
-            {
-                eprintln!("  ✗ Error applying action to {}: {}", &climate_entity.entity_id, e);
+            if let Err(e) = apply_heating_action(&state.climate_entity, action.clone(), &state.api_client).await {
+                eprintln!("  ✗ Error applying action: {}", e);
             } else {
                 // Update last state only if successful
                 last_state = Some(desired_state.clone());
             }
+
+            println!();
         }
     }
 }
-
 
 #[cfg(test)]
 mod tests {

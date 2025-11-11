@@ -1,15 +1,12 @@
 use crate::api_client::ApiClient;
-use crate::climate::climate_state_api::{ApiHeatingState, ClimateState};
+use crate::climate::climate_state_api::{ApiHeatingState, ClimateState as ApiClimateState};
 use crate::schedule::HeatingState;
 use anyhow::anyhow;
 
-mod climate_state_api;
+pub mod climate_state_api;
+pub mod climate;
 
-#[derive(Debug)]
-pub struct ClimateEntity {
-    pub entity_id: String,
-    pub info: Option<ClimateInfo>,
-}
+pub use climate::ClimateEntity;
 
 #[derive(Debug, Clone)]
 pub struct ClimateInfo {
@@ -17,46 +14,51 @@ pub struct ClimateInfo {
     pub state: HeatingState,
 }
 
-impl ClimateEntity {
+#[derive(Debug)]
+pub struct DefaultClimate {
+    pub entity_id: String,
+    pub info: Option<ClimateInfo>,
+}
+
+impl DefaultClimate {
     pub fn new(entity_id: String) -> Self {
-        ClimateEntity {
+        DefaultClimate {
             entity_id,
             info: None,
         }
     }
+}
 
-    async fn fetch(&self, api_client: &ApiClient) -> Result<ClimateInfo, anyhow::Error> {
-        let endpoint = format!("/api/states/{}", self.entity_id);
-        let resp = api_client
-            .get(&endpoint)
-            .send()
-            .await
-            .map_err(|e| anyhow!(e))?
-            .json::<ClimateState>()
-            .await?;
-
-        Ok(resp.into())
+#[async_trait::async_trait]
+impl ClimateEntity for DefaultClimate {
+    fn get_entity_id(&self) -> &str {
+        &self.entity_id
     }
 
-    pub async fn get_state(
-        &mut self,
-        api_client: &ApiClient,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        self.info = Some(self.fetch(api_client).await?);
+    fn get_cached_state(&self) -> &Option<ClimateInfo> {
+        &self.info
+    }
+
+    fn update_cached_state(&mut self, climate_info: Option<ClimateInfo>) {
+        self.info = climate_info;
+    }
+
+    async fn fetch_and_update_state(&mut self, api_client: &ApiClient) -> Result<(), anyhow::Error> {
+        // Actually calls the Home Assistant API
+        let climate_info = api_client.fetch_climate_state(&self.entity_id).await?;
+        self.info = Some(climate_info);
         Ok(())
     }
 
-    /// Turn heating on by setting HVAC mode to 'heat'
-    pub async fn turn_on(&self, api_client: &ApiClient) -> Result<(), anyhow::Error> {
-        println!("Turned on {:?}", self.info);
-        let endpoint = "/api/services/climate/set_hvac_mode";
+    async fn turn_on(&self, api_client: &ApiClient) -> Result<(), anyhow::Error> {
+        println!("  → Turning ON: {}", self.entity_id);
         let body = serde_json::json!({
             "entity_id": self.entity_id,
             "hvac_mode": "heat"
         });
 
         api_client
-            .post(endpoint)
+            .post("/api/services/climate/set_hvac_mode")
             .json(&body)
             .send()
             .await
@@ -65,17 +67,15 @@ impl ClimateEntity {
         Ok(())
     }
 
-    /// Turn heating off by setting HVAC mode to 'off'
-    pub async fn turn_off(&self, api_client: &ApiClient) -> Result<(), anyhow::Error> {
-        println!("Turned off {:?}", self.info);
-        let endpoint = "/api/services/climate/set_hvac_mode";
+    async fn turn_off(&self, api_client: &ApiClient) -> Result<(), anyhow::Error> {
+        println!("  → Turning OFF: {}", self.entity_id);
         let body = serde_json::json!({
             "entity_id": self.entity_id,
             "hvac_mode": "off"
         });
 
         api_client
-            .post(endpoint)
+            .post("/api/services/climate/set_hvac_mode")
             .json(&body)
             .send()
             .await
@@ -83,39 +83,101 @@ impl ClimateEntity {
 
         Ok(())
     }
+}
 
-    /// Set temperature target
-    pub async fn set_temperature(
-        &self,
-        api_client: &ApiClient,
-        temperature: f64,
-    ) -> Result<(), anyhow::Error> {
-        println!("Setting temperature to {:?}", self.info);
-        // let endpoint = "/api/services/climate/set_temperature";
-        // let body = serde_json::json!({
-        //     "entity_id": self.entity_id,
-        //     "temperature": temperature
-        // });
-        //
-        // api_client
-        //     .post(endpoint)
-        //     .json(&body)
-        //     .send()
-        //     .await
-        //     .map_err(|e| anyhow!(e))?;
 
+#[derive(Debug)]
+pub struct MockClimate {
+    pub entity_id: String,
+    pub info: Option<ClimateInfo>,
+}
+
+impl MockClimate {
+    pub fn new(entity_id: String, initial_state: HeatingState) -> Self {
+        MockClimate {
+            entity_id,
+            info: Some(ClimateInfo {
+                current_temperature: 20.0,
+                state: initial_state,
+            }),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl ClimateEntity for MockClimate {
+    fn get_entity_id(&self) -> &str {
+        &self.entity_id
+    }
+
+    fn get_cached_state(&self) -> &Option<ClimateInfo> {
+        &self.info
+    }
+
+    fn update_cached_state(&mut self, climate_info: Option<ClimateInfo>) {
+        self.info = climate_info;
+    }
+
+    async fn fetch_and_update_state(&mut self, _api_client: &ApiClient) -> Result<(), anyhow::Error> {
+        // Mock: doesn't call API, just returns success
+        println!("[MOCK] Fetching state for {} (no API call)", self.entity_id);
+        // Optionally update with mock data
+        self.info = Some(ClimateInfo {
+            current_temperature: 21.0,
+            state: self.info.as_ref().map(|i| i.state.clone()).unwrap_or(HeatingState::Off),
+        });
+        Ok(())
+    }
+
+    async fn turn_on(&self, _api_client: &ApiClient) -> Result<(), anyhow::Error> {
+        println!("[MOCK] Turning ON: {}", self.entity_id);
+        // In a real mock, you might update internal state here
+        Ok(())
+    }
+
+    async fn turn_off(&self, _api_client: &ApiClient) -> Result<(), anyhow::Error> {
+        println!("[MOCK] Turning OFF: {}", self.entity_id);
+        // In a real mock, you might update internal state here
         Ok(())
     }
 }
 
-impl From<ClimateState> for ClimateInfo {
-    fn from(state: ClimateState) -> Self {
+// ============================================================================
+// Conversion from API response to ClimateInfo
+// ============================================================================
+
+impl From<ApiClimateState> for ClimateInfo {
+    fn from(state: ApiClimateState) -> Self {
         ClimateInfo {
             current_temperature: state.attributes.current_temperature,
             state: match state.state {
-                ApiHeatingState::Off => { HeatingState::Off }
-                ApiHeatingState::Heat => { HeatingState::On }
+                ApiHeatingState::Off => HeatingState::Off,
+                ApiHeatingState::Heat => HeatingState::On,
             },
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_mock_climate() {
+        let mut mock = MockClimate::new("climate.test".to_string(), HeatingState::Off);
+
+        // No real API client needed for mock
+        let fake_client = ApiClient::new(
+            reqwest::Url::parse("http://fake").unwrap(),
+            "fake_token".to_string(),
+        );
+
+        // Test fetch doesn't actually call API
+        mock.fetch_and_update_state(&fake_client).await.unwrap();
+        assert!(mock.get_cached_state().is_some());
+
+        // Test controls don't call API
+        mock.turn_on(&fake_client).await.unwrap();
+        mock.turn_off(&fake_client).await.unwrap();
     }
 }

@@ -1,4 +1,7 @@
-use reqwest::{Client, RequestBuilder, Result, Url};
+use crate::climate::climate_state_api::ClimateState;
+use crate::climate::ClimateInfo;
+use anyhow::anyhow;
+use reqwest::{Client, RequestBuilder, Url};
 
 pub struct ApiClient {
     client: Client,
@@ -13,6 +16,19 @@ impl ApiClient {
             base_url,
             token,
         }
+    }
+
+    pub async fn fetch_climate_state(&self, entity_id: &str) -> Result<ClimateInfo, anyhow::Error> {
+        let endpoint = format!("/api/states/{}", entity_id);
+        let resp = self
+            .get(&endpoint)
+            .send()
+            .await
+            .map_err(|e| anyhow!(e))?
+            .json::<ClimateState>()
+            .await?;
+
+        Ok(resp.into())
     }
 
     pub fn get(&self, endpoint: &str) -> RequestBuilder {
