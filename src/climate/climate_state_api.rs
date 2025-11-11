@@ -1,12 +1,26 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ApiHeatingState {
+    Off,
+    Heat,
+}
+
+impl Default for ApiHeatingState {
+    fn default() -> Self {
+        ApiHeatingState::Off
+    }
+}
+
 #[derive(Default, Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ClimateState {
     #[serde(rename = "entity_id")]
     pub entity_id: String,
-    pub state: String,
+    pub state: ApiHeatingState,
     pub attributes: Attributes,
     #[serde(rename = "last_changed")]
     pub last_changed: String,
@@ -29,16 +43,8 @@ pub struct Attributes {
     #[serde(rename = "current_temperature")]
     pub current_temperature: f64,
     pub temperature: Value,
-    #[serde(rename = "occupied_cooling_setpoint")]
-    pub occupied_cooling_setpoint: i64,
-    #[serde(rename = "occupied_heating_setpoint")]
-    pub occupied_heating_setpoint: i64,
-    #[serde(rename = "system_mode")]
-    pub system_mode: String,
     #[serde(rename = "friendly_name")]
     pub friendly_name: String,
-    #[serde(rename = "supported_features")]
-    pub supported_features: i64,
 }
 
 #[derive(Default, Debug, Clone, PartialEq, Serialize, Deserialize)]

@@ -54,7 +54,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("=== Adding Evening Heating (17:00-22:00) ===");
     schedule.add_entry(ScheduleEntry::new(
         "Evening Heating",
-        TimePeriod::new(21, 50, 21, 55),
+        TimePeriod::new(17, 40, 17, 42),
         HeatingState::On,
     ));
 

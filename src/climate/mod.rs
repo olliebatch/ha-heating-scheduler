@@ -1,5 +1,6 @@
 use crate::api_client::ApiClient;
-use crate::climate::climate_state_api::ClimateState;
+use crate::climate::climate_state_api::{ApiHeatingState, ClimateState};
+use crate::schedule::HeatingState;
 use anyhow::anyhow;
 
 mod climate_state_api;
@@ -10,11 +11,10 @@ pub struct ClimateEntity {
     pub info: Option<ClimateInfo>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ClimateInfo {
     pub current_temperature: f64,
-    pub hvac_mode: String,
-    pub state: String,
+    pub state: HeatingState,
 }
 
 impl ClimateEntity {
@@ -48,6 +48,7 @@ impl ClimateEntity {
 
     /// Turn heating on by setting HVAC mode to 'heat'
     pub async fn turn_on(&self, api_client: &ApiClient) -> Result<(), anyhow::Error> {
+        println!("Turned on {:?}", self.info);
         let endpoint = "/api/services/climate/set_hvac_mode";
         let body = serde_json::json!({
             "entity_id": self.entity_id,
@@ -66,6 +67,7 @@ impl ClimateEntity {
 
     /// Turn heating off by setting HVAC mode to 'off'
     pub async fn turn_off(&self, api_client: &ApiClient) -> Result<(), anyhow::Error> {
+        println!("Turned off {:?}", self.info);
         let endpoint = "/api/services/climate/set_hvac_mode";
         let body = serde_json::json!({
             "entity_id": self.entity_id,
@@ -88,18 +90,19 @@ impl ClimateEntity {
         api_client: &ApiClient,
         temperature: f64,
     ) -> Result<(), anyhow::Error> {
-        let endpoint = "/api/services/climate/set_temperature";
-        let body = serde_json::json!({
-            "entity_id": self.entity_id,
-            "temperature": temperature
-        });
-
-        api_client
-            .post(endpoint)
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| anyhow!(e))?;
+        println!("Setting temperature to {:?}", self.info);
+        // let endpoint = "/api/services/climate/set_temperature";
+        // let body = serde_json::json!({
+        //     "entity_id": self.entity_id,
+        //     "temperature": temperature
+        // });
+        //
+        // api_client
+        //     .post(endpoint)
+        //     .json(&body)
+        //     .send()
+        //     .await
+        //     .map_err(|e| anyhow!(e))?;
 
         Ok(())
     }
@@ -109,8 +112,10 @@ impl From<ClimateState> for ClimateInfo {
     fn from(state: ClimateState) -> Self {
         ClimateInfo {
             current_temperature: state.attributes.current_temperature,
-            hvac_mode: state.attributes.system_mode,
-            state: state.state,
+            state: match state.state {
+                ApiHeatingState::Off => { HeatingState::Off }
+                ApiHeatingState::Heat => { HeatingState::On }
+            },
         }
     }
 }

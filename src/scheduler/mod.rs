@@ -64,11 +64,12 @@ async fn apply_heating_action(
 /// Main scheduler loop that runs periodically and applies schedule
 pub async fn run_scheduler(state: SchedulerState) {
     let mut interval = interval(Duration::from_secs(5));
-    let mut last_state: Option<HeatingState> = None;
+    let mut last_state: Option<HeatingState>;
 
-    let mut office_trv = ClimateEntity::new("climate.office_trv".to_string());
+    let mut office_trv = ClimateEntity::new("climate.office_thermostat".to_string());
     office_trv.get_state(&state.api_client).await.unwrap();
 
+    last_state = Some(office_trv.info.clone().unwrap().state);
 
     println!("\n=== Heating Scheduler Started ===");
     println!("Checking schedule every 5 seconds...\n");
