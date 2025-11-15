@@ -2,6 +2,8 @@ use chrono::{NaiveTime, Timelike};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
+pub mod persistence;
+
 /// Represents a time period within a day (e.g., 08:00 - 22:00)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TimePeriod {

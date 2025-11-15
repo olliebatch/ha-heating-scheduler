@@ -9,10 +9,14 @@ mod handlers;
 #[derive(Clone, Debug)]
 pub struct AppState {
     schedule: ScheduleState,
+    schedule_file_path: String,
 }
 
-pub async fn start_server(schedule: ScheduleState) {
-    let app_state = AppState { schedule };
+pub async fn start_server(schedule: ScheduleState, schedule_file_path: String) {
+    let app_state = AppState {
+        schedule,
+        schedule_file_path,
+    };
     let cors_layer = CorsLayer::permissive();
     let app = Router::new()
         .route("/schedule", get(get_schedule))
