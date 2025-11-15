@@ -1,4 +1,4 @@
-use ha_heating_scheduler::climate::{ClimateEntity, DefaultClimate};
+use ha_heating_scheduler::climate::get_initial_states;
 use ha_heating_scheduler::config;
 use ha_heating_scheduler::schedule::{HeatingState, Schedule, ScheduleEntry, TimePeriod};
 use ha_heating_scheduler::scheduler::{run_scheduler, SchedulerState};
@@ -35,7 +35,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("=== Adding Morning Heating (10:00-11:00) ===");
     schedule.add_entry(ScheduleEntry::new(
         "Morning Heating",
-        TimePeriod::new(10, 0, 11, 0),
+        TimePeriod::new(9, 55, 10, 00),
         HeatingState::On,
     ));
 
@@ -55,7 +55,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("=== Adding Evening Heating (17:00-22:00) ===");
     schedule.add_entry(ScheduleEntry::new(
         "Evening Heating",
-        TimePeriod::new(17, 40, 17, 42),
+        TimePeriod::new(19, 45, 20, 30),
         HeatingState::On,
     ));
 
@@ -78,13 +78,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!();
     let schedule: ScheduleState = Arc::new(RwLock::new(schedule));
     let api_task = tokio::spawn(start_server(Arc::clone(&schedule)));
-    let mut climate_entity = DefaultClimate::new(config.climate_entity);
-    climate_entity.fetch_and_update_state(&api_client).await?;
+    let climate_entities = get_initial_states(config.climate_entities).await?;
 
-    println!("Current climate state: {:?}", climate_entity.get_cached_state());
-    println!();
 
-    let scheduler_task = tokio::spawn(run_scheduler(SchedulerState { api_client, schedule, climate_entity }));
+    let scheduler_task = tokio::spawn(run_scheduler(SchedulerState { api_client, schedule, climate_entities }));
 
     tokio::try_join!(api_task, scheduler_task).unwrap();
     Ok(())

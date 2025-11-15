@@ -6,10 +6,10 @@ use chrono::Local;
 use std::time::Duration;
 use tokio::time::interval;
 
-pub struct SchedulerState<T: ClimateEntity> {
+pub struct SchedulerState<T: ClimateEntity + Clone> {
     pub api_client: ApiClient,
     pub schedule: ScheduleState,
-    pub climate_entity: T,
+    pub climate_entities: Vec<T>,
 }
 
 /// Represents an action to be taken on a climate entity
@@ -61,25 +61,10 @@ async fn apply_heating_action(
 }
 
 /// Main scheduler loop that runs periodically and applies schedule
-pub async fn run_scheduler<T: ClimateEntity>(mut state: SchedulerState<T>) {
-    let mut interval = interval(Duration::from_secs(5));
+pub async fn run_scheduler<T: ClimateEntity + Clone>(mut state: SchedulerState<T>) {
+    let mut interval = interval(Duration::from_secs(30));
 
-    // Fetch initial state from the entity
     println!("\n=== Heating Scheduler Started ===");
-    println!("Fetching initial state for {}...", state.climate_entity.get_entity_id());
-
-    if let Err(e) = state.climate_entity.fetch_and_update_state(&state.api_client).await {
-        eprintln!("Warning: Failed to fetch initial state: {}", e);
-    }
-
-    let mut last_state = state
-        .climate_entity
-        .get_cached_state()
-        .as_ref()
-        .map(|info| info.state.clone());
-
-    println!("Initial state: {:?}", last_state);
-    println!("Checking schedule every 5 seconds...\n");
 
     loop {
         interval.tick().await;
@@ -92,32 +77,31 @@ pub async fn run_scheduler<T: ClimateEntity>(mut state: SchedulerState<T>) {
             schedule.get_current_state(&now)
         };
 
-        // Calculate what action to take
-        let action = calculate_heating_action(last_state.as_ref(), &desired_state);
+        for entity in state.climate_entities.iter_mut() {
+            entity.fetch_and_update_state(&state.api_client).await.unwrap();
 
-        println!(
-            "[{}] Action: {:?}",
-            now.format("%Y-%m-%d %H:%M:%S"),
-            action
-        );
+            let heating_state = entity.get_cached_state().clone().unwrap().state;
+            let action = calculate_heating_action(Some(&heating_state), &desired_state);
 
-        // Only apply changes when action is needed
-        if action != HeatingAction::NoChange {
             println!(
-                "  Schedule change: {:?} → {:?}",
-                last_state,
-                desired_state
+                "[{}] Action: {:?}",
+                now.format("%Y-%m-%d %H:%M:%S"),
+                action
             );
 
-            if let Err(e) = apply_heating_action(&state.climate_entity, action.clone(), &state.api_client).await {
-                eprintln!("  ✗ Error applying action: {}", e);
-            } else {
-                // Update last state only if successful
-                last_state = Some(desired_state.clone());
-            }
+            // Only apply changes when action is needed
+            if action != HeatingAction::NoChange {
+                println!(
+                    "  Schedule change: {:?} → {:?}",
+                    heating_state,
+                    desired_state
+                );
 
-            println!();
-        }
+                if let Err(e) = apply_heating_action(entity, action.clone(), &state.api_client).await {
+                    eprintln!("  ✗ Error applying action: {}", e);
+                }
+            }
+        };
     }
 }
 

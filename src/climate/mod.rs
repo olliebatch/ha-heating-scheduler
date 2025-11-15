@@ -14,7 +14,7 @@ pub struct ClimateInfo {
     pub state: HeatingState,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct DefaultClimate {
     pub entity_id: String,
     pub info: Option<ClimateInfo>,
@@ -86,7 +86,7 @@ impl ClimateEntity for DefaultClimate {
 }
 
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct MockClimate {
     pub entity_id: String,
     pub info: Option<ClimateInfo>,
@@ -157,6 +157,18 @@ impl From<ApiClimateState> for ClimateInfo {
         }
     }
 }
+
+
+pub async fn get_initial_states(inital_strings: Vec<String>) -> Result<Vec<DefaultClimate>, anyhow::Error> {
+    let mut initial: Vec<DefaultClimate> = Vec::new();
+    for string in inital_strings {
+        let mut new_climate = DefaultClimate::new(string.as_str().to_string());
+        new_climate.update_cached_state(None);
+        initial.push(new_climate);
+    }
+    Ok(initial)
+}
+
 
 #[cfg(test)]
 mod tests {
