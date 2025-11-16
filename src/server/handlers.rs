@@ -32,6 +32,6 @@ pub async fn add_schedule_entry(
         ));
     }
 
-    println!("Schedule updated and saved to: {}", state.schedule_file_path);
+    println!("Schedule updated and saved");
     Ok(Json(updated_schedule))
 }

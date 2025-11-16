@@ -1,6 +1,7 @@
 use chrono::{NaiveTime, Timelike};
 use serde::{Deserialize, Serialize};
 use std::fmt;
+use uuid::Uuid;
 
 pub mod persistence;
 
@@ -223,6 +224,7 @@ pub enum HeatingState {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ScheduleEntry {
+    pub id: Uuid,
     pub name: String,
     pub time_period: TimePeriod,
     pub heating_state: HeatingState,
@@ -236,6 +238,7 @@ impl ScheduleEntry {
         heating_state: HeatingState,
     ) -> Self {
         ScheduleEntry {
+            id: Uuid::new_v4(),
             name: name.into(),
             time_period,
             heating_state,
@@ -271,7 +274,7 @@ impl Schedule {
             .iter()
             .find(|entry| entry.time_period.contains(naive_time))
     }
-    
+
     pub fn get_current_state(&self, time: &chrono::DateTime<chrono::Local>) -> HeatingState {
         self.get_active_entry(time)
             .map(|entry| entry.heating_state.clone())
@@ -291,6 +294,7 @@ impl Schedule {
                 // Create new entries for each remaining period with the same properties
                 for period in remaining_periods {
                     new_entries.push(ScheduleEntry {
+                        id: Uuid::new_v4(),
                         name: existing.name.clone(),
                         time_period: period,
                         heating_state: existing.heating_state.clone(),

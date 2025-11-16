@@ -2,14 +2,16 @@ pub struct Config {
     pub ha_url: String,
     pub ha_token: String,
     pub climate_entities: Vec<String>,
+    pub data_path: String,
 }
 
 impl Config {
-    pub fn new(ha_url: &str, ha_token: &str, climate_entities: Vec<String>) -> Self {
+    pub fn new(ha_url: &str, ha_token: &str, climate_entities: Vec<String>, data_path: String) -> Self {
         Config {
             ha_url: ha_url.to_string(),
             ha_token: ha_token.to_string(),
             climate_entities,
+            data_path,
         }
     }
 
@@ -18,7 +20,8 @@ impl Config {
         let ha_url = std::env::var("HA_URL").expect("HA_URL must be set");
         let ha_token = std::env::var("HA_TOKEN").expect("HA_TOKEN must be set");
         let climate_entity = std::env::var("CLIMATE_ENTITY").expect("CLIMATE_ENTITY must be set");
+        let data_path = std::env::var("DATA_PATH").expect("DATA_PATH must be set");
         let climates: Vec<String> = climate_entity.split(",").map(|s| s.trim().to_owned()).collect();
-        Config::new(&ha_url, &ha_token, climates)
+        Config::new(&ha_url, &ha_token, climates, data_path)
     }
 }
