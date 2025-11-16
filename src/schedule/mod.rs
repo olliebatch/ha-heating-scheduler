@@ -316,6 +316,48 @@ impl Schedule {
 
         self.entries = new_entries;
     }
+
+    /// Delete an entry by ID and extend the previous entry to fill the gap
+    pub fn delete_entry(&mut self, entry_id: Uuid) -> Result<(), String> {
+        // Find the entry to delete
+        let entry_to_delete = self
+            .entries
+            .iter()
+            .find(|e| e.id == entry_id)
+            .ok_or_else(|| format!("Entry with ID {} not found", entry_id))?;
+
+        let deleted_time_period = entry_to_delete.time_period;
+
+        // Sort entries by start time to find the previous entry
+        let mut sorted_entries = self.entries.clone();
+        sorted_entries.sort_by(|a, b| a.time_period.start.cmp(&b.time_period.start));
+
+        // Find the index of the entry to delete
+        let delete_idx = sorted_entries
+            .iter()
+            .position(|e| e.id == entry_id)
+            .ok_or_else(|| "Entry not found in sorted list".to_string())?;
+
+        // Find the previous entry (wraps around for midnight crossing)
+        let prev_idx = if delete_idx == 0 {
+            sorted_entries.len() - 1
+        } else {
+            delete_idx - 1
+        };
+
+        let prev_entry_id = sorted_entries[prev_idx].id;
+
+        // Remove the entry to delete
+        self.entries.retain(|e| e.id != entry_id);
+
+        // Extend the previous entry to cover the deleted entry's time period
+        if let Some(prev_entry) = self.entries.iter_mut().find(|e| e.id == prev_entry_id) {
+            // The previous entry should now end where the deleted entry ended
+            prev_entry.time_period.end = deleted_time_period.end;
+        }
+
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -528,5 +570,103 @@ mod tests {
 
         let has_large = schedule.entries.iter().any(|e| e.name == "Large");
         assert!(has_large, "Large entry should exist");
+    }
+
+    #[test]
+    fn test_delete_entry_extends_previous() {
+        // Create a schedule with multiple entries
+        let mut schedule = Schedule::new("Test Schedule");
+
+        // Add morning heating (06:00-09:00)
+        schedule.add_entry(ScheduleEntry::new(
+            "Morning",
+            TimePeriod::new(6, 0, 9, 0),
+            HeatingState::On,
+        ));
+
+        // Add work hours (09:00-17:00)
+        schedule.add_entry(ScheduleEntry::new(
+            "Work",
+            TimePeriod::new(9, 0, 17, 0),
+            HeatingState::Off,
+        ));
+
+        // Add evening heating (17:00-22:00)
+        schedule.add_entry(ScheduleEntry::new(
+            "Evening",
+            TimePeriod::new(17, 0, 22, 0),
+            HeatingState::On,
+        ));
+
+        // Should have: 00:00-06:00 (default off), 06:00-09:00 (morning), 09:00-17:00 (work), 17:00-22:00 (evening), 22:00-00:00 (default off)
+        let initial_count = schedule.entries.len();
+        assert!(initial_count >= 4);
+
+        // Find the "Work" entry to delete
+        let work_entry_id = schedule
+            .entries
+            .iter()
+            .find(|e| e.name == "Work")
+            .unwrap()
+            .id;
+
+        // Delete the "Work" entry
+        schedule.delete_entry(work_entry_id).unwrap();
+
+        // Should have one less entry
+        assert_eq!(schedule.entries.len(), initial_count - 1);
+
+        // The "Morning" entry should now extend to 17:00 (covering the deleted work hours)
+        let morning_entry = schedule.entries.iter().find(|e| e.name == "Morning").unwrap();
+        assert_eq!(
+            morning_entry.time_period.end,
+            NaiveTime::from_hms_opt(17, 0, 0).unwrap(),
+            "Morning entry should extend to 17:00 after deleting Work entry"
+        );
+
+        // Verify no gaps: 12:00 (during old work hours) should now be in the Morning entry
+        let noon = NaiveTime::from_hms_opt(12, 0, 0).unwrap();
+        assert!(
+            morning_entry.time_period.contains(noon),
+            "Morning entry should now cover noon (12:00)"
+        );
+    }
+
+    #[test]
+    fn test_delete_entry_wraps_around_midnight() {
+        // Test deleting the first entry (should extend the last entry)
+        let mut schedule = Schedule::new("Test Schedule");
+
+        // Add morning heating
+        schedule.add_entry(ScheduleEntry::new(
+            "Morning",
+            TimePeriod::new(6, 0, 12, 0),
+            HeatingState::On,
+        ));
+
+        // The default entry should have been split into 00:00-06:00 and 12:00-00:00
+        let first_entry_id = schedule
+            .entries
+            .iter()
+            .find(|e| {
+                e.time_period.start == NaiveTime::from_hms_opt(0, 0, 0).unwrap()
+                    && e.time_period.end == NaiveTime::from_hms_opt(6, 0, 0).unwrap()
+            })
+            .unwrap()
+            .id;
+
+        // Delete the first entry (00:00-06:00)
+        schedule.delete_entry(first_entry_id).unwrap();
+
+        // The last entry should now extend to 06:00
+        let last_entry = schedule
+            .entries
+            .iter()
+            .find(|e| e.time_period.end == NaiveTime::from_hms_opt(6, 0, 0).unwrap());
+
+        assert!(
+            last_entry.is_some(),
+            "Last entry should extend to 06:00 after deleting first entry"
+        );
     }
 }

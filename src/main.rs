@@ -1,4 +1,10 @@
-use ha_heating_scheduler::climate::get_initial_states;
+use ha_heating_scheduler::climate::ClimateEntityWrapper;
+#[cfg(debug_assertions)]
+use ha_heating_scheduler::climate::MockClimate;
+#[cfg(debug_assertions)]
+use ha_heating_scheduler::schedule::HeatingState;
+#[cfg(not(debug_assertions))]
+use ha_heating_scheduler::climate::DefaultClimate;
 use ha_heating_scheduler::config;
 use ha_heating_scheduler::schedule::persistence;
 use ha_heating_scheduler::scheduler::{run_scheduler, SchedulerState};
@@ -39,8 +45,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Arc::clone(&schedule),
         schedule_file_path.to_string_lossy().to_string(),
     ));
-    let climate_entities = get_initial_states(config.climate_entities).await?;
 
+    // Use mock climate entities in debug mode, real ones in release mode
+    let climate_entities: Vec<ClimateEntityWrapper> = {
+        #[cfg(debug_assertions)]
+        {
+            println!("=== DEBUG MODE: Using Mock Climate Entities ===");
+            config.climate_entities
+                .into_iter()
+                .map(|entity_id| ClimateEntityWrapper::Mock(MockClimate::new(entity_id, HeatingState::Off)))
+                .collect()
+        }
+
+        #[cfg(not(debug_assertions))]
+        {
+            println!("=== PRODUCTION MODE: Using Real Climate Entities ===");
+            config.climate_entities
+                .into_iter()
+                .map(|entity_id| ClimateEntityWrapper::Real(DefaultClimate::new(entity_id)))
+                .collect()
+        }
+    };
 
     let scheduler_task = tokio::spawn(run_scheduler(SchedulerState { api_client, schedule, climate_entities }));
 

@@ -14,6 +14,58 @@ pub struct ClimateInfo {
     pub state: HeatingState,
 }
 
+/// Wrapper enum to allow using either Mock or Real climate entities
+#[derive(Debug, Clone)]
+pub enum ClimateEntityWrapper {
+    Mock(MockClimate),
+    Real(DefaultClimate),
+}
+
+#[async_trait::async_trait]
+impl ClimateEntity for ClimateEntityWrapper {
+    fn get_entity_id(&self) -> &str {
+        match self {
+            ClimateEntityWrapper::Mock(m) => m.get_entity_id(),
+            ClimateEntityWrapper::Real(r) => r.get_entity_id(),
+        }
+    }
+
+    fn get_cached_state(&self) -> &Option<ClimateInfo> {
+        match self {
+            ClimateEntityWrapper::Mock(m) => m.get_cached_state(),
+            ClimateEntityWrapper::Real(r) => r.get_cached_state(),
+        }
+    }
+
+    fn update_cached_state(&mut self, climate_info: Option<ClimateInfo>) {
+        match self {
+            ClimateEntityWrapper::Mock(m) => m.update_cached_state(climate_info),
+            ClimateEntityWrapper::Real(r) => r.update_cached_state(climate_info),
+        }
+    }
+
+    async fn fetch_and_update_state(&mut self, api_client: &ApiClient) -> Result<(), anyhow::Error> {
+        match self {
+            ClimateEntityWrapper::Mock(m) => m.fetch_and_update_state(api_client).await,
+            ClimateEntityWrapper::Real(r) => r.fetch_and_update_state(api_client).await,
+        }
+    }
+
+    async fn turn_on(&self, api_client: &ApiClient) -> Result<(), anyhow::Error> {
+        match self {
+            ClimateEntityWrapper::Mock(m) => m.turn_on(api_client).await,
+            ClimateEntityWrapper::Real(r) => r.turn_on(api_client).await,
+        }
+    }
+
+    async fn turn_off(&self, api_client: &ApiClient) -> Result<(), anyhow::Error> {
+        match self {
+            ClimateEntityWrapper::Mock(m) => m.turn_off(api_client).await,
+            ClimateEntityWrapper::Real(r) => r.turn_off(api_client).await,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct DefaultClimate {
     pub entity_id: String,

@@ -1,6 +1,6 @@
-use crate::server::handlers::{add_schedule_entry, get_schedule};
+use crate::server::handlers::{add_schedule_entry, delete_schedule_entry, get_schedule};
 use crate::ScheduleState;
-use axum::routing::post;
+use axum::routing::{delete, post};
 use axum::{routing::get, Router};
 use tower_http::cors::CorsLayer;
 
@@ -21,6 +21,7 @@ pub async fn start_server(schedule: ScheduleState, schedule_file_path: String) {
     let app = Router::new()
         .route("/schedule", get(get_schedule))
         .route("/schedule", post(add_schedule_entry))
+        .route("/schedule/{id}", delete(delete_schedule_entry))
         .layer(cors_layer)
         .with_state(app_state);
 
