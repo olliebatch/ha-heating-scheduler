@@ -246,6 +246,20 @@ impl ScheduleEntry {
     }
 }
 
+/// Request DTO for creating a new schedule entry (without ID)
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ScheduleEntryRequest {
+    pub name: String,
+    pub time_period: TimePeriod,
+    pub heating_state: HeatingState,
+}
+
+impl From<ScheduleEntryRequest> for ScheduleEntry {
+    fn from(request: ScheduleEntryRequest) -> Self {
+        ScheduleEntry::new(request.name, request.time_period, request.heating_state)
+    }
+}
+
 impl Default for ScheduleEntry {
     fn default() -> Self {
         // Full day period: 00:00 - 00:00 (represents entire day)

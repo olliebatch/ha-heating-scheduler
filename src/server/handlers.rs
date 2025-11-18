@@ -1,5 +1,5 @@
 use crate::schedule::persistence;
-use crate::schedule::{Schedule, ScheduleEntry};
+use crate::schedule::{Schedule, ScheduleEntry, ScheduleEntryRequest};
 use crate::server::AppState;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
@@ -15,12 +15,15 @@ pub async fn get_schedule(
 
 pub async fn add_schedule_entry(
     State(state): State<AppState>,
-    Json(payload): Json<ScheduleEntry>,
+    Json(payload): Json<ScheduleEntryRequest>,
 ) -> Result<Json<Schedule>, (StatusCode, String)> {
+    // Convert request to ScheduleEntry (generates UUID automatically)
+    let entry: ScheduleEntry = payload.into();
+
     // Add entry to the in-memory schedule
     let updated_schedule = {
         let mut schedule = state.schedule.write().unwrap();
-        schedule.add_entry(payload);
+        schedule.add_entry(entry);
         schedule.clone()
     };
 
