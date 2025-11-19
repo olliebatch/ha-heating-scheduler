@@ -1,20 +1,22 @@
+use crate::climate::{BoostInfo, ClimateEntity};
 use crate::schedule::persistence;
 use crate::schedule::{Schedule, ScheduleEntry, ScheduleEntryRequest};
 use crate::server::AppState;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::Json;
+use chrono::{Duration, Local};
 use uuid::Uuid;
 
-pub async fn get_schedule(
-    State(state): State<AppState>,
+pub async fn get_schedule<T: ClimateEntity + Clone>(
+    State(state): State<AppState<T>>,
 ) -> Json<Schedule> {
     let schedule = state.schedule.read().unwrap().clone();
     Json(schedule)
 }
 
-pub async fn add_schedule_entry(
-    State(state): State<AppState>,
+pub async fn add_schedule_entry<T: ClimateEntity + Clone>(
+    State(state): State<AppState<T>>,
     Json(payload): Json<ScheduleEntryRequest>,
 ) -> Result<Json<Schedule>, (StatusCode, String)> {
     // Convert request to ScheduleEntry (generates UUID automatically)
@@ -40,8 +42,8 @@ pub async fn add_schedule_entry(
     Ok(Json(updated_schedule))
 }
 
-pub async fn delete_schedule_entry(
-    State(state): State<AppState>,
+pub async fn delete_schedule_entry<T: ClimateEntity + Clone>(
+    State(state): State<AppState<T>>,
     Path(entry_id): Path<Uuid>,
 ) -> Result<Json<Schedule>, (StatusCode, String)> {
     // Delete entry from the in-memory schedule
@@ -70,4 +72,22 @@ pub async fn delete_schedule_entry(
 
     println!("Schedule entry deleted and saved");
     Ok(Json(updated_schedule))
+}
+
+
+pub async fn boost_all<T: ClimateEntity + Clone>(
+    State(state): State<AppState<T>>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    if let Ok(mut climates) = state.climate_entities.write() {
+        for entity in climates.iter_mut() {
+            let now = Local::now().time();
+            entity.set_boost(BoostInfo {
+                boosted: true,
+                boost_start: Some(now.clone()),
+                boost_end: Some(now + Duration::minutes(30)),
+            });
+        }
+        return Ok(StatusCode::OK);
+    }
+    Err((StatusCode::INTERNAL_SERVER_ERROR, "Error Locking".to_string()))
 }

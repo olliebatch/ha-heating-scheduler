@@ -2,6 +2,7 @@ use crate::api_client::ApiClient;
 use crate::climate::climate_state_api::{ApiHeatingState, ClimateState as ApiClimateState};
 use crate::schedule::HeatingState;
 use anyhow::anyhow;
+use chrono::NaiveTime;
 
 pub mod climate_state_api;
 pub mod climate;
@@ -12,6 +13,14 @@ pub use climate::ClimateEntity;
 pub struct ClimateInfo {
     pub current_temperature: f64,
     pub state: HeatingState,
+}
+
+
+#[derive(Debug, Default, Clone)]
+pub struct BoostInfo {
+    pub boosted: bool,
+    pub boost_start: Option<NaiveTime>,
+    pub boost_end: Option<NaiveTime>,
 }
 
 /// Wrapper enum to allow using either Mock or Real climate entities
@@ -44,6 +53,19 @@ impl ClimateEntity for ClimateEntityWrapper {
         }
     }
 
+    fn get_boosted_status(&self) -> &BoostInfo {
+        match self {
+            ClimateEntityWrapper::Mock(m) => m.get_boosted_status(),
+            ClimateEntityWrapper::Real(r) => r.get_boosted_status(),
+        }
+    }
+    fn set_boost(&mut self, boost: BoostInfo) {
+        match self {
+            ClimateEntityWrapper::Mock(m) => m.set_boost(boost),
+            ClimateEntityWrapper::Real(r) => r.set_boost(boost),
+        }
+    }
+
     async fn fetch_and_update_state(&mut self, api_client: &ApiClient) -> Result<(), anyhow::Error> {
         match self {
             ClimateEntityWrapper::Mock(m) => m.fetch_and_update_state(api_client).await,
@@ -70,6 +92,7 @@ impl ClimateEntity for ClimateEntityWrapper {
 pub struct DefaultClimate {
     pub entity_id: String,
     pub info: Option<ClimateInfo>,
+    pub boosted: BoostInfo,
 }
 
 impl DefaultClimate {
@@ -77,6 +100,7 @@ impl DefaultClimate {
         DefaultClimate {
             entity_id,
             info: None,
+            boosted: Default::default(),
         }
     }
 }
@@ -93,6 +117,13 @@ impl ClimateEntity for DefaultClimate {
 
     fn update_cached_state(&mut self, climate_info: Option<ClimateInfo>) {
         self.info = climate_info;
+    }
+
+    fn get_boosted_status(&self) -> &BoostInfo {
+        &self.boosted
+    }
+    fn set_boost(&mut self, boost: BoostInfo) {
+        self.boosted = boost;
     }
 
     async fn fetch_and_update_state(&mut self, api_client: &ApiClient) -> Result<(), anyhow::Error> {
@@ -142,6 +173,7 @@ impl ClimateEntity for DefaultClimate {
 pub struct MockClimate {
     pub entity_id: String,
     pub info: Option<ClimateInfo>,
+    pub boosted: BoostInfo,
 }
 
 impl MockClimate {
@@ -152,6 +184,7 @@ impl MockClimate {
                 current_temperature: 20.0,
                 state: initial_state,
             }),
+            boosted: Default::default(),
         }
     }
 }
@@ -168,6 +201,13 @@ impl ClimateEntity for MockClimate {
 
     fn update_cached_state(&mut self, climate_info: Option<ClimateInfo>) {
         self.info = climate_info;
+    }
+
+    fn get_boosted_status(&self) -> &BoostInfo {
+        &self.boosted
+    }
+    fn set_boost(&mut self, boost: BoostInfo) {
+        self.boosted = boost
     }
 
     async fn fetch_and_update_state(&mut self, _api_client: &ApiClient) -> Result<(), anyhow::Error> {
