@@ -1,5 +1,5 @@
-use crate::climate::climate_state_api::ClimateState;
 use crate::climate::ClimateInfo;
+use crate::climate::climate_state_api::ClimateState;
 use anyhow::anyhow;
 use reqwest::{Client, RequestBuilder, Url};
 
@@ -10,6 +10,7 @@ pub struct ApiClient {
 }
 
 impl ApiClient {
+    #[must_use]
     pub fn new(base_url: Url, token: String) -> Self {
         ApiClient {
             client: Client::new(),

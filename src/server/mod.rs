@@ -1,5 +1,5 @@
 use crate::climate::ClimateEntity;
-use crate::server::handlers::{add_schedule_entry, boost_all, delete_schedule_entry, get_schedule};
+use crate::server::handlers::{add_schedule_entry, boost, boost_all, delete_schedule_entry, get_schedule};
 use crate::ScheduleState;
 use axum::routing::{delete, post};
 use axum::{routing::get, Router};
@@ -27,6 +27,7 @@ pub async fn start_server<T: ClimateEntity + Clone + 'static>(schedule: Schedule
         .route("/schedule", post(add_schedule_entry))
         .route("/schedule/{id}", delete(delete_schedule_entry))
         .route("/boost_all", post(boost_all))
+        .route("/boost", post(boost))
         .layer(cors_layer)
         .with_state(app_state);
 

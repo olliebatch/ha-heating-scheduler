@@ -1,7 +1,7 @@
+use crate::ScheduleState;
 use crate::api_client::ApiClient;
 use crate::climate::{BoostInfo, ClimateEntity};
 use crate::schedule::HeatingState;
-use crate::ScheduleState;
 use chrono::Local;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
@@ -22,37 +22,36 @@ pub enum HeatingAction {
 }
 
 /// Calculate what heating action should be taken based on the schedule
+#[must_use]
 pub fn calculate_heating_action_for_schedule(
     current_state: &HeatingState,
     desired_state: &HeatingState,
 ) -> HeatingAction {
     match (current_state, desired_state) {
         // If current state matches desired, no change needed
-        (HeatingState::On, HeatingState::On) => HeatingAction::NoChange,
-        (HeatingState::Off, HeatingState::Off) => HeatingAction::NoChange,
-
+        (HeatingState::On, HeatingState::On) | (HeatingState::Off, HeatingState::Off) => {
+            HeatingAction::NoChange
+        }
         // If states differ, change to desired state
         (HeatingState::Off, HeatingState::On) => HeatingAction::TurnOn,
         (HeatingState::On, HeatingState::Off) => HeatingAction::TurnOff,
     }
 }
+
+// Return a tuple containing the desired heating state and a boolean indicating if the state should be updated
 pub fn calculate_desired_heating_state_for_boost(
-    boost_info: &BoostInfo,
-) -> HeatingState {
-    if !boost_info.boosted {
-        HeatingState::Off
-    } else {
+    boost_info: &Option<BoostInfo>,
+) -> (HeatingState, bool) {
+    if let Some(boosted) = boost_info {
         // Validate that current time is inside the boosted time period
         let now = Local::now().time();
-
-        if let (Some(start), Some(end)) = (boost_info.boost_start, boost_info.boost_end) {
-            // Check if current time is within boost period
-            if now >= start && now <= end {
-                return HeatingState::On;
-            }
+        // Check if current time is within boost period
+        if now >= boosted.boost_start && now <= boosted.boost_end {
+            return (HeatingState::On, false);
         }
-
-        HeatingState::Off
+        (HeatingState::Off, true)
+    } else {
+        (HeatingState::Off, false)
     }
 }
 
@@ -116,29 +115,34 @@ pub async fn run_scheduler<T: ClimateEntity + Clone>(state: SchedulerState<T>) {
 
         // Process entities outside the lock
         for entity in entities_clone.iter_mut() {
-            entity.fetch_and_update_state(&state.api_client).await.unwrap();
-            let boosted_state = calculate_desired_heating_state_for_boost(entity.get_boosted_status());
+            entity
+                .fetch_and_update_state(&state.api_client)
+                .await
+                .unwrap();
+            let (boosted_state, should_update) =
+                calculate_desired_heating_state_for_boost(entity.get_boosted_status());
+            if should_update {
+                entity.set_boost(None);
+            }
             let final_desired_state = final_desired_heating_state(&desired_state, &boosted_state);
 
             let heating_state = entity.get_cached_state().clone().unwrap().state;
 
-            let action = calculate_heating_action_for_schedule(&heating_state, &final_desired_state);
+            let action =
+                calculate_heating_action_for_schedule(&heating_state, &final_desired_state);
 
-            println!(
-                "[{}] Action: {:?}",
-                now.format("%Y-%m-%d %H:%M:%S"),
-                action
-            );
+            println!("[{}] Action: {:?}", now.format("%Y-%m-%d %H:%M:%S"), action);
 
             // Only apply changes when action is needed
             if action != HeatingAction::NoChange {
                 println!(
                     "  Schedule change: {:?} → {:?}",
-                    heating_state,
-                    desired_state
+                    heating_state, desired_state
                 );
 
-                if let Err(e) = apply_heating_action(entity, action.clone(), &state.api_client).await {
+                if let Err(e) =
+                    apply_heating_action(entity, action.clone(), &state.api_client).await
+                {
                     eprintln!("  ✗ Error applying action: {}", e);
                 }
             }

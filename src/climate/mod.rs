@@ -4,8 +4,8 @@ use crate::schedule::HeatingState;
 use anyhow::anyhow;
 use chrono::NaiveTime;
 
-pub mod climate_state_api;
 pub mod climate;
+pub mod climate_state_api;
 
 pub use climate::ClimateEntity;
 
@@ -15,12 +15,10 @@ pub struct ClimateInfo {
     pub state: HeatingState,
 }
 
-
 #[derive(Debug, Default, Clone)]
 pub struct BoostInfo {
-    pub boosted: bool,
-    pub boost_start: Option<NaiveTime>,
-    pub boost_end: Option<NaiveTime>,
+    pub boost_start: NaiveTime,
+    pub boost_end: NaiveTime,
 }
 
 /// Wrapper enum to allow using either Mock or Real climate entities
@@ -53,20 +51,23 @@ impl ClimateEntity for ClimateEntityWrapper {
         }
     }
 
-    fn get_boosted_status(&self) -> &BoostInfo {
+    fn get_boosted_status(&self) -> &Option<BoostInfo> {
         match self {
             ClimateEntityWrapper::Mock(m) => m.get_boosted_status(),
             ClimateEntityWrapper::Real(r) => r.get_boosted_status(),
         }
     }
-    fn set_boost(&mut self, boost: BoostInfo) {
+    fn set_boost(&mut self, boost: Option<BoostInfo>) {
         match self {
             ClimateEntityWrapper::Mock(m) => m.set_boost(boost),
             ClimateEntityWrapper::Real(r) => r.set_boost(boost),
         }
     }
 
-    async fn fetch_and_update_state(&mut self, api_client: &ApiClient) -> Result<(), anyhow::Error> {
+    async fn fetch_and_update_state(
+        &mut self,
+        api_client: &ApiClient,
+    ) -> Result<(), anyhow::Error> {
         match self {
             ClimateEntityWrapper::Mock(m) => m.fetch_and_update_state(api_client).await,
             ClimateEntityWrapper::Real(r) => r.fetch_and_update_state(api_client).await,
@@ -92,7 +93,7 @@ impl ClimateEntity for ClimateEntityWrapper {
 pub struct DefaultClimate {
     pub entity_id: String,
     pub info: Option<ClimateInfo>,
-    pub boosted: BoostInfo,
+    pub boosted: Option<BoostInfo>,
 }
 
 impl DefaultClimate {
@@ -119,14 +120,17 @@ impl ClimateEntity for DefaultClimate {
         self.info = climate_info;
     }
 
-    fn get_boosted_status(&self) -> &BoostInfo {
+    fn get_boosted_status(&self) -> &Option<BoostInfo> {
         &self.boosted
     }
-    fn set_boost(&mut self, boost: BoostInfo) {
+    fn set_boost(&mut self, boost: Option<BoostInfo>) {
         self.boosted = boost;
     }
 
-    async fn fetch_and_update_state(&mut self, api_client: &ApiClient) -> Result<(), anyhow::Error> {
+    async fn fetch_and_update_state(
+        &mut self,
+        api_client: &ApiClient,
+    ) -> Result<(), anyhow::Error> {
         // Actually calls the Home Assistant API
         let climate_info = api_client.fetch_climate_state(&self.entity_id).await?;
         self.info = Some(climate_info);
@@ -168,12 +172,11 @@ impl ClimateEntity for DefaultClimate {
     }
 }
 
-
 #[derive(Debug, Clone)]
 pub struct MockClimate {
     pub entity_id: String,
     pub info: Option<ClimateInfo>,
-    pub boosted: BoostInfo,
+    pub boosted: Option<BoostInfo>,
 }
 
 impl MockClimate {
@@ -203,20 +206,27 @@ impl ClimateEntity for MockClimate {
         self.info = climate_info;
     }
 
-    fn get_boosted_status(&self) -> &BoostInfo {
+    fn get_boosted_status(&self) -> &Option<BoostInfo> {
         &self.boosted
     }
-    fn set_boost(&mut self, boost: BoostInfo) {
-        self.boosted = boost
+    fn set_boost(&mut self, boost: Option<BoostInfo>) {
+        self.boosted = boost;
     }
 
-    async fn fetch_and_update_state(&mut self, _api_client: &ApiClient) -> Result<(), anyhow::Error> {
+    async fn fetch_and_update_state(
+        &mut self,
+        _api_client: &ApiClient,
+    ) -> Result<(), anyhow::Error> {
         // Mock: doesn't call API, just returns success
         println!("[MOCK] Fetching state for {} (no API call)", self.entity_id);
         // Optionally update with mock data
         self.info = Some(ClimateInfo {
             current_temperature: 21.0,
-            state: self.info.as_ref().map(|i| i.state.clone()).unwrap_or(HeatingState::Off),
+            state: self
+                .info
+                .as_ref()
+                .map(|i| i.state.clone())
+                .unwrap_or(HeatingState::Off),
         });
         Ok(())
     }
@@ -250,8 +260,9 @@ impl From<ApiClimateState> for ClimateInfo {
     }
 }
 
-
-pub async fn get_initial_states(inital_strings: Vec<String>) -> Result<Vec<DefaultClimate>, anyhow::Error> {
+pub async fn get_initial_states(
+    inital_strings: Vec<String>,
+) -> Result<Vec<DefaultClimate>, anyhow::Error> {
     let mut initial: Vec<DefaultClimate> = Vec::new();
     for string in inital_strings {
         let mut new_climate = DefaultClimate::new(string.as_str().to_string());
@@ -260,7 +271,6 @@ pub async fn get_initial_states(inital_strings: Vec<String>) -> Result<Vec<Defau
     }
     Ok(initial)
 }
-
 
 #[cfg(test)]
 mod tests {
