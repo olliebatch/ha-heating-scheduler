@@ -1,8 +1,10 @@
-use crate::climate::ClimateEntity;
-use crate::server::handlers::{add_schedule_entry, boost, boost_all, delete_schedule_entry, get_schedule};
 use crate::ScheduleState;
+use crate::climate::ClimateEntity;
+use crate::server::handlers::{
+    add_schedule_entry, boost, boost_all, delete_schedule_entry, get_entities, get_schedule,
+};
 use axum::routing::{delete, post};
-use axum::{routing::get, Router};
+use axum::{Router, routing::get};
 use std::sync::{Arc, RwLock};
 use tower_http::cors::CorsLayer;
 
@@ -15,7 +17,11 @@ pub struct AppState<T: ClimateEntity + Clone> {
     climate_entities: Arc<RwLock<Vec<T>>>,
 }
 
-pub async fn start_server<T: ClimateEntity + Clone + 'static>(schedule: ScheduleState, schedule_file_path: String, climate_entities: Arc<RwLock<Vec<T>>>) {
+pub async fn start_server<T: ClimateEntity + Clone + 'static>(
+    schedule: ScheduleState,
+    schedule_file_path: String,
+    climate_entities: Arc<RwLock<Vec<T>>>,
+) {
     let app_state = AppState {
         schedule,
         schedule_file_path,
@@ -26,6 +32,7 @@ pub async fn start_server<T: ClimateEntity + Clone + 'static>(schedule: Schedule
         .route("/schedule", get(get_schedule))
         .route("/schedule", post(add_schedule_entry))
         .route("/schedule/{id}", delete(delete_schedule_entry))
+        .route("/entities", get(get_entities))
         .route("/boost_all", post(boost_all))
         .route("/boost", post(boost))
         .layer(cors_layer)

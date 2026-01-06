@@ -124,3 +124,43 @@ pub async fn boost<T: ClimateEntity + Clone>(
         "Error Locking".to_string(),
     ))
 }
+
+#[derive(Serialize, Deserialize)]
+pub struct ClimateEntityInfo {
+    pub entity_id: String,
+    pub current_temperature: Option<f64>,
+    pub state: Option<String>,
+    pub boost_active: bool,
+    pub boost_start: Option<String>,
+    pub boost_end: Option<String>,
+}
+
+pub async fn get_entities<T: ClimateEntity + Clone>(
+    State(state): State<AppState<T>>,
+) -> Result<Json<Vec<ClimateEntityInfo>>, (StatusCode, String)> {
+    if let Ok(climates) = state.climate_entities.read() {
+        let entities: Vec<ClimateEntityInfo> = climates
+            .iter()
+            .map(|entity| {
+                let cached_state = entity.get_cached_state();
+                let boost_info = entity.get_boosted_status();
+
+                ClimateEntityInfo {
+                    entity_id: entity.get_entity_id().to_string(),
+                    current_temperature: cached_state.as_ref().map(|s| s.current_temperature),
+                    state: cached_state.as_ref().map(|s| format!("{:?}", s.state)),
+                    boost_active: boost_info.is_some(),
+                    boost_start: boost_info.as_ref().map(|b| b.boost_start.to_string()),
+                    boost_end: boost_info.as_ref().map(|b| b.boost_end.to_string()),
+                }
+            })
+            .collect();
+
+        return Ok(Json(entities));
+    }
+
+    Err((
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "Failed to read climate entities".to_string(),
+    ))
+}
