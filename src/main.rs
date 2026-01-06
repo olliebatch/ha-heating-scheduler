@@ -15,7 +15,8 @@ use std::sync::{Arc, RwLock};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let config = config::Config::from_env();
+    // Load config with persisted entities
+    let config = config::Config::from_env_with_persisted_entities()?;
     let api_client = api_client::ApiClient::new(
         reqwest::Url::parse(&config.ha_url)?,
         config.ha_token.clone(),
@@ -25,6 +26,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     std::fs::create_dir_all(data_dir)?;
 
     let schedule_file_path = data_dir.join("schedule.json");
+    let entities_file_path = data_dir.join("entities.json");
 
     let schedule = persistence::load_or_create_default(&schedule_file_path)?;
     // Use mock climate entities in debug mode, real ones in release mode
@@ -65,6 +67,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Arc::clone(&schedule),
         schedule_file_path.to_string_lossy().to_string(),
         Arc::clone(&climate_entities),
+        entities_file_path.to_string_lossy().to_string(),
     ));
 
 

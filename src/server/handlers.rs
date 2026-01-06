@@ -9,6 +9,14 @@ use chrono::{Duration, Local};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::climate::ClimateEntityWrapper;
+#[cfg(debug_assertions)]
+use crate::climate::MockClimate;
+#[cfg(not(debug_assertions))]
+use crate::climate::DefaultClimate;
+#[cfg(debug_assertions)]
+use crate::schedule::HeatingState;
+
 pub async fn get_schedule<T: ClimateEntity + Clone>(
     State(state): State<AppState<T>>,
 ) -> Json<Schedule> {
@@ -163,4 +171,112 @@ pub async fn get_entities<T: ClimateEntity + Clone>(
         StatusCode::INTERNAL_SERVER_ERROR,
         "Failed to read climate entities".to_string(),
     ))
+}
+
+/// Request body for adding entities
+#[derive(Serialize, Deserialize)]
+pub struct AddEntitiesRequest {
+    pub entity_ids: Vec<String>,
+}
+
+/// Request body for removing an entity
+#[derive(Serialize, Deserialize)]
+pub struct RemoveEntityRequest {
+    pub entity_id: String,
+}
+
+/// Add new climate entities
+pub async fn add_entities(
+    State(state): State<AppState<ClimateEntityWrapper>>,
+    Json(payload): Json<AddEntitiesRequest>,
+) -> Result<Json<Vec<String>>, (StatusCode, String)> {
+    use crate::config::entities_persistence::{save_entities, EntitiesConfig};
+
+    // Get current entity IDs
+    let current_ids: Vec<String> = {
+        let climates = state.climate_entities.read().unwrap();
+        climates.iter().map(|e| e.get_entity_id().to_string()).collect()
+    };
+
+    // Filter out entities that already exist
+    let new_entity_ids: Vec<String> = payload.entity_ids
+        .into_iter()
+        .filter(|id| !current_ids.contains(id))
+        .collect();
+
+    if new_entity_ids.is_empty() {
+        return Ok(Json(current_ids));
+    }
+
+    // Add new entities to the climate_entities list
+    #[cfg(debug_assertions)]
+    {
+        let mut climates = state.climate_entities.write().unwrap();
+        for entity_id in &new_entity_ids {
+            climates.push(ClimateEntityWrapper::Mock(MockClimate::new(
+                entity_id.clone(),
+                HeatingState::Off,
+            )));
+        }
+    }
+
+    #[cfg(not(debug_assertions))]
+    {
+        let mut climates = state.climate_entities.write().unwrap();
+        for entity_id in &new_entity_ids {
+            climates.push(ClimateEntityWrapper::Real(DefaultClimate::new(entity_id.clone())));
+        }
+    }
+
+    // Get updated list
+    let all_entity_ids: Vec<String> = {
+        let climates = state.climate_entities.read().unwrap();
+        climates.iter().map(|e| e.get_entity_id().to_string()).collect()
+    };
+
+    // Persist to disk
+    let entities_config = EntitiesConfig::new(all_entity_ids.clone());
+    if let Err(e) = save_entities(&entities_config, &state.entities_file_path) {
+        eprintln!("Failed to save entities to disk: {}", e);
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to persist entities: {}", e),
+        ));
+    }
+
+    println!("Added {} new entities", new_entity_ids.len());
+    Ok(Json(all_entity_ids))
+}
+
+/// Remove a climate entity
+pub async fn remove_entity(
+    State(state): State<AppState<ClimateEntityWrapper>>,
+    Json(payload): Json<RemoveEntityRequest>,
+) -> Result<Json<Vec<String>>, (StatusCode, String)> {
+    use crate::config::entities_persistence::{save_entities, EntitiesConfig};
+
+    // Remove entity from the list
+    {
+        let mut climates = state.climate_entities.write().unwrap();
+        climates.retain(|e| e.get_entity_id() != payload.entity_id);
+    }
+
+    // Get updated list
+    let all_entity_ids: Vec<String> = {
+        let climates = state.climate_entities.read().unwrap();
+        climates.iter().map(|e| e.get_entity_id().to_string()).collect()
+    };
+
+    // Persist to disk
+    let entities_config = EntitiesConfig::new(all_entity_ids.clone());
+    if let Err(e) = save_entities(&entities_config, &state.entities_file_path) {
+        eprintln!("Failed to save entities to disk: {}", e);
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to persist entities: {}", e),
+        ));
+    }
+
+    println!("Removed entity: {}", payload.entity_id);
+    Ok(Json(all_entity_ids))
 }
