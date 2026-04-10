@@ -115,10 +115,18 @@ pub async fn run_scheduler<T: ClimateEntity + Clone>(state: SchedulerState<T>) {
 
         // Process entities outside the lock
         for entity in entities_clone.iter_mut() {
-            entity
+            if let Err(e) = entity
                 .fetch_and_update_state(&state.api_client)
                 .await
-                .unwrap();
+            {
+                eprintln!(
+                    "[{}] Error fetching state for {}: {}",
+                    now.format("%Y-%m-%d %H:%M:%S"),
+                    entity.get_entity_id(),
+                    e
+                );
+                continue;
+            }
             let (boosted_state, should_update) =
                 calculate_desired_heating_state_for_boost(entity.get_boosted_status());
             if should_update {
