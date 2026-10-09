@@ -32,6 +32,8 @@ pub struct Reason {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Adjusted {
     pub target: f64,
+    /// The scheduled target plus the reasons, before clamping and rounding
+    pub raw: f64,
     pub reasons: Vec<Reason>,
 }
 
@@ -96,13 +98,17 @@ pub fn adjust_target(
     if reasons.is_empty() {
         return Adjusted {
             target: scheduled,
+            raw: scheduled,
             reasons,
         };
     }
     let total: f64 = scheduled + reasons.iter().map(|r| r.delta).sum::<f64>();
-    let clamped = total.clamp(*TARGET_TEMP_RANGE.start(), *TARGET_TEMP_RANGE.end());
+    // Keep the sum at one decimal, as the reasons are
+    let raw = (total * 10.0).round() / 10.0;
+    let clamped = raw.clamp(*TARGET_TEMP_RANGE.start(), *TARGET_TEMP_RANGE.end());
     Adjusted {
         target: (clamped * 2.0).round() / 2.0,
+        raw,
         reasons,
     }
 }
@@ -373,5 +379,16 @@ mod tests {
         let clear = weather(None, None, Some(0.0));
         let adjusted = adjust_target(20.0, &clear, &windows, WindExposure::Medium, at(0, 30));
         assert_eq!(adjusted.target, 18.5);
+    }
+
+    #[test]
+    fn test_raw_shows_the_unrounded_sum() {
+        let cold = |t| weather(Some(t), None, None);
+        let a = adjust_target(20.0, &cold(3.4), &[], WindExposure::Medium, at(9, 0));
+        assert_eq!((a.raw, a.target), (20.2, 20.0));
+        let a = adjust_target(20.0, &cold(3.3), &[], WindExposure::Medium, at(9, 0));
+        assert_eq!((a.raw, a.target), (20.3, 20.5));
+        let a = adjust_target(29.5, &cold(-10.0), &[], WindExposure::Medium, at(9, 0));
+        assert_eq!((a.raw, a.target), (31.0, 30.0));
     }
 }

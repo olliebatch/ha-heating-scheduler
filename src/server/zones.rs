@@ -78,7 +78,11 @@ pub async fn get_zones<T: ClimateEntity + Clone>(
     State(state): State<AppState<T>>,
 ) -> Json<Vec<ZoneView>> {
     let now = Local::now();
-    let weather = state.weather.read().unwrap().weather.clone();
+    // The scheduler's last reading and the targets it is holding, so this shows what it sends
+    let (weather, held) = {
+        let status = state.weather.read().unwrap();
+        (status.weather.clone(), status.held.clone())
+    };
     // Lock order everywhere: schedule sets, then zones
     let sets = state.schedule.read().unwrap();
     let zones = state.zones.read().unwrap();
@@ -88,7 +92,13 @@ pub async fn get_zones<T: ClimateEntity + Clone>(
             .iter()
             .map(|zone| ZoneView {
                 zone: zone.clone(),
-                status: zone_status(Some(zone), &sets, weather.as_ref(), &now),
+                status: zone_status(
+                    Some(zone),
+                    &sets,
+                    weather.as_ref(),
+                    held.get(&zone.id).copied(),
+                    &now,
+                ),
             })
             .collect(),
     )

@@ -1,7 +1,9 @@
 use crate::api_client::ApiClient;
 use anyhow::{Context, Result, anyhow};
+use chrono::{DateTime, Local};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 use std::sync::{Arc, RwLock};
@@ -106,10 +108,28 @@ pub struct WeatherConfig {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct WeatherStatus {
     pub entity_id: Option<String>,
-    /// The last successful reading; None when the last read failed or nothing is configured
+    /// The last good reading, kept for up to [`KEEP_READING_FOR`] while reads fail; None when
+    /// nothing is configured or the last good reading is too old
     pub weather: Option<Weather>,
+    /// When `weather` was read
+    pub read_at: Option<DateTime<Local>>,
+    /// Why the last read failed, if it did
     pub error: Option<String>,
+    /// The adjusted target each zone is held at, by zone id (see `scheduler::zone_status`)
+    #[serde(skip)]
+    pub held: HashMap<uuid::Uuid, Held>,
 }
+
+/// A zone's adjusted target, held until the weather moves it clearly
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Held {
+    /// The scheduled target it was adjusted from
+    pub scheduled: f64,
+    pub target: f64,
+}
+
+/// How long to keep using the last good reading while reads fail
+pub const KEEP_READING_FOR: chrono::TimeDelta = chrono::TimeDelta::minutes(30);
 
 pub fn load_weather_config<P: AsRef<Path>>(path: P) -> Result<WeatherConfig> {
     let path = path.as_ref();

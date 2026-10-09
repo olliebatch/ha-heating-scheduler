@@ -1,9 +1,10 @@
 use crate::api_client::ApiClient;
 use crate::climate::{BoostInfo, ClimateEntity};
 use crate::schedule::HeatingState;
+use crate::schedule::TARGET_TEMP_RANGE;
 use crate::schedule::sets::ScheduleSets;
 use crate::weather::adjust::{Reason, adjust_target};
-use crate::weather::{Weather, WeatherSource};
+use crate::weather::{Held, KEEP_READING_FOR, Weather, WeatherSource};
 use crate::zones::{Zone, Zones};
 use crate::{ScheduleState, WeatherState, ZonesState};
 use chrono::Local;
@@ -12,6 +13,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use tokio::time::interval;
+use uuid::Uuid;
 
 pub struct SchedulerState<T: ClimateEntity + Clone> {
     pub api_client: ApiClient,
@@ -106,22 +108,6 @@ pub struct Scheduled {
     pub target_temp: Option<f64>,
 }
 
-/// What the schedule asks of one entity at `time`: its zone's schedule set, or the active set
-/// when the zone follows the active set, the zone's set no longer exists, or it has no zone
-pub fn scheduled_for(
-    entity_id: &str,
-    sets: &ScheduleSets,
-    zones: &Zones,
-    weather: Option<&Weather>,
-    time: &chrono::DateTime<Local>,
-) -> Scheduled {
-    let status = zone_status(zones.zone_for(entity_id), sets, weather, time);
-    Scheduled {
-        state: status.state,
-        target_temp: status.target,
-    }
-}
-
 /// What a zone is doing right now and why
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct ZoneStatus {
@@ -131,15 +117,29 @@ pub struct ZoneStatus {
     /// The target after weather adjustment (equal to `scheduled_target` without it)
     pub target: Option<f64>,
     pub reasons: Vec<Reason>,
+    /// The scheduled target plus the reasons, before clamping, rounding and holding
+    /// (when the weather was applied)
+    pub raw_target: Option<f64>,
+    /// The target was kept at its previous value because the weather moved it only slightly
+    pub held: bool,
 }
+
+/// How far the unrounded target must move from a held target before the target changes:
+/// 0.25 °C past the rounding boundary, which is itself 0.25 °C away
+const HOLD_BAND: f64 = 0.5;
 
 /// A zone's state and target at `time`: from its schedule set (or the active set when it follows
 /// the active set, its set no longer exists, or there is no zone), adjusted for the weather when
 /// the zone has weather adjust on and is scheduled On. Off is never adjusted.
+///
+/// `held` is the zone's previous adjusted target. While the scheduled target is the same and the
+/// unrounded target stays within [`HOLD_BAND`] of it, the held target is kept, so an outside
+/// temperature wobbling around a rounding boundary doesn't re-command TRVs.
 pub fn zone_status(
     zone: Option<&Zone>,
     sets: &ScheduleSets,
     weather: Option<&Weather>,
+    held: Option<Held>,
     time: &chrono::DateTime<Local>,
 ) -> ZoneStatus {
     let schedule = zone
@@ -164,12 +164,56 @@ pub fn zone_status(
         }
         _ => None,
     };
+    let hold = match (&adjusted, held) {
+        (Some(a), Some(h)) => {
+            let raw = a
+                .raw
+                .clamp(*TARGET_TEMP_RANGE.start(), *TARGET_TEMP_RANGE.end());
+            scheduled_target == Some(h.scheduled)
+                && a.target != h.target
+                && (raw - h.target).abs() < HOLD_BAND
+        }
+        _ => false,
+    };
     ZoneStatus {
         state,
         scheduled_target,
-        target: adjusted.as_ref().map(|a| a.target).or(scheduled_target),
+        target: match (&adjusted, held) {
+            (Some(_), Some(h)) if hold => Some(h.target),
+            (Some(a), _) => Some(a.target),
+            (None, _) => scheduled_target,
+        },
+        raw_target: adjusted.as_ref().map(|a| a.raw),
         reasons: adjusted.map(|a| a.reasons).unwrap_or_default(),
+        held: hold,
     }
+}
+
+/// Every zone's status, holding adjusted targets in `held` between ticks
+pub fn zone_statuses(
+    zones: &Zones,
+    sets: &ScheduleSets,
+    weather: Option<&Weather>,
+    held: &mut HashMap<Uuid, Held>,
+    time: &chrono::DateTime<Local>,
+) -> HashMap<Uuid, ZoneStatus> {
+    let statuses: HashMap<Uuid, ZoneStatus> = zones
+        .zones
+        .iter()
+        .map(|z| {
+            let status = zone_status(Some(z), sets, weather, held.get(&z.id).copied(), time);
+            (z.id, status)
+        })
+        .collect();
+    held.clear();
+    for (id, status) in &statuses {
+        if let (Some(_), Some(scheduled), Some(target)) =
+            (status.raw_target, status.scheduled_target, status.target)
+        {
+            held.insert(*id, Held { scheduled, target });
+        }
+    }
+    statuses
 }
 
 /// Target to set while the heating is On: the scheduled On entry's target, or the default when
@@ -257,21 +301,36 @@ pub async fn apply_schedule_to_entity<T: ClimateEntity>(
 }
 
 /// Read the weather and record the reading (or the error) in `status`
-pub async fn read_weather(status: &WeatherState, source: &dyn WeatherSource) -> Option<Weather> {
+/// If the read fails, the last good reading is kept for up to [`KEEP_READING_FOR`], so a brief
+/// Home Assistant hiccup doesn't change any targets; after that, targets aren't adjusted.
+pub async fn read_weather(
+    status: &WeatherState,
+    source: &dyn WeatherSource,
+    now: chrono::DateTime<Local>,
+) -> Option<Weather> {
     let entity_id = status.read().unwrap().entity_id.clone();
     let result = source.fetch(entity_id.as_deref()).await;
     let mut status = status.write().unwrap();
     match result {
         Ok(weather) => {
+            status.read_at = weather.as_ref().map(|_| now);
             status.weather = weather.clone();
             status.error = None;
             weather
         }
         Err(e) => {
-            eprintln!("Failed to read the weather, not adjusting targets: {}", e);
-            status.weather = None;
             status.error = Some(e.to_string());
-            None
+            let fresh = status
+                .read_at
+                .is_some_and(|at| now - at <= KEEP_READING_FOR);
+            if fresh {
+                eprintln!("Failed to read the weather, using the last reading: {}", e);
+            } else {
+                eprintln!("Failed to read the weather, not adjusting targets: {}", e);
+                status.weather = None;
+                status.read_at = None;
+            }
+            status.weather.clone()
         }
     }
 }
@@ -297,15 +356,33 @@ pub async fn run_scheduler<T: ClimateEntity + Clone>(state: SchedulerState<T>) {
         };
 
         // Read the weather once per tick; without it, targets aren't adjusted
-        let weather = read_weather(&state.weather, state.weather_source.as_ref()).await;
+        let weather = read_weather(&state.weather, state.weather_source.as_ref(), now).await;
 
         // What each entity's zone schedule asks for right now
         let (scheduled, default_target_temp): (Vec<Scheduled>, f64) = {
             let sets = state.schedule.read().unwrap();
             let zones = state.zones.read().unwrap();
+            let mut weather_status = state.weather.write().unwrap();
+            let statuses = zone_statuses(
+                &zones,
+                &sets,
+                weather.as_ref(),
+                &mut weather_status.held,
+                &now,
+            );
+            let no_zone = zone_status(None, &sets, weather.as_ref(), None, &now);
             let scheduled = entities_clone
                 .iter()
-                .map(|e| scheduled_for(e.get_entity_id(), &sets, &zones, weather.as_ref(), &now))
+                .map(|e| {
+                    let status = zones
+                        .zone_for(e.get_entity_id())
+                        .and_then(|z| statuses.get(&z.id))
+                        .unwrap_or(&no_zone);
+                    Scheduled {
+                        state: status.state.clone(),
+                        target_temp: status.target,
+                    }
+                })
                 .collect();
             (scheduled, sets.default_target_temp)
         };
@@ -360,6 +437,21 @@ mod tests {
             calculate_heating_action_for_schedule(&HeatingState::On, &HeatingState::Off),
             HeatingAction::TurnOff
         );
+    }
+
+    /// What an entity's zone asks for, without weather or holding
+    fn scheduled_for(
+        entity_id: &str,
+        sets: &ScheduleSets,
+        zones: &Zones,
+        weather: Option<&Weather>,
+        now: &chrono::DateTime<Local>,
+    ) -> Scheduled {
+        let status = zone_status(zones.zone_for(entity_id), sets, weather, None, now);
+        Scheduled {
+            state: status.state,
+            target_temp: status.target,
+        }
     }
 
     fn scheduled(state: HeatingState, target_temp: Option<f64>) -> Scheduled {
@@ -604,17 +696,29 @@ mod tests {
         let now = Local::now();
         let weather = cold_and_windy();
 
-        let off = zone_status(Some(&zone_with_profile(false)), &sets, Some(&weather), &now);
+        let off = zone_status(
+            Some(&zone_with_profile(false)),
+            &sets,
+            Some(&weather),
+            None,
+            &now,
+        );
         assert_eq!(off.target, Some(20.0));
         assert!(off.reasons.is_empty());
 
-        let on = zone_status(Some(&zone_with_profile(true)), &sets, Some(&weather), &now);
+        let on = zone_status(
+            Some(&zone_with_profile(true)),
+            &sets,
+            Some(&weather),
+            None,
+            &now,
+        );
         assert_eq!(on.scheduled_target, Some(20.0));
         assert_eq!(on.target, Some(22.5));
         assert_eq!(on.reasons.len(), 2);
 
         // No weather reading: the scheduled target as is
-        let unread = zone_status(Some(&zone_with_profile(true)), &sets, None, &now);
+        let unread = zone_status(Some(&zone_with_profile(true)), &sets, None, None, &now);
         assert_eq!(unread.target, Some(20.0));
     }
 
@@ -626,6 +730,7 @@ mod tests {
             Some(&zone_with_profile(true)),
             &sets,
             Some(&cold_and_windy()),
+            None,
             &Local::now(),
         );
         assert_eq!(status.state, HeatingState::Off);
@@ -659,17 +764,144 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_read_weather_records_reading_and_failure() {
+    async fn test_failed_read_keeps_last_reading_for_30_minutes() {
         let status: WeatherState = Default::default();
         let mock = crate::weather::MockWeather::default();
         *mock.weather.write().unwrap() = cold_and_windy();
+        let start = Local::now();
+        let at = |minutes| start + chrono::TimeDelta::minutes(minutes);
 
-        assert_eq!(read_weather(&status, &mock).await, Some(cold_and_windy()));
-        assert_eq!(status.read().unwrap().weather, Some(cold_and_windy()));
+        assert_eq!(
+            read_weather(&status, &mock, at(0)).await,
+            Some(cold_and_windy())
+        );
 
-        assert_eq!(read_weather(&status, &FailingWeather).await, None);
-        let status = status.read().unwrap();
-        assert_eq!(status.weather, None);
-        assert!(status.error.as_deref().unwrap().contains("unreachable"));
+        // Within 30 minutes the last reading is still used
+        assert_eq!(
+            read_weather(&status, &FailingWeather, at(29)).await,
+            Some(cold_and_windy())
+        );
+        assert!(
+            status
+                .read()
+                .unwrap()
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("unreachable")
+        );
+
+        // After that, no adjustment
+        assert_eq!(read_weather(&status, &FailingWeather, at(31)).await, None);
+        assert_eq!(status.read().unwrap().weather, None);
+
+        // A good read clears the error
+        assert_eq!(
+            read_weather(&status, &mock, at(32)).await,
+            Some(cold_and_windy())
+        );
+        assert_eq!(status.read().unwrap().error, None);
+    }
+
+    #[test]
+    fn test_wobbling_weather_holds_the_target() {
+        // Cold only: 3.4 °C gives 20.2 (rounds to 20), 3.3 °C gives 20.3 (rounds to 20.5)
+        let sets = on_all_day(20.0);
+        let mut zones = Zones::default();
+        zones.reconcile(Some(vec![]), &["climate.a".to_string()]);
+        zones.zones[0].weather_adjust = true;
+        let id = zones.zones[0].id;
+        let now = Local::now();
+        let mut held = HashMap::new();
+        let mut target_at = |outside: f64| {
+            let weather = Weather {
+                temperature: Some(outside),
+                ..Default::default()
+            };
+            zone_statuses(&zones, &sets, Some(&weather), &mut held, &now)[&id].clone()
+        };
+
+        assert_eq!(target_at(3.4).target, Some(20.0));
+        for outside in [3.3, 3.4, 3.3, 3.2, 3.4, 3.0] {
+            let status = target_at(outside);
+            assert_eq!(status.target, Some(20.0), "at {} °C: {:?}", outside, status);
+        }
+        // Held when the rounded value differs
+        assert!(target_at(3.3).held);
+
+        // A clear move (raw 20.5, 0.25 past the boundary) changes it
+        assert_eq!(target_at(1.7).target, Some(20.5));
+        // ...and then the new value is held in turn
+        assert_eq!(target_at(3.0).target, Some(20.5));
+        // A move back below 20.0 releases it
+        assert_eq!(target_at(5.0).target, Some(20.0));
+    }
+
+    #[test]
+    fn test_hold_resets_when_the_schedule_changes() {
+        let sets = on_all_day(20.0);
+        let mut zones = Zones::default();
+        zones.reconcile(Some(vec![]), &["climate.a".to_string()]);
+        zones.zones[0].weather_adjust = true;
+        let id = zones.zones[0].id;
+        let weather = Weather {
+            temperature: Some(3.3),
+            ..Default::default()
+        };
+        // Held at 20.0 for a scheduled 20.0...
+        let mut held = HashMap::from([(
+            id,
+            Held {
+                scheduled: 20.0,
+                target: 20.0,
+            },
+        )]);
+        let now = Local::now();
+        assert_eq!(
+            zone_statuses(&zones, &sets, Some(&weather), &mut held, &now)[&id].target,
+            Some(20.0)
+        );
+        // ...but not when the schedule now says 21.0
+        let sets = on_all_day(21.0);
+        assert_eq!(
+            zone_statuses(&zones, &sets, Some(&weather), &mut held, &now)[&id].target,
+            Some(21.5)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_weather_hiccup_sends_nothing() {
+        let sets = on_all_day(20.0);
+        let mut zones = Zones::default();
+        zones.reconcile(Some(vec![]), &["climate.test".to_string()]);
+        zones.zones[0].weather_adjust = true;
+        let id = zones.zones[0].id;
+        let status: WeatherState = Default::default();
+        let mut entity = mock(HeatingState::Off);
+        let source = crate::weather::MockWeather::default();
+        *source.weather.write().unwrap() = cold_and_windy();
+        let mut last = None;
+        let start = Local::now();
+
+        for (minute, ok) in [(0, true), (1, false), (2, false), (3, true)] {
+            let now = start + chrono::TimeDelta::minutes(minute);
+            let weather = if ok {
+                read_weather(&status, &source, now).await
+            } else {
+                read_weather(&status, &FailingWeather, now).await
+            };
+            let zone_status = {
+                let mut status = status.write().unwrap();
+                zone_statuses(&zones, &sets, weather.as_ref(), &mut status.held, &now)[&id].clone()
+            };
+            tick(
+                &mut entity,
+                &scheduled(zone_status.state, zone_status.target),
+                &mut last,
+            )
+            .await;
+        }
+
+        assert_eq!(sent(&entity), vec![22.0], "one send, none for the hiccup");
     }
 }
