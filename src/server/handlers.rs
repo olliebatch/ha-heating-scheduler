@@ -63,6 +63,9 @@ pub async fn add_schedule_entry<T: ClimateEntity + Clone>(
     State(state): State<AppState<T>>,
     Json(payload): Json<ScheduleEntryRequest>,
 ) -> Result<Json<Schedule>, ApiError> {
+    payload
+        .validate()
+        .map_err(|msg| (StatusCode::BAD_REQUEST, msg))?;
     // Convert request to ScheduleEntry (generates UUID automatically)
     let entry: ScheduleEntry = payload.into();
 
@@ -168,6 +171,9 @@ pub async fn add_set_entry<T: ClimateEntity + Clone>(
     Path(set_id): Path<Uuid>,
     Json(payload): Json<ScheduleEntryRequest>,
 ) -> Result<Json<Schedule>, ApiError> {
+    payload
+        .validate()
+        .map_err(|msg| (StatusCode::BAD_REQUEST, msg))?;
     let period = payload.time_period;
     if period.start == period.end && !period.is_full_day() {
         return Err((
@@ -267,6 +273,7 @@ pub async fn boost<T: ClimateEntity + Clone>(
 pub struct ClimateEntityInfo {
     pub entity_id: String,
     pub current_temperature: Option<f64>,
+    pub target_temp: Option<f64>,
     pub state: Option<String>,
     pub boost_active: bool,
     pub boost_start: Option<String>,
@@ -286,6 +293,7 @@ pub async fn get_entities<T: ClimateEntity + Clone>(
                 ClimateEntityInfo {
                     entity_id: entity.get_entity_id().to_string(),
                     current_temperature: cached_state.as_ref().map(|s| s.current_temperature),
+                    target_temp: cached_state.as_ref().and_then(|s| s.target_temp),
                     state: cached_state.as_ref().map(|s| format!("{:?}", s.state)),
                     boost_active: boost_info.is_some(),
                     boost_start: boost_info.as_ref().map(|b| b.boost_start.to_string()),
@@ -456,6 +464,7 @@ mod tests {
             name: "On".to_string(),
             time_period: TimePeriod::new(start, 0, end, 0),
             heating_state: HeatingState::On,
+            target_temp: Some(21.0),
         }
     }
 
@@ -591,5 +600,36 @@ mod tests {
         .await
         .unwrap_err();
         assert_eq!(err.0, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_add_validates_target_temp() {
+        let (state, _dir) = test_state();
+        let set_id = state.schedule.read().unwrap().active_id;
+        let no_target = ScheduleEntryRequest {
+            target_temp: None,
+            ..on(8, 17)
+        };
+        let off_with_target = ScheduleEntryRequest {
+            heating_state: HeatingState::Off,
+            ..on(8, 17)
+        };
+
+        for request in [no_target, off_with_target] {
+            let err = add_set_entry(State(state.clone()), Path(set_id), Json(request.clone()))
+                .await
+                .unwrap_err();
+            assert_eq!(err.0, StatusCode::BAD_REQUEST);
+            let err = add_schedule_entry(State(state.clone()), Json(request))
+                .await
+                .unwrap_err();
+            assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        }
+
+        let added = add_set_entry(State(state.clone()), Path(set_id), Json(on(8, 17)))
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(added.entries[0].target_temp, Some(21.0));
     }
 }

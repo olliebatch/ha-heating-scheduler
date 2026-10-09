@@ -81,6 +81,9 @@ pub struct ScheduleEntry {
     pub name: String,
     pub time_period: TimePeriod,
     pub heating_state: HeatingState,
+    /// Target temperature (°C) for On entries; always None for Off entries
+    #[serde(default)]
+    pub target_temp: Option<f64>,
 }
 
 impl ScheduleEntry {
@@ -95,7 +98,19 @@ impl ScheduleEntry {
             name: name.into(),
             time_period,
             heating_state,
+            target_temp: None,
         }
+    }
+
+    /// Set the target temperature
+    pub fn with_target(mut self, target_temp: f64) -> Self {
+        self.target_temp = Some(target_temp);
+        self
+    }
+
+    /// Same heating state and target, so neighbouring entries can merge
+    fn same_setting(&self, other: &ScheduleEntry) -> bool {
+        self.heating_state == other.heating_state && self.target_temp == other.target_temp
     }
 }
 
@@ -105,11 +120,35 @@ pub struct ScheduleEntryRequest {
     pub name: String,
     pub time_period: TimePeriod,
     pub heating_state: HeatingState,
+    #[serde(default)]
+    pub target_temp: Option<f64>,
+}
+
+/// Allowed target temperatures (°C)
+pub const TARGET_TEMP_RANGE: std::ops::RangeInclusive<f64> = 5.0..=30.0;
+
+impl ScheduleEntryRequest {
+    /// On entries need a target in [`TARGET_TEMP_RANGE`]; Off entries must not have one
+    pub fn validate(&self) -> Result<(), String> {
+        match (&self.heating_state, self.target_temp) {
+            (HeatingState::On, None) => Err("On entries need a target_temp".to_string()),
+            (HeatingState::On, Some(t)) if !TARGET_TEMP_RANGE.contains(&t) => Err(format!(
+                "target_temp must be between {} and {} °C",
+                TARGET_TEMP_RANGE.start(),
+                TARGET_TEMP_RANGE.end()
+            )),
+            (HeatingState::Off, Some(_)) => Err("Off entries can't have a target_temp".to_string()),
+            _ => Ok(()),
+        }
+    }
 }
 
 impl From<ScheduleEntryRequest> for ScheduleEntry {
     fn from(request: ScheduleEntryRequest) -> Self {
-        ScheduleEntry::new(request.name, request.time_period, request.heating_state)
+        ScheduleEntry {
+            target_temp: request.target_temp,
+            ..ScheduleEntry::new(request.name, request.time_period, request.heating_state)
+        }
     }
 }
 
@@ -177,7 +216,7 @@ impl Schedule {
     }
 
     /// Rebuild the entries into the smallest set that covers the day exactly once, with no two
-    /// neighbouring entries (including across midnight) sharing a heating state.
+    /// neighbouring entries (including across midnight) sharing a heating state and target.
     ///
     /// - Where entries overlap, the later entry in `entries` wins.
     /// - A gap is filled by the entry before it, wrapping round midnight.
@@ -238,19 +277,14 @@ impl Schedule {
         for (start, end, owner) in slices {
             let owner = owner.unwrap();
             match runs.last_mut() {
-                Some(run)
-                    if self.entries[run.2].heating_state == self.entries[owner].heating_state =>
-                {
-                    run.1 = end
-                }
+                Some(run) if self.entries[run.2].same_setting(&self.entries[owner]) => run.1 = end,
                 _ => runs.push((start, end, owner)),
             }
         }
 
         // Merge across midnight: the run that starts before midnight takes over the first run
         if runs.len() > 1
-            && self.entries[runs[0].2].heating_state
-                == self.entries[runs[runs.len() - 1].2].heating_state
+            && self.entries[runs[0].2].same_setting(&self.entries[runs[runs.len() - 1].2])
         {
             let first = runs.remove(0);
             runs.last_mut().unwrap().1 = first.1;
@@ -274,6 +308,7 @@ impl Schedule {
                         end: time(end),
                     },
                     heating_state: source.heating_state.clone(),
+                    target_temp: source.target_temp,
                 }
             })
             .collect();
@@ -776,5 +811,46 @@ mod tests {
             }
             assert_normalised(&schedule);
         }
+    }
+
+    #[test]
+    fn test_on_neighbours_with_different_targets_dont_merge() {
+        let mut schedule = Schedule::new("Test");
+        schedule.add_entry(
+            entry("Warm", TimePeriod::new(6, 0, 9, 0), HeatingState::On).with_target(21.0),
+        );
+        schedule.add_entry(
+            entry("Cool", TimePeriod::new(9, 0, 17, 0), HeatingState::On).with_target(18.0),
+        );
+        assert_eq!(schedule.entries.len(), 3);
+
+        schedule.add_entry(
+            entry("Cool too", TimePeriod::new(17, 0, 18, 0), HeatingState::On).with_target(18.0),
+        );
+        let cool: Vec<_> = schedule
+            .entries
+            .iter()
+            .filter(|e| e.target_temp == Some(18.0))
+            .collect();
+        assert_eq!(cool.len(), 1, "same target merges: {:#?}", schedule.entries);
+        assert_eq!(cool[0].time_period, TimePeriod::new(9, 0, 18, 0));
+    }
+
+    #[test]
+    fn test_entry_request_validation() {
+        let request = |state, target_temp| ScheduleEntryRequest {
+            name: "x".to_string(),
+            time_period: TimePeriod::new(8, 0, 9, 0),
+            heating_state: state,
+            target_temp,
+        };
+        assert!(request(HeatingState::On, Some(21.0)).validate().is_ok());
+        assert!(request(HeatingState::On, Some(5.0)).validate().is_ok());
+        assert!(request(HeatingState::On, Some(30.0)).validate().is_ok());
+        assert!(request(HeatingState::Off, None).validate().is_ok());
+        assert!(request(HeatingState::On, None).validate().is_err());
+        assert!(request(HeatingState::On, Some(4.5)).validate().is_err());
+        assert!(request(HeatingState::On, Some(30.5)).validate().is_err());
+        assert!(request(HeatingState::Off, Some(20.0)).validate().is_err());
     }
 }

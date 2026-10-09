@@ -15,4 +15,9 @@ pub trait ClimateEntity: Send + Sync {
     -> Result<(), anyhow::Error>;
     async fn turn_on(&self, api_client: &ApiClient) -> Result<(), anyhow::Error>;
     async fn turn_off(&self, api_client: &ApiClient) -> Result<(), anyhow::Error>;
+    async fn set_temperature(
+        &self,
+        api_client: &ApiClient,
+        temperature: f64,
+    ) -> Result<(), anyhow::Error>;
 }

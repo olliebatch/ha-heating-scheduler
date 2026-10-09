@@ -217,6 +217,14 @@ mod tests {
         assert_eq!(sets.sets.len(), 1);
         assert_eq!(sets.active().name, "Old");
         assert_eq!(sets.active().entries.len(), 2, "migrated set is normalised");
+        let day = &sets.active().entries[0];
+        assert_eq!(day.heating_state, HeatingState::On);
+        assert_eq!(
+            day.target_temp,
+            Some(20.0),
+            "On entries get the default target"
+        );
+        assert_eq!(sets.active().entries[1].target_temp, None);
         assert!(sets_path.exists());
         assert_eq!(fs::read_to_string(&schedule_path).unwrap(), legacy);
 
@@ -254,5 +262,41 @@ mod tests {
         assert_eq!(loaded.active_id, holiday);
         let ids: Vec<_> = loaded.sets.iter().map(|s| s.id).collect();
         assert_eq!(ids, sets.sets.iter().map(|s| s.id).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn test_load_sets_without_targets_uses_stored_default() {
+        let dir = tempdir().unwrap();
+        let sets_path = dir.path().join("schedule_sets.json");
+        // Saved by 0.3.0: no target_temp on entries, no default_target_temp
+        let old = r#"{
+            "active_id": "10000000-0000-4000-8000-000000000000",
+            "sets": [{
+                "id": "10000000-0000-4000-8000-000000000000",
+                "name": "Work week",
+                "entries": [
+                    {"id": "00000000-0000-4000-8000-000000000001", "name": "day",
+                     "time_period": {"start": "06:00:00", "end": "22:00:00"}, "heating_state": "ON"},
+                    {"id": "00000000-0000-4000-8000-000000000002", "name": "night",
+                     "time_period": {"start": "22:00:00", "end": "06:00:00"}, "heating_state": "OFF"}
+                ]
+            }]
+        }"#;
+        fs::write(&sets_path, old).unwrap();
+
+        let sets = load_sets(&sets_path).unwrap();
+        assert_eq!(sets.default_target_temp, 20.0);
+        assert_eq!(sets.active().entries[0].target_temp, Some(20.0));
+        assert_eq!(sets.active().entries[1].target_temp, None);
+
+        // A changed default is kept, and used for entries still missing a target
+        let changed = old.replacen("{", "{\"default_target_temp\": 19.5,", 1);
+        fs::write(&sets_path, changed).unwrap();
+        let sets = load_sets(&sets_path).unwrap();
+        assert_eq!(sets.default_target_temp, 19.5);
+        assert_eq!(sets.active().entries[0].target_temp, Some(19.5));
+
+        save_sets(&sets, &sets_path).unwrap();
+        assert_eq!(load_sets(&sets_path).unwrap().default_target_temp, 19.5);
     }
 }

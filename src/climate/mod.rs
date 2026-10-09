@@ -3,6 +3,7 @@ use crate::climate::climate_state_api::{ApiHeatingState, ClimateState as ApiClim
 use crate::schedule::HeatingState;
 use anyhow::anyhow;
 use chrono::NaiveTime;
+use std::sync::{Arc, Mutex};
 
 pub mod climate;
 pub mod climate_state_api;
@@ -13,6 +14,8 @@ pub use climate::ClimateEntity;
 pub struct ClimateInfo {
     pub current_temperature: f64,
     pub state: HeatingState,
+    /// The entity's target temperature, when it reports one
+    pub target_temp: Option<f64>,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -85,6 +88,17 @@ impl ClimateEntity for ClimateEntityWrapper {
         match self {
             ClimateEntityWrapper::Mock(m) => m.turn_off(api_client).await,
             ClimateEntityWrapper::Real(r) => r.turn_off(api_client).await,
+        }
+    }
+
+    async fn set_temperature(
+        &self,
+        api_client: &ApiClient,
+        temperature: f64,
+    ) -> Result<(), anyhow::Error> {
+        match self {
+            ClimateEntityWrapper::Mock(m) => m.set_temperature(api_client, temperature).await,
+            ClimateEntityWrapper::Real(r) => r.set_temperature(api_client, temperature).await,
         }
     }
 }
@@ -170,6 +184,27 @@ impl ClimateEntity for DefaultClimate {
 
         Ok(())
     }
+
+    async fn set_temperature(
+        &self,
+        api_client: &ApiClient,
+        temperature: f64,
+    ) -> Result<(), anyhow::Error> {
+        println!("  → Setting {} to {}°C", self.entity_id, temperature);
+        let body = serde_json::json!({
+            "entity_id": self.entity_id,
+            "temperature": temperature
+        });
+
+        api_client
+            .post("/api/services/climate/set_temperature")
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| anyhow!(e))?;
+
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -177,6 +212,8 @@ pub struct MockClimate {
     pub entity_id: String,
     pub info: Option<ClimateInfo>,
     pub boosted: Option<BoostInfo>,
+    /// Every temperature passed to `set_temperature`, oldest first
+    pub set_temperatures: Arc<Mutex<Vec<f64>>>,
 }
 
 impl MockClimate {
@@ -186,8 +223,10 @@ impl MockClimate {
             info: Some(ClimateInfo {
                 current_temperature: 20.0,
                 state: initial_state,
+                target_temp: None,
             }),
             boosted: Default::default(),
+            set_temperatures: Default::default(),
         }
     }
 }
@@ -220,6 +259,14 @@ impl ClimateEntity for MockClimate {
         // Mock: doesn't call API, just returns success
         println!("[MOCK] Fetching state for {} (no API call)", self.entity_id);
         // Optionally update with mock data
+        // Report the last temperature set, as Home Assistant would
+        let target_temp = self
+            .set_temperatures
+            .lock()
+            .unwrap()
+            .last()
+            .copied()
+            .or_else(|| self.info.as_ref().and_then(|i| i.target_temp));
         self.info = Some(ClimateInfo {
             current_temperature: 21.0,
             state: self
@@ -227,6 +274,7 @@ impl ClimateEntity for MockClimate {
                 .as_ref()
                 .map(|i| i.state.clone())
                 .unwrap_or(HeatingState::Off),
+            target_temp,
         });
         Ok(())
     }
@@ -240,6 +288,16 @@ impl ClimateEntity for MockClimate {
     async fn turn_off(&self, _api_client: &ApiClient) -> Result<(), anyhow::Error> {
         println!("[MOCK] Turning OFF: {}", self.entity_id);
         // In a real mock, you might update internal state here
+        Ok(())
+    }
+
+    async fn set_temperature(
+        &self,
+        _api_client: &ApiClient,
+        temperature: f64,
+    ) -> Result<(), anyhow::Error> {
+        println!("[MOCK] Setting {} to {}°C", self.entity_id, temperature);
+        self.set_temperatures.lock().unwrap().push(temperature);
         Ok(())
     }
 }
@@ -256,6 +314,8 @@ impl From<ApiClimateState> for ClimateInfo {
                 ApiHeatingState::Off => HeatingState::Off,
                 ApiHeatingState::Heat => HeatingState::On,
             },
+            // null while the entity is off
+            target_temp: state.attributes.temperature.as_f64(),
         }
     }
 }
