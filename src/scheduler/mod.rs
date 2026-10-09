@@ -401,10 +401,6 @@ mod tests {
         last_sent: &mut Option<f64>,
     ) {
         apply_schedule_to_entity(entity, scheduled, 20.0, &fake_client(), last_sent).await;
-        // HA reports heat once turned on; the mock doesn't change its own mode
-        if scheduled.state == HeatingState::On {
-            entity.info.as_mut().unwrap().state = HeatingState::On;
-        }
     }
 
     fn sent(entity: &crate::climate::MockClimate) -> Vec<f64> {
@@ -475,7 +471,6 @@ mod tests {
 
         tick(&mut entity, &on, &mut last).await;
         tick(&mut entity, &scheduled(HeatingState::Off, None), &mut last).await;
-        entity.info.as_mut().unwrap().state = HeatingState::Off;
         tick(&mut entity, &on, &mut last).await;
 
         assert_eq!(sent(&entity), vec![21.0, 21.0]);
