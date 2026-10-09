@@ -108,6 +108,29 @@ pub fn early_start<'a>(
     ))
 }
 
+/// Keep an early start that has begun going until its period starts, whatever the weather does
+/// meanwhile, so a warming reading can't turn the zone Off and On again. Returns the period's
+/// entry while the schedule is still Off and that period (same start) is still ahead within the
+/// lead; None once it starts or if the schedule changed.
+pub fn continue_early_start<'a>(
+    schedule: &'a Schedule,
+    now: NaiveTime,
+    begun: &EarlyStart,
+) -> Option<&'a ScheduleEntry> {
+    let currently_on = schedule
+        .entries
+        .iter()
+        .any(|e| e.heating_state == HeatingState::On && e.time_period.contains(now));
+    if currently_on {
+        return None;
+    }
+    let entry = schedule.entries.iter().find(|e| {
+        e.heating_state == HeatingState::On && e.time_period.start == begun.period_start
+    })?;
+    let until = seconds_until(now, entry.time_period.start);
+    (until > 0 && until <= begun.lead_minutes * 60).then_some(entry)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -223,5 +246,24 @@ mod tests {
         assert_eq!(entry.target_temp, Some(21.0));
         assert_eq!(early.lead_minutes, 15);
         assert_eq!(early.causes, vec![Cause::Cold]);
+    }
+
+    #[test]
+    fn test_continue_early_start() {
+        let morning = schedule(&[(7, 0, 9, 0)]);
+        let begun = EarlyStart {
+            period_start: at(7, 0),
+            lead_minutes: 30,
+            causes: vec![Cause::Cold],
+        };
+
+        assert!(continue_early_start(&morning, at(6, 41), &begun).is_some());
+        assert!(continue_early_start(&morning, at(6, 59), &begun).is_some());
+        // Once the period starts the schedule takes over; outside the lead it's over
+        assert!(continue_early_start(&morning, at(7, 0), &begun).is_none());
+        assert!(continue_early_start(&morning, at(6, 20), &begun).is_none());
+        // The schedule changed so there's no 07:00 period any more
+        let later = schedule(&[(8, 0, 9, 0)]);
+        assert!(continue_early_start(&later, at(6, 45), &begun).is_none());
     }
 }

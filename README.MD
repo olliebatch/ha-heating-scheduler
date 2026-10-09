@@ -77,7 +77,8 @@ outside temperature wobbling around a boundary doesn't re-command TRVs. Off peri
 Early start: with weather adjust on, a zone's next On period starts up to `max_early_start_minutes` early (default
 30, 0 disables) when it's cold or windy: none at 10 °C or warmer outside, the full amount at -2 °C or colder, with
 wind adding up to a quarter (medium exposure) or half (high) of it. The zone then heats to that period's (adjusted)
-target. End times never move, and nothing else turns heating on during an Off period.
+target. Once an early start begins it carries on until the period starts, even if it warms up meanwhile, so the
+heating isn't turned off and on again. End times never move, and nothing else turns heating on during an Off period.
 
 - `GET /weather` - The configured weather entity, the last reading and any error
 - `PUT /weather` - Choose the weather entity: `{"entity_id": "weather.home"}` (`null` to stop); stored in `data/weather.json`
