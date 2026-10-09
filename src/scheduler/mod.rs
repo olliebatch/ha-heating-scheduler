@@ -3,6 +3,7 @@ use crate::api_client::ApiClient;
 use crate::climate::{BoostInfo, ClimateEntity};
 use crate::schedule::HeatingState;
 use chrono::Local;
+use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use tokio::time::interval;
@@ -90,7 +91,6 @@ async fn apply_heating_action(
     Ok(())
 }
 
-/// Main scheduler loop that runs periodically and applies schedule
 /// The heating state and target temperature the active schedule asks for right now
 #[derive(Debug, Clone, PartialEq)]
 pub struct Scheduled {
@@ -116,11 +116,17 @@ pub fn desired_target_temp(
 
 /// Fetch one entity's state and bring it in line with the schedule and any boost.
 /// Turning On sets the mode, then the target temperature.
+///
+/// `last_sent` is the target last sent to this entity successfully. The target is only sent
+/// when it differs from that, or right after turning On, never because the entity reports a
+/// different value: a TRV that rounds or clamps the target would otherwise be re-commanded
+/// every tick. A failed send leaves `last_sent` unchanged, so it is retried on the next tick.
 pub async fn apply_schedule_to_entity<T: ClimateEntity>(
     entity: &mut T,
     scheduled: &Scheduled,
     default_target_temp: f64,
     api_client: &ApiClient,
+    last_sent: &mut Option<f64>,
 ) {
     let now = Local::now();
     if let Err(e) = entity.fetch_and_update_state(api_client).await {
@@ -161,15 +167,13 @@ pub async fn apply_schedule_to_entity<T: ClimateEntity>(
 
     let Some(target) = desired_target_temp(&final_desired_state, scheduled, default_target_temp)
     else {
+        *last_sent = None;
         return;
     };
-    // The cached target is from before any mode change, so always set it after turning On
-    let target_differs = cached
-        .target_temp
-        .is_none_or(|current| (current - target).abs() > 0.05);
-    if action == HeatingAction::TurnOn || target_differs {
-        if let Err(e) = entity.set_temperature(api_client, target).await {
-            eprintln!("  ✗ Error setting temperature: {}", e);
+    if action == HeatingAction::TurnOn || *last_sent != Some(target) {
+        match entity.set_temperature(api_client, target).await {
+            Ok(()) => *last_sent = Some(target),
+            Err(e) => eprintln!("  ✗ Error setting temperature: {}", e),
         }
     }
 }
@@ -179,6 +183,9 @@ pub async fn run_scheduler<T: ClimateEntity + Clone>(state: SchedulerState<T>) {
     let mut interval = interval(Duration::from_secs(15));
 
     println!("\n=== Heating Scheduler Started ===");
+
+    // Last target temperature sent to each entity, by entity id
+    let mut last_sent_targets: HashMap<String, Option<f64>> = HashMap::new();
 
     loop {
         interval.tick().await;
@@ -206,8 +213,17 @@ pub async fn run_scheduler<T: ClimateEntity + Clone>(state: SchedulerState<T>) {
 
         // Process entities outside the lock
         for entity in entities_clone.iter_mut() {
-            apply_schedule_to_entity(entity, &scheduled, default_target_temp, &state.api_client)
-                .await;
+            let last_sent = last_sent_targets
+                .entry(entity.get_entity_id().to_string())
+                .or_default();
+            apply_schedule_to_entity(
+                entity,
+                &scheduled,
+                default_target_temp,
+                &state.api_client,
+                last_sent,
+            )
+            .await;
         }
 
         // Update the shared state with processed entities
@@ -279,53 +295,121 @@ mod tests {
         crate::climate::MockClimate::new("climate.test".to_string(), state)
     }
 
-    #[tokio::test]
-    async fn test_turning_on_sets_target_once() {
-        let mut entity = mock(HeatingState::Off);
-        let on = scheduled(HeatingState::On, Some(21.5));
+    /// One scheduler tick for `entity`
+    async fn tick(
+        entity: &mut crate::climate::MockClimate,
+        scheduled: &Scheduled,
+        last_sent: &mut Option<f64>,
+    ) {
+        apply_schedule_to_entity(entity, scheduled, 20.0, &fake_client(), last_sent).await;
+        // HA reports heat once turned on; the mock doesn't change its own mode
+        if scheduled.state == HeatingState::On {
+            entity.info.as_mut().unwrap().state = HeatingState::On;
+        }
+    }
 
-        apply_schedule_to_entity(&mut entity, &on, 20.0, &fake_client()).await;
-        assert_eq!(*entity.set_temperatures.lock().unwrap(), vec![21.5]);
-
-        // The mock now reports 21.5, so the next tick sets nothing
-        entity.info.as_mut().unwrap().state = HeatingState::On;
-        apply_schedule_to_entity(&mut entity, &on, 20.0, &fake_client()).await;
-        assert_eq!(*entity.set_temperatures.lock().unwrap(), vec![21.5]);
+    fn sent(entity: &crate::climate::MockClimate) -> Vec<f64> {
+        entity.set_temperatures.lock().unwrap().clone()
     }
 
     #[tokio::test]
-    async fn test_target_change_while_on_is_set() {
+    async fn test_turning_on_sets_target_once() {
+        let mut entity = mock(HeatingState::Off);
+        let mut last = None;
+        let on = scheduled(HeatingState::On, Some(21.5));
+
+        tick(&mut entity, &on, &mut last).await;
+        tick(&mut entity, &on, &mut last).await;
+        tick(&mut entity, &on, &mut last).await;
+
+        assert_eq!(sent(&entity), vec![21.5]);
+    }
+
+    #[tokio::test]
+    async fn test_rounding_trv_is_not_recommanded() {
+        let mut entity = mock(HeatingState::Off);
+        entity.target_step = Some(0.5);
+        let mut last = None;
+        let on = scheduled(HeatingState::On, Some(21.3));
+
+        for _ in 0..5 {
+            tick(&mut entity, &on, &mut last).await;
+        }
+
+        // The TRV reports 21.5, but we only sent once
+        assert_eq!(entity.info.as_ref().unwrap().target_temp, Some(21.5));
+        assert_eq!(sent(&entity), vec![21.3]);
+    }
+
+    #[tokio::test]
+    async fn test_target_change_while_on_is_sent_once() {
         let mut entity = mock(HeatingState::On);
-        apply_schedule_to_entity(
+        let mut last = None;
+
+        tick(
             &mut entity,
             &scheduled(HeatingState::On, Some(19.0)),
-            20.0,
-            &fake_client(),
+            &mut last,
         )
         .await;
-        apply_schedule_to_entity(
+        tick(
             &mut entity,
             &scheduled(HeatingState::On, Some(22.0)),
-            20.0,
-            &fake_client(),
+            &mut last,
+        )
+        .await;
+        tick(
+            &mut entity,
+            &scheduled(HeatingState::On, Some(22.0)),
+            &mut last,
         )
         .await;
 
-        assert_eq!(*entity.set_temperatures.lock().unwrap(), vec![19.0, 22.0]);
+        assert_eq!(sent(&entity), vec![19.0, 22.0]);
+    }
+
+    #[tokio::test]
+    async fn test_turning_on_again_resends_same_target() {
+        let mut entity = mock(HeatingState::Off);
+        let mut last = None;
+        let on = scheduled(HeatingState::On, Some(21.0));
+
+        tick(&mut entity, &on, &mut last).await;
+        tick(&mut entity, &scheduled(HeatingState::Off, None), &mut last).await;
+        entity.info.as_mut().unwrap().state = HeatingState::Off;
+        tick(&mut entity, &on, &mut last).await;
+
+        assert_eq!(sent(&entity), vec![21.0, 21.0]);
+    }
+
+    #[tokio::test]
+    async fn test_failed_send_retries_once_per_tick() {
+        let mut entity = mock(HeatingState::On);
+        entity.fail_set_temperature = true;
+        let mut last = None;
+        let on = scheduled(HeatingState::On, Some(21.0));
+
+        tick(&mut entity, &on, &mut last).await;
+        tick(&mut entity, &on, &mut last).await;
+        assert_eq!(sent(&entity), vec![21.0, 21.0], "one attempt per tick");
+        assert_eq!(last, None);
+
+        entity.fail_set_temperature = false;
+        tick(&mut entity, &on, &mut last).await;
+        tick(&mut entity, &on, &mut last).await;
+        assert_eq!(sent(&entity).len(), 3, "stops once a send succeeds");
+        assert_eq!(last, Some(21.0));
     }
 
     #[tokio::test]
     async fn test_off_sets_no_temperature() {
         let mut entity = mock(HeatingState::On);
-        apply_schedule_to_entity(
-            &mut entity,
-            &scheduled(HeatingState::Off, None),
-            20.0,
-            &fake_client(),
-        )
-        .await;
+        let mut last = Some(21.0);
 
-        assert!(entity.set_temperatures.lock().unwrap().is_empty());
+        tick(&mut entity, &scheduled(HeatingState::Off, None), &mut last).await;
+
+        assert!(sent(&entity).is_empty());
+        assert_eq!(last, None);
     }
 
     #[tokio::test]
@@ -340,15 +424,10 @@ mod tests {
             boost_start: now,
             boost_end,
         }));
+        let mut last = None;
 
-        apply_schedule_to_entity(
-            &mut entity,
-            &scheduled(HeatingState::Off, None),
-            20.0,
-            &fake_client(),
-        )
-        .await;
+        tick(&mut entity, &scheduled(HeatingState::Off, None), &mut last).await;
 
-        assert_eq!(*entity.set_temperatures.lock().unwrap(), vec![20.0]);
+        assert_eq!(sent(&entity), vec![20.0]);
     }
 }

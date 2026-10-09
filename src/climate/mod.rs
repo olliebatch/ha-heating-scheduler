@@ -201,6 +201,7 @@ impl ClimateEntity for DefaultClimate {
             .json(&body)
             .send()
             .await
+            .and_then(|response| response.error_for_status())
             .map_err(|e| anyhow!(e))?;
 
         Ok(())
@@ -214,6 +215,10 @@ pub struct MockClimate {
     pub boosted: Option<BoostInfo>,
     /// Every temperature passed to `set_temperature`, oldest first
     pub set_temperatures: Arc<Mutex<Vec<f64>>>,
+    /// Report targets rounded to this step, like a TRV that only takes 0.5 °C steps
+    pub target_step: Option<f64>,
+    /// Make `set_temperature` fail, like a rejected HA call
+    pub fail_set_temperature: bool,
 }
 
 impl MockClimate {
@@ -227,6 +232,8 @@ impl MockClimate {
             }),
             boosted: Default::default(),
             set_temperatures: Default::default(),
+            target_step: None,
+            fail_set_temperature: false,
         }
     }
 }
@@ -265,7 +272,10 @@ impl ClimateEntity for MockClimate {
             .lock()
             .unwrap()
             .last()
-            .copied()
+            .map(|t| match self.target_step {
+                Some(step) => (t / step).round() * step,
+                None => *t,
+            })
             .or_else(|| self.info.as_ref().and_then(|i| i.target_temp));
         self.info = Some(ClimateInfo {
             current_temperature: 21.0,
@@ -298,6 +308,9 @@ impl ClimateEntity for MockClimate {
     ) -> Result<(), anyhow::Error> {
         println!("[MOCK] Setting {} to {}°C", self.entity_id, temperature);
         self.set_temperatures.lock().unwrap().push(temperature);
+        if self.fail_set_temperature {
+            return Err(anyhow!("mock set_temperature failure"));
+        }
         Ok(())
     }
 }
