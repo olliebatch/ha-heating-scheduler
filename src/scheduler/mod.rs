@@ -1,7 +1,9 @@
-use crate::ScheduleState;
 use crate::api_client::ApiClient;
 use crate::climate::{BoostInfo, ClimateEntity};
 use crate::schedule::HeatingState;
+use crate::schedule::sets::ScheduleSets;
+use crate::zones::Zones;
+use crate::{ScheduleState, ZonesState};
 use chrono::Local;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
@@ -11,6 +13,7 @@ use tokio::time::interval;
 pub struct SchedulerState<T: ClimateEntity + Clone> {
     pub api_client: ApiClient,
     pub schedule: ScheduleState,
+    pub zones: ZonesState,
     pub climate_entities: Arc<RwLock<Vec<T>>>,
 }
 
@@ -96,6 +99,28 @@ async fn apply_heating_action(
 pub struct Scheduled {
     pub state: HeatingState,
     pub target_temp: Option<f64>,
+}
+
+/// What the schedule asks of one entity at `time`: its zone's schedule set, or the active set
+/// when the zone follows the active set, the zone's set no longer exists, or it has no zone
+pub fn scheduled_for(
+    entity_id: &str,
+    sets: &ScheduleSets,
+    zones: &Zones,
+    time: &chrono::DateTime<Local>,
+) -> Scheduled {
+    let schedule = zones
+        .zone_for(entity_id)
+        .and_then(|z| z.schedule_set_id)
+        .and_then(|id| sets.get(id))
+        .unwrap_or_else(|| sets.active());
+    let entry = schedule.get_active_entry(time);
+    Scheduled {
+        state: entry
+            .map(|e| e.heating_state.clone())
+            .unwrap_or(HeatingState::Off),
+        target_temp: entry.and_then(|e| e.target_temp),
+    }
 }
 
 /// Target to set while the heating is On: the scheduled On entry's target, or the default when
@@ -192,33 +217,31 @@ pub async fn run_scheduler<T: ClimateEntity + Clone>(state: SchedulerState<T>) {
 
         let now = Local::now();
 
-        // Get current scheduled state and target
-        let (scheduled, default_target_temp) = {
-            let sets = state.schedule.read().unwrap();
-            let entry = sets.active().get_active_entry(&now);
-            let scheduled = Scheduled {
-                state: entry
-                    .map(|e| e.heating_state.clone())
-                    .unwrap_or(HeatingState::Off),
-                target_temp: entry.and_then(|e| e.target_temp),
-            };
-            (scheduled, sets.default_target_temp)
-        };
-
         // Clone entities to avoid holding lock across await points
         let mut entities_clone = {
             let climates = state.climate_entities.read().unwrap();
             climates.clone()
         };
 
+        // What each entity's zone schedule asks for right now
+        let (scheduled, default_target_temp): (Vec<Scheduled>, f64) = {
+            let sets = state.schedule.read().unwrap();
+            let zones = state.zones.read().unwrap();
+            let scheduled = entities_clone
+                .iter()
+                .map(|e| scheduled_for(e.get_entity_id(), &sets, &zones, &now))
+                .collect();
+            (scheduled, sets.default_target_temp)
+        };
+
         // Process entities outside the lock
-        for entity in entities_clone.iter_mut() {
+        for (entity, scheduled) in entities_clone.iter_mut().zip(&scheduled) {
             let last_sent = last_sent_targets
                 .entry(entity.get_entity_id().to_string())
                 .or_default();
             apply_schedule_to_entity(
                 entity,
-                &scheduled,
+                scheduled,
                 default_target_temp,
                 &state.api_client,
                 last_sent,
@@ -429,5 +452,51 @@ mod tests {
         tick(&mut entity, &scheduled(HeatingState::Off, None), &mut last).await;
 
         assert_eq!(sent(&entity), vec![20.0]);
+    }
+
+    #[test]
+    fn test_scheduled_for_follows_zone_set() {
+        use crate::schedule::{Schedule, ScheduleEntry, TimePeriod};
+        use crate::zones::areas::Area;
+
+        // Active set: Off all day. "Warm" set: On 21.0 all day.
+        let mut sets = ScheduleSets::from_schedule(Schedule::new("Off"));
+        let warm = sets.create("Warm", None).unwrap().id;
+        sets.get_mut(warm).unwrap().add_entry(
+            ScheduleEntry::new("All day", TimePeriod::new(0, 0, 0, 0), HeatingState::On)
+                .with_target(21.0),
+        );
+
+        let managed = vec!["climate.study".to_string(), "climate.loft".to_string()];
+        let mut zones = Zones::default();
+        let study_area = Area {
+            id: "study".to_string(),
+            name: "Study".to_string(),
+            entities: vec!["climate.study".to_string()],
+        };
+        zones.reconcile(Some(vec![study_area]), &managed);
+        let study = zones.zone_for("climate.study").unwrap().id;
+        let now = Local::now();
+
+        // Every zone follows the active set until assigned one
+        assert_eq!(
+            scheduled_for("climate.study", &sets, &zones, &now),
+            scheduled(HeatingState::Off, None)
+        );
+
+        zones.set_schedule_set(study, Some(warm)).unwrap();
+        assert_eq!(
+            scheduled_for("climate.study", &sets, &zones, &now),
+            scheduled(HeatingState::On, Some(21.0))
+        );
+        assert_eq!(
+            scheduled_for("climate.loft", &sets, &zones, &now),
+            scheduled(HeatingState::Off, None)
+        );
+        // An entity in no zone follows the active set
+        assert_eq!(
+            scheduled_for("climate.unknown", &sets, &zones, &now),
+            scheduled(HeatingState::Off, None)
+        );
     }
 }
