@@ -36,8 +36,8 @@ pub fn load_entities<P: AsRef<Path>>(path: P) -> Result<EntitiesConfig> {
 /// Save entities to a JSON file
 pub fn save_entities<P: AsRef<Path>>(entities: &EntitiesConfig, path: P) -> Result<()> {
     let path = path.as_ref();
-    let json = serde_json::to_string_pretty(entities)
-        .context("Failed to serialize entities to JSON")?;
+    let json =
+        serde_json::to_string_pretty(entities).context("Failed to serialize entities to JSON")?;
 
     fs::write(path, json)
         .with_context(|| format!("Failed to write entities file: {}", path.display()))?;
@@ -59,8 +59,7 @@ pub fn load_or_create_default<P: AsRef<Path>>(path: P) -> Result<EntitiesConfig>
         let entities = EntitiesConfig::default();
 
         // Save the default entities for next time
-        save_entities(&entities, path)
-            .context("Failed to save default entities config")?;
+        save_entities(&entities, path).context("Failed to save default entities config")?;
 
         println!("Empty entities config saved to: {}", path.display());
         Ok(entities)
@@ -105,6 +104,9 @@ mod tests {
 
         // Second call should load existing
         let entities2 = load_or_create_default(&file_path).unwrap();
-        assert_eq!(entities1.climate_entities.len(), entities2.climate_entities.len());
+        assert_eq!(
+            entities1.climate_entities.len(),
+            entities2.climate_entities.len()
+        );
     }
 }

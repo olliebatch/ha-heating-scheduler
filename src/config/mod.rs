@@ -10,7 +10,12 @@ pub struct Config {
 }
 
 impl Config {
-    pub fn new(ha_url: &str, ha_token: &str, climate_entities: Vec<String>, data_path: String) -> Self {
+    pub fn new(
+        ha_url: &str,
+        ha_token: &str,
+        climate_entities: Vec<String>,
+        data_path: String,
+    ) -> Self {
         Config {
             ha_url: ha_url.to_string(),
             ha_token: ha_token.to_string(),
@@ -27,7 +32,10 @@ impl Config {
         let ha_token = std::env::var("HA_TOKEN").expect("HA_TOKEN must be set");
         let climate_entity = std::env::var("CLIMATE_ENTITY").expect("CLIMATE_ENTITY must be set");
         let data_path = std::env::var("DATA_PATH").expect("DATA_PATH must be set");
-        let climates: Vec<String> = climate_entity.split(",").map(|s| s.trim().to_owned()).collect();
+        let climates: Vec<String> = climate_entity
+            .split(",")
+            .map(|s| s.trim().to_owned())
+            .collect();
         Config::new(&ha_url, &ha_token, climates, data_path)
     }
 
@@ -48,15 +56,29 @@ impl Config {
             // Fall back to environment variable if no entities in file
             println!("No entities in persisted file, checking environment variable...");
             if let Ok(climate_entity) = std::env::var("CLIMATE_ENTITY") {
-                let climates: Vec<String> = climate_entity.split(",").map(|s| s.trim().to_owned()).collect();
-                println!("Loaded {} entities from CLIMATE_ENTITY env var", climates.len());
+                let climates: Vec<String> = climate_entity
+                    .split(",")
+                    .map(|s| s.trim().to_owned())
+                    .collect();
+                println!(
+                    "Loaded {} entities from CLIMATE_ENTITY env var",
+                    climates.len()
+                );
 
                 // Save to file so next time we don't need the env var
                 let new_config = entities_persistence::EntitiesConfig::new(climates.clone());
-                if let Err(e) = entities_persistence::save_entities(&new_config, &entities_file_path) {
-                    eprintln!("Warning: Failed to save entities from env var to file: {}", e);
+                if let Err(e) =
+                    entities_persistence::save_entities(&new_config, &entities_file_path)
+                {
+                    eprintln!(
+                        "Warning: Failed to save entities from env var to file: {}",
+                        e
+                    );
                 } else {
-                    println!("Saved entities to {} for future use", entities_file_path.display());
+                    println!(
+                        "Saved entities to {} for future use",
+                        entities_file_path.display()
+                    );
                     println!("You can now remove CLIMATE_ENTITY from your .env file");
                 }
 
@@ -66,7 +88,10 @@ impl Config {
                 Vec::new()
             }
         } else {
-            println!("Loaded {} entities from persisted file", entities_config.climate_entities.len());
+            println!(
+                "Loaded {} entities from persisted file",
+                entities_config.climate_entities.len()
+            );
             entities_config.climate_entities
         };
 
