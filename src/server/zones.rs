@@ -33,20 +33,17 @@ pub fn managed_entity_ids<T: ClimateEntity + Clone>(state: &AppState<T>) -> Vec<
         .collect()
 }
 
-/// Apply `change` to the zones under the write lock, then persist them.
+/// Apply `change` to the zones and persist them, all under the write lock.
 /// `change` must not modify the zones when it returns an error.
 fn update_zones<T: ClimateEntity + Clone, R>(
     state: &AppState<T>,
     change: impl FnOnce(&mut Zones, &[String]) -> Result<R, ApiError>,
 ) -> Result<R, ApiError> {
     let managed = managed_entity_ids(state);
-    let (result, snapshot) = {
-        let mut zones = state.zones.write().unwrap();
-        let result = change(&mut zones, &managed)?;
-        (result, zones.clone())
-    };
-
-    if let Err(e) = save_zones(&snapshot, &state.zones_file_path) {
+    // Save while still holding the lock, so concurrent changes reach disk in order
+    let mut zones = state.zones.write().unwrap();
+    let result = change(&mut zones, &managed)?;
+    if let Err(e) = save_zones(&zones, &state.zones_file_path) {
         eprintln!("Failed to save zones to disk: {}", e);
         return Err((
             StatusCode::INTERNAL_SERVER_ERROR,

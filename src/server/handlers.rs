@@ -20,19 +20,16 @@ use crate::schedule::HeatingState;
 
 type ApiError = (StatusCode, String);
 
-/// Apply `change` to the schedule sets under the write lock, then persist them.
+/// Apply `change` to the schedule sets and persist them, all under the write lock.
 /// `change` must not modify the sets when it returns an error.
 fn update_sets<T: ClimateEntity + Clone, R>(
     state: &AppState<T>,
     change: impl FnOnce(&mut ScheduleSets) -> Result<R, ApiError>,
 ) -> Result<R, ApiError> {
-    let (result, snapshot) = {
-        let mut sets = state.schedule.write().unwrap();
-        let result = change(&mut sets)?;
-        (result, sets.clone())
-    };
-
-    if let Err(e) = persistence::save_sets(&snapshot, &state.schedule_sets_file_path) {
+    // Save while still holding the lock, so concurrent changes reach disk in order
+    let mut sets = state.schedule.write().unwrap();
+    let result = change(&mut sets)?;
+    if let Err(e) = persistence::save_sets(&sets, &state.schedule_sets_file_path) {
         eprintln!("Failed to save schedule sets to disk: {}", e);
         return Err((
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -79,6 +76,22 @@ pub async fn add_schedule_entry<T: ClimateEntity + Clone>(
     Ok(Json(updated_schedule))
 }
 
+/// Delete an entry: 404 if it isn't there, 409 if it's the schedule's only entry
+fn delete_entry_checked(schedule: &mut Schedule, entry_id: Uuid) -> Result<(), ApiError> {
+    if !schedule.entries.iter().any(|e| e.id == entry_id) {
+        return Err((StatusCode::NOT_FOUND, "Entry not found".to_string()));
+    }
+    if schedule.entries.len() == 1 {
+        return Err((
+            StatusCode::CONFLICT,
+            "Cannot delete the only schedule entry".to_string(),
+        ));
+    }
+    schedule
+        .delete_entry(entry_id)
+        .map_err(|e| (StatusCode::NOT_FOUND, e))
+}
+
 /// Delete an entry from the active schedule
 pub async fn delete_schedule_entry<T: ClimateEntity + Clone>(
     State(state): State<AppState<T>>,
@@ -86,12 +99,7 @@ pub async fn delete_schedule_entry<T: ClimateEntity + Clone>(
 ) -> Result<Json<Schedule>, ApiError> {
     let updated_schedule = update_sets(&state, |sets| {
         let schedule = sets.active_mut();
-        schedule.delete_entry(entry_id).map_err(|e| {
-            (
-                StatusCode::NOT_FOUND,
-                format!("Failed to delete entry: {}", e),
-            )
-        })?;
+        delete_entry_checked(schedule, entry_id)?;
         Ok(schedule.clone())
     })?;
 
@@ -220,18 +228,7 @@ pub async fn delete_set_entry<T: ClimateEntity + Clone>(
         let schedule = sets
             .get_mut(set_id)
             .ok_or_else(|| set_error(SetError::NotFound))?;
-        if !schedule.entries.iter().any(|e| e.id == entry_id) {
-            return Err((StatusCode::NOT_FOUND, "Entry not found".to_string()));
-        }
-        if schedule.entries.len() == 1 {
-            return Err((
-                StatusCode::CONFLICT,
-                "Cannot delete the only schedule entry".to_string(),
-            ));
-        }
-        schedule
-            .delete_entry(entry_id)
-            .map_err(|e| (StatusCode::NOT_FOUND, e))?;
+        delete_entry_checked(schedule, entry_id)?;
         Ok(schedule.clone())
     })?;
     Ok(Json(updated))
@@ -734,5 +731,71 @@ mod tests {
             .0;
         assert_eq!(set, cold);
         assert_eq!(*mock.read().unwrap(), cold);
+    }
+
+    #[tokio::test]
+    async fn test_legacy_delete_status_codes() {
+        let (state, _dir) = test_state();
+        let only = state.schedule.read().unwrap().active().entries[0].id;
+
+        let err = delete_schedule_entry(State(state.clone()), Path(only))
+            .await
+            .unwrap_err();
+        assert_eq!(err.0, StatusCode::CONFLICT);
+
+        let err = delete_schedule_entry(State(state.clone()), Path(Uuid::new_v4()))
+            .await
+            .unwrap_err();
+        assert_eq!(err.0, StatusCode::NOT_FOUND);
+
+        // With two entries, deleting one works
+        let added = add_schedule_entry(State(state.clone()), Json(on(8, 17)))
+            .await
+            .unwrap()
+            .0;
+        let on_id = added
+            .entries
+            .iter()
+            .find(|e| e.heating_state == HeatingState::On)
+            .unwrap()
+            .id;
+        let after = delete_schedule_entry(State(state.clone()), Path(on_id))
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(after.entries.len(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_concurrent_changes_reach_disk_in_order() {
+        let (state, _dir) = test_state();
+        let set_id = state.schedule.read().unwrap().active_id;
+
+        let tasks: Vec<_> = (0..40)
+            .map(|i| {
+                let state = state.clone();
+                tokio::spawn(async move {
+                    let hour = i % 24;
+                    let request = ScheduleEntryRequest {
+                        target_temp: Some(15.0 + f64::from(i % 10)),
+                        ..on(hour, (hour + 1) % 24)
+                    };
+                    let _updated = add_set_entry(State(state), Path(set_id), Json(request))
+                        .await
+                        .unwrap();
+                })
+            })
+            .collect();
+        for task in tasks {
+            task.await.unwrap();
+        }
+
+        // The file holds the final state, not an earlier snapshot saved late
+        let saved = persistence::load_sets(&state.schedule_sets_file_path).unwrap();
+        let memory = state.schedule.read().unwrap().clone();
+        assert_eq!(
+            serde_json::to_value(&saved).unwrap(),
+            serde_json::to_value(&memory).unwrap()
+        );
     }
 }
