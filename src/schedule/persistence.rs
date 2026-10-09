@@ -9,8 +9,11 @@ pub fn load_schedule<P: AsRef<Path>>(path: P) -> Result<Schedule> {
     let contents = fs::read_to_string(path)
         .with_context(|| format!("Failed to read schedule file: {}", path.display()))?;
 
-    let schedule: Schedule = serde_json::from_str(&contents)
+    let mut schedule: Schedule = serde_json::from_str(&contents)
         .with_context(|| format!("Failed to parse schedule JSON from: {}", path.display()))?;
+
+    // Fix up schedules saved before entries were normalised
+    schedule.normalise();
 
     Ok(schedule)
 }
@@ -18,8 +21,8 @@ pub fn load_schedule<P: AsRef<Path>>(path: P) -> Result<Schedule> {
 /// Save a schedule to a JSON file
 pub fn save_schedule<P: AsRef<Path>>(schedule: &Schedule, path: P) -> Result<()> {
     let path = path.as_ref();
-    let json = serde_json::to_string_pretty(schedule)
-        .context("Failed to serialize schedule to JSON")?;
+    let json =
+        serde_json::to_string_pretty(schedule).context("Failed to serialize schedule to JSON")?;
 
     fs::write(path, json)
         .with_context(|| format!("Failed to write schedule file: {}", path.display()))?;
@@ -41,8 +44,7 @@ pub fn load_or_create_default<P: AsRef<Path>>(path: P) -> Result<Schedule> {
         let schedule = Schedule::new("Default Heating Schedule");
 
         // Save the default schedule for next time
-        save_schedule(&schedule, path)
-            .context("Failed to save default schedule")?;
+        save_schedule(&schedule, path).context("Failed to save default schedule")?;
 
         println!("Default schedule saved to: {}", path.display());
         Ok(schedule)
@@ -96,5 +98,32 @@ mod tests {
         // Second call should load existing
         let schedule2 = load_or_create_default(&file_path).unwrap();
         assert_eq!(schedule1.name, schedule2.name);
+    }
+
+    #[test]
+    fn test_load_normalises_fragments() {
+        let dir = tempdir().unwrap();
+        let file_path = dir.path().join("schedule.json");
+
+        let schedule = Schedule {
+            name: "Fragmented".into(),
+            entries: vec![
+                ScheduleEntry::new("a", TimePeriod::new(0, 0, 6, 0), HeatingState::Off),
+                ScheduleEntry::new("b", TimePeriod::new(6, 0, 9, 0), HeatingState::On),
+                ScheduleEntry::new("c", TimePeriod::new(9, 0, 22, 0), HeatingState::On),
+                ScheduleEntry::new("d", TimePeriod::new(22, 0, 0, 0), HeatingState::Off),
+            ],
+        };
+        save_schedule(&schedule, &file_path).unwrap();
+
+        let loaded = load_or_create_default(&file_path).unwrap();
+
+        let periods: Vec<_> = loaded.entries.iter().map(|e| e.time_period).collect();
+        assert_eq!(
+            periods,
+            vec![TimePeriod::new(6, 0, 22, 0), TimePeriod::new(22, 0, 6, 0)]
+        );
+        assert_eq!(loaded.entries[0].name, "b");
+        assert_eq!(loaded.entries[1].name, "d");
     }
 }

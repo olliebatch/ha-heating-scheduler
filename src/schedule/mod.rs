@@ -52,154 +52,6 @@ impl TimePeriod {
         }
         self.contains(other.start) || other.contains(self.start)
     }
-
-    /// Subtract another period from this one, returning the remaining parts
-    /// This handles splitting a period when another is inserted into it
-    pub fn subtract(&self, other: &TimePeriod) -> Vec<TimePeriod> {
-        // If no overlap, return self unchanged
-        if !self.overlaps(other) {
-            return vec![*self];
-        }
-
-        let mut result = Vec::new();
-
-        // Special case: subtracting from a full day
-        if self.is_full_day() {
-            let midnight = NaiveTime::from_hms_opt(0, 0, 0).unwrap();
-
-            if other.is_full_day() {
-                // Full day - full day = nothing
-                return vec![];
-            }
-
-            if other.start <= other.end {
-                // Subtracting a normal period from full day
-                // Results in: [00:00, other.start) and [other.end, 00:00)
-                // But we need to avoid creating zero-length or full-day periods
-
-                // Add the "before" period if other doesn't start at midnight
-                if other.start != midnight {
-                    result.push(TimePeriod {
-                        start: midnight,
-                        end: other.start,
-                    });
-                }
-
-                // Add the "after" period if other doesn't end at midnight
-                // (to avoid creating [00:00, 00:00) which would be a full day)
-                if other.end != midnight {
-                    result.push(TimePeriod {
-                        start: other.end,
-                        end: midnight, // This represents crossing midnight
-                    });
-                }
-            } else {
-                // Subtracting a midnight-crossing period from full day
-                // Results in: [other.end, other.start)
-                if other.end != other.start {
-                    result.push(TimePeriod {
-                        start: other.end,
-                        end: other.start,
-                    });
-                }
-            }
-            return result;
-        }
-
-        // Handle normal periods (don't cross midnight)
-        if self.start <= self.end && other.start <= other.end {
-            // Before part: if self starts before other
-            if self.start < other.start {
-                result.push(TimePeriod {
-                    start: self.start,
-                    end: other.start,
-                });
-            }
-
-            // After part: if self ends after other
-            if other.end < self.end {
-                result.push(TimePeriod {
-                    start: other.end,
-                    end: self.end,
-                });
-            }
-        } else {
-            // For midnight-crossing periods, we need more complex logic
-            // Convert to two normal periods and process each
-            if self.start > self.end {
-                // Self crosses midnight: split into [start..midnight] and [midnight..end]
-                let midnight = NaiveTime::from_hms_opt(0, 0, 0).unwrap();
-
-                // If self.end is midnight, period1 would be identical to self, causing infinite recursion
-                // In this case, just process it as the "before midnight" part
-                if self.end == midnight {
-                    // [self.start, 00:00) - only process the portion before midnight
-                    if other.start <= other.end {
-                        // Other is a normal period
-                        // Add the part before other starts (if any)
-                        if other.start > self.start {
-                            result.push(TimePeriod {
-                                start: self.start,
-                                end: other.start,
-                            });
-                        }
-                        // Add the part after other ends (if any)
-                        // Since self goes to midnight, check if other ends before midnight
-                        // and if other.end is within self's range [self.start, midnight)
-                        if other.end >= self.start && other.end != midnight {
-                            result.push(TimePeriod {
-                                start: other.end,
-                                end: midnight,
-                            });
-                        }
-                    } else {
-                        // Other also crosses midnight - complex case
-                        // Just return self for now to avoid recursion
-                        result.push(*self);
-                    }
-                } else {
-                    let period1 = TimePeriod {
-                        start: self.start,
-                        end: midnight,
-                    };
-                    let period2 = TimePeriod {
-                        start: midnight,
-                        end: self.end,
-                    };
-
-                    // Subtract from both parts
-                    result.extend(period1.subtract(other));
-                    // Only process period2 if it's not zero-length (to avoid [00:00, 00:00) recursion)
-                    if period2.start != period2.end {
-                        result.extend(period2.subtract(other));
-                    }
-                }
-            } else {
-                // Other crosses midnight
-                let midnight = NaiveTime::from_hms_opt(0, 0, 0).unwrap();
-                let other1 = TimePeriod {
-                    start: other.start,
-                    end: midnight,
-                };
-                let other2 = TimePeriod {
-                    start: midnight,
-                    end: other.end,
-                };
-                let mut temp = vec![*self];
-                temp = temp
-                    .iter()
-                    .flat_map(|p| p.subtract(&other1))
-                    .collect();
-                temp = temp
-                    .iter()
-                    .flat_map(|p| p.subtract(&other2))
-                    .collect();
-                result = temp;
-            }
-        }
-
-        result
-    }
 }
 
 impl fmt::Display for TimePeriod {
@@ -282,7 +134,10 @@ impl Schedule {
         }
     }
 
-    pub fn get_active_entry(&self, time: &chrono::DateTime<chrono::Local>) -> Option<&ScheduleEntry> {
+    pub fn get_active_entry(
+        &self,
+        time: &chrono::DateTime<chrono::Local>,
+    ) -> Option<&ScheduleEntry> {
         let naive_time = time.time();
         self.entries
             .iter()
@@ -295,82 +150,122 @@ impl Schedule {
             .unwrap_or(HeatingState::Off)
     }
 
+    /// Add an entry on top of the schedule. It replaces whatever covered its period before.
     pub fn add_entry(&mut self, entry: ScheduleEntry) {
-        let mut new_entries = Vec::new();
+        self.entries.push(entry);
+        self.normalise();
+    }
 
-        // Process each existing entry
-        for existing in &self.entries {
-            // If the existing entry overlaps with the new one, split it
-            if existing.time_period.overlaps(&entry.time_period) {
-                // Subtract the new entry's period from the existing one
-                let remaining_periods = existing.time_period.subtract(&entry.time_period);
+    /// Delete an entry by ID. The previous entry (by start time, wrapping round midnight)
+    /// is extended to fill the gap. Deleting the only entry is refused.
+    pub fn delete_entry(&mut self, entry_id: Uuid) -> Result<(), String> {
+        if !self.entries.iter().any(|e| e.id == entry_id) {
+            return Err(format!("Entry with ID {} not found", entry_id));
+        }
+        if self.entries.len() == 1 {
+            return Err("Cannot delete the only schedule entry".to_string());
+        }
 
-                // Create new entries for each remaining period with the same properties
-                for period in remaining_periods {
-                    new_entries.push(ScheduleEntry {
-                        id: Uuid::new_v4(),
-                        name: existing.name.clone(),
-                        time_period: period,
-                        heating_state: existing.heating_state.clone(),
-                    });
+        self.entries.retain(|e| e.id != entry_id);
+        self.normalise();
+        Ok(())
+    }
+
+    /// Rebuild the entries into the smallest set that covers the day exactly once, with no two
+    /// neighbouring entries (including across midnight) sharing a heating state.
+    ///
+    /// - Where entries overlap, the later entry in `entries` wins.
+    /// - A gap is filled by the entry before it, wrapping round midnight.
+    /// - When neighbouring pieces merge, the merged entry keeps the id and name of the earliest
+    ///   piece in loop order: the piece with the earliest start, except across midnight, where
+    ///   the piece that starts before midnight wins. A schedule that is one state all day
+    ///   becomes a single 00:00 - 00:00 entry named after the piece that covers 00:00.
+    /// - Any other piece that would repeat an id already used gets a new id.
+    pub fn normalise(&mut self) {
+        const DAY: u32 = 24 * 60 * 60;
+        let secs = |t: NaiveTime| t.num_seconds_from_midnight();
+        let time = |s: u32| NaiveTime::from_num_seconds_from_midnight_opt(s % DAY, 0).unwrap();
+
+        if self.entries.is_empty() {
+            self.entries.push(ScheduleEntry::default());
+            return;
+        }
+
+        // Every start and end is a boundary; between two boundaries the owner can't change.
+        let mut bounds: Vec<u32> = vec![0, DAY];
+        for e in &self.entries {
+            bounds.push(secs(e.time_period.start));
+            bounds.push(secs(e.time_period.end));
+        }
+        bounds.sort_unstable();
+        bounds.dedup();
+
+        // (start, end, index of owning entry) for each slice; the last entry containing it wins
+        let mut slices: Vec<(u32, u32, Option<usize>)> = bounds
+            .windows(2)
+            .map(|w| {
+                let owner = self
+                    .entries
+                    .iter()
+                    .rposition(|e| e.time_period.contains(time(w[0])));
+                (w[0], w[1], owner)
+            })
+            .collect();
+
+        // Fill gaps from the previous slice, wrapping round midnight
+        let Some(last_owned) = slices.iter().rev().find_map(|s| s.2) else {
+            self.entries = vec![ScheduleEntry::default()];
+            return;
+        };
+        let mut prev = last_owned;
+        for slice in &mut slices {
+            prev = *slice.2.get_or_insert(prev);
+        }
+
+        // Merge neighbouring slices with the same state; the first slice names the run
+        let mut runs: Vec<(u32, u32, usize)> = Vec::new();
+        for (start, end, owner) in slices {
+            let owner = owner.unwrap();
+            match runs.last_mut() {
+                Some(run)
+                    if self.entries[run.2].heating_state == self.entries[owner].heating_state =>
+                {
+                    run.1 = end
                 }
-            } else {
-                // No overlap, keep the existing entry as-is
-                new_entries.push(existing.clone());
+                _ => runs.push((start, end, owner)),
             }
         }
 
-        // Add the new entry
-        new_entries.push(entry);
-
-        // Sort entries by start time for cleaner organization
-        new_entries.sort_by(|a, b| {
-            a.time_period.start.cmp(&b.time_period.start)
-        });
-
-        self.entries = new_entries;
-    }
-
-    /// Delete an entry by ID and extend the previous entry to fill the gap
-    pub fn delete_entry(&mut self, entry_id: Uuid) -> Result<(), String> {
-        // Find the entry to delete
-        let entry_to_delete = self
-            .entries
-            .iter()
-            .find(|e| e.id == entry_id)
-            .ok_or_else(|| format!("Entry with ID {} not found", entry_id))?;
-
-        let deleted_time_period = entry_to_delete.time_period;
-
-        // Sort entries by start time to find the previous entry
-        let mut sorted_entries = self.entries.clone();
-        sorted_entries.sort_by(|a, b| a.time_period.start.cmp(&b.time_period.start));
-
-        // Find the index of the entry to delete
-        let delete_idx = sorted_entries
-            .iter()
-            .position(|e| e.id == entry_id)
-            .ok_or_else(|| "Entry not found in sorted list".to_string())?;
-
-        // Find the previous entry (wraps around for midnight crossing)
-        let prev_idx = if delete_idx == 0 {
-            sorted_entries.len() - 1
-        } else {
-            delete_idx - 1
-        };
-
-        let prev_entry_id = sorted_entries[prev_idx].id;
-
-        // Remove the entry to delete
-        self.entries.retain(|e| e.id != entry_id);
-
-        // Extend the previous entry to cover the deleted entry's time period
-        if let Some(prev_entry) = self.entries.iter_mut().find(|e| e.id == prev_entry_id) {
-            // The previous entry should now end where the deleted entry ended
-            prev_entry.time_period.end = deleted_time_period.end;
+        // Merge across midnight: the run that starts before midnight takes over the first run
+        if runs.len() > 1
+            && self.entries[runs[0].2].heating_state
+                == self.entries[runs[runs.len() - 1].2].heating_state
+        {
+            let first = runs.remove(0);
+            runs.last_mut().unwrap().1 = first.1;
         }
 
-        Ok(())
+        let mut used_ids = std::collections::HashSet::new();
+        self.entries = runs
+            .into_iter()
+            .map(|(start, end, owner)| {
+                let source = &self.entries[owner];
+                let id = if used_ids.insert(source.id) {
+                    source.id
+                } else {
+                    Uuid::new_v4()
+                };
+                ScheduleEntry {
+                    id,
+                    name: source.name.clone(),
+                    time_period: TimePeriod {
+                        start: time(start),
+                        end: time(end),
+                    },
+                    heating_state: source.heating_state.clone(),
+                }
+            })
+            .collect();
     }
 }
 
@@ -412,31 +307,6 @@ mod tests {
     }
 
     #[test]
-    fn test_time_period_subtract_simple() {
-        // Test: 00:00-23:59 subtract 08:00-17:00 should give two periods
-        let full_day = TimePeriod::new(0, 0, 23, 59);
-        let work_hours = TimePeriod::new(8, 0, 17, 0);
-
-        let result = full_day.subtract(&work_hours);
-
-        assert_eq!(result.len(), 2);
-        assert_eq!(result[0], TimePeriod::new(0, 0, 8, 0));
-        assert_eq!(result[1], TimePeriod::new(17, 0, 23, 59));
-    }
-
-    #[test]
-    fn test_time_period_subtract_no_overlap() {
-        // Test: subtracting non-overlapping periods returns original
-        let period1 = TimePeriod::new(8, 0, 12, 0);
-        let period2 = TimePeriod::new(14, 0, 18, 0);
-
-        let result = period1.subtract(&period2);
-
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0], period1);
-    }
-
-    #[test]
     fn test_schedule_add_entry_splits_default() {
         // Test: Adding an entry to a new schedule should split the default entry
         let mut schedule = Schedule::new("Test Schedule");
@@ -451,19 +321,20 @@ mod tests {
             HeatingState::On,
         ));
 
-        // Should now have 3 entries: before work, work hours, after work
-        assert_eq!(schedule.entries.len(), 3);
+        // Should now have 2 entries: work hours, and the rest of the day across midnight
+        assert_eq!(schedule.entries.len(), 2);
 
-        // Verify the entries cover the full day
-        assert_eq!(schedule.entries[0].time_period, TimePeriod::new(0, 0, 8, 0));
-        assert_eq!(schedule.entries[0].heating_state, HeatingState::Off);
+        assert_eq!(
+            schedule.entries[0].time_period,
+            TimePeriod::new(8, 0, 17, 0)
+        );
+        assert_eq!(schedule.entries[0].heating_state, HeatingState::On);
 
-        assert_eq!(schedule.entries[1].time_period, TimePeriod::new(8, 0, 17, 0));
-        assert_eq!(schedule.entries[1].heating_state, HeatingState::On);
-
-        // The after-work period goes from 17:00 to 00:00 (midnight crossing)
-        assert_eq!(schedule.entries[2].time_period, TimePeriod::new(17, 0, 0, 0));
-        assert_eq!(schedule.entries[2].heating_state, HeatingState::Off);
+        assert_eq!(
+            schedule.entries[1].time_period,
+            TimePeriod::new(17, 0, 8, 0)
+        );
+        assert_eq!(schedule.entries[1].heating_state, HeatingState::Off);
     }
 
     #[test]
@@ -513,9 +384,11 @@ mod tests {
             let next_start = entries_sorted[i + 1].time_period.start;
             // End of current should equal start of next (no gaps)
             assert_eq!(
-                current_end, next_start,
+                current_end,
+                next_start,
                 "Gap found between entries {} and {}",
-                i, i + 1
+                i,
+                i + 1
             );
         }
     }
@@ -539,14 +412,14 @@ mod tests {
             HeatingState::On,
         ));
 
-        // Verify we have the 22:00-00:00 period
-        let has_22_to_midnight = schedule.entries.iter().any(|e| {
-            e.time_period.start == NaiveTime::from_hms_opt(22, 0, 0).unwrap()
-                && e.time_period.end == NaiveTime::from_hms_opt(0, 0, 0).unwrap()
-        });
+        // 22:00-00:00 is merged with 00:00-10:00 into one entry across midnight
+        let has_22_to_10 = schedule
+            .entries
+            .iter()
+            .any(|e| e.time_period == TimePeriod::new(22, 0, 10, 0));
         assert!(
-            has_22_to_midnight,
-            "Missing coverage for 22:00-00:00 period. Entries: {:#?}",
+            has_22_to_10,
+            "Missing coverage for 22:00-10:00 period. Entries: {:#?}",
             schedule.entries
         );
 
@@ -568,14 +441,14 @@ mod tests {
         schedule.add_entry(ScheduleEntry::new(
             "Small",
             TimePeriod::new(10, 0, 12, 0),
-            HeatingState::On,
+            HeatingState::Off,
         ));
 
         // Add a larger entry that covers it
         schedule.add_entry(ScheduleEntry::new(
             "Large",
             TimePeriod::new(8, 0, 14, 0),
-            HeatingState::Off,
+            HeatingState::On,
         ));
 
         // The small entry should be completely replaced
@@ -627,15 +500,18 @@ mod tests {
         // Delete the "Work" entry
         schedule.delete_entry(work_entry_id).unwrap();
 
-        // Should have one less entry
-        assert_eq!(schedule.entries.len(), initial_count - 1);
+        // Morning extends over Work, then merges with Evening (both On)
+        assert_eq!(schedule.entries.len(), initial_count - 2);
 
-        // The "Morning" entry should now extend to 17:00 (covering the deleted work hours)
-        let morning_entry = schedule.entries.iter().find(|e| e.name == "Morning").unwrap();
+        let morning_entry = schedule
+            .entries
+            .iter()
+            .find(|e| e.name == "Morning")
+            .unwrap();
         assert_eq!(
-            morning_entry.time_period.end,
-            NaiveTime::from_hms_opt(17, 0, 0).unwrap(),
-            "Morning entry should extend to 17:00 after deleting Work entry"
+            morning_entry.time_period,
+            TimePeriod::new(6, 0, 22, 0),
+            "Morning entry should cover 06:00-22:00 after deleting Work entry"
         );
 
         // Verify no gaps: 12:00 (during old work hours) should now be in the Morning entry
@@ -651,36 +527,230 @@ mod tests {
         // Test deleting the first entry (should extend the last entry)
         let mut schedule = Schedule::new("Test Schedule");
 
-        // Add morning heating
         schedule.add_entry(ScheduleEntry::new(
             "Morning",
             TimePeriod::new(6, 0, 12, 0),
             HeatingState::On,
         ));
+        schedule.add_entry(ScheduleEntry::new(
+            "Early",
+            TimePeriod::new(0, 0, 3, 0),
+            HeatingState::On,
+        ));
 
-        // The default entry should have been split into 00:00-06:00 and 12:00-00:00
-        let first_entry_id = schedule
-            .entries
-            .iter()
-            .find(|e| {
-                e.time_period.start == NaiveTime::from_hms_opt(0, 0, 0).unwrap()
-                    && e.time_period.end == NaiveTime::from_hms_opt(6, 0, 0).unwrap()
-            })
-            .unwrap()
-            .id;
+        // 00:00-03:00 On, 03:00-06:00 Off, 06:00-12:00 On, 12:00-00:00 Off
+        assert_eq!(schedule.entries.len(), 4);
+        let first_entry_id = schedule.entries[0].id;
 
-        // Delete the first entry (00:00-06:00)
+        // Delete the first entry (00:00-03:00)
         schedule.delete_entry(first_entry_id).unwrap();
 
-        // The last entry should now extend to 06:00
+        // The last entry extends to 03:00 and merges with 03:00-06:00 (both Off)
         let last_entry = schedule
             .entries
             .iter()
-            .find(|e| e.time_period.end == NaiveTime::from_hms_opt(6, 0, 0).unwrap());
+            .find(|e| e.time_period == TimePeriod::new(12, 0, 6, 0));
 
         assert!(
             last_entry.is_some(),
-            "Last entry should extend to 06:00 after deleting first entry"
+            "Last entry should extend to 06:00 after deleting first entry: {:#?}",
+            schedule.entries
         );
+    }
+
+    /// Every second of the day is covered exactly once, and neighbours differ in state
+    fn assert_normalised(schedule: &Schedule) {
+        let entries = &schedule.entries;
+        assert!(!entries.is_empty());
+        for minute in 0..24 * 60 {
+            let t = NaiveTime::from_hms_opt(minute / 60, minute % 60, 0).unwrap();
+            let covering = entries.iter().filter(|e| e.time_period.contains(t)).count();
+            assert_eq!(
+                covering, 1,
+                "{} covered {} times: {:#?}",
+                t, covering, entries
+            );
+        }
+        if entries.len() > 1 {
+            for i in 0..entries.len() {
+                let a = &entries[i];
+                let b = &entries[(i + 1) % entries.len()];
+                assert_eq!(a.time_period.end, b.time_period.start, "{:#?}", entries);
+                assert_ne!(a.heating_state, b.heating_state, "{:#?}", entries);
+            }
+        }
+        let ids: std::collections::HashSet<_> = entries.iter().map(|e| e.id).collect();
+        assert_eq!(ids.len(), entries.len(), "duplicate ids: {:#?}", entries);
+    }
+
+    fn entry(name: &str, period: TimePeriod, state: HeatingState) -> ScheduleEntry {
+        ScheduleEntry::new(name, period, state)
+    }
+
+    #[test]
+    fn test_normalise_merges_across_midnight() {
+        let late = entry("Late", TimePeriod::new(22, 0, 0, 0), HeatingState::Off);
+        let early = entry("Early", TimePeriod::new(0, 0, 6, 0), HeatingState::Off);
+        let day = entry("Day", TimePeriod::new(6, 0, 22, 0), HeatingState::On);
+        let late_id = late.id;
+        let mut schedule = Schedule {
+            name: "Test".into(),
+            entries: vec![early, day, late],
+        };
+
+        schedule.normalise();
+
+        assert_normalised(&schedule);
+        assert_eq!(schedule.entries.len(), 2);
+        let night = &schedule.entries[1];
+        assert_eq!(night.time_period, TimePeriod::new(22, 0, 6, 0));
+        // The piece that starts before midnight survives
+        assert_eq!(night.id, late_id);
+        assert_eq!(night.name, "Late");
+    }
+
+    #[test]
+    fn test_normalise_merge_keeps_earliest_piece() {
+        let first = entry("First", TimePeriod::new(6, 0, 9, 0), HeatingState::On);
+        let second = entry("Second", TimePeriod::new(9, 0, 17, 0), HeatingState::On);
+        let first_id = first.id;
+        let mut schedule = Schedule::new("Test");
+        schedule.add_entry(second);
+        schedule.add_entry(first);
+
+        assert_normalised(&schedule);
+        assert_eq!(schedule.entries.len(), 2);
+        let on = &schedule.entries[0];
+        assert_eq!(on.time_period, TimePeriod::new(6, 0, 17, 0));
+        assert_eq!(on.id, first_id);
+        assert_eq!(on.name, "First");
+    }
+
+    #[test]
+    fn test_normalise_all_one_state_is_full_day() {
+        let mut schedule = Schedule::new("Test");
+        schedule.add_entry(entry(
+            "Day",
+            TimePeriod::new(8, 0, 17, 0),
+            HeatingState::Off,
+        ));
+
+        assert_eq!(schedule.entries.len(), 1);
+        assert!(schedule.entries[0].time_period.is_full_day());
+
+        schedule.add_entry(entry("On", TimePeriod::new(22, 0, 6, 0), HeatingState::On));
+        schedule.add_entry(entry(
+            "All On",
+            TimePeriod::new(6, 0, 22, 0),
+            HeatingState::On,
+        ));
+        assert_eq!(schedule.entries.len(), 1);
+        assert!(schedule.entries[0].time_period.is_full_day());
+        assert_eq!(schedule.entries[0].heating_state, HeatingState::On);
+    }
+
+    #[test]
+    fn test_add_midnight_crossing_onto_midnight_crossing() {
+        // The case TimePeriod::subtract used to leave overlapping
+        let mut schedule = Schedule::new("Test");
+        schedule.add_entry(entry("Day", TimePeriod::new(6, 0, 22, 0), HeatingState::On));
+        assert_eq!(
+            schedule.entries[1].time_period,
+            TimePeriod::new(22, 0, 6, 0)
+        );
+
+        schedule.add_entry(entry(
+            "Late",
+            TimePeriod::new(23, 0, 1, 0),
+            HeatingState::On,
+        ));
+
+        assert_normalised(&schedule);
+        let periods: Vec<_> = schedule.entries.iter().map(|e| e.time_period).collect();
+        assert_eq!(
+            periods,
+            vec![
+                TimePeriod::new(1, 0, 6, 0),
+                TimePeriod::new(6, 0, 22, 0),
+                TimePeriod::new(22, 0, 23, 0),
+                TimePeriod::new(23, 0, 1, 0),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_delete_leaves_no_same_state_neighbours() {
+        let mut schedule = Schedule::new("Test");
+        schedule.add_entry(entry(
+            "Morning",
+            TimePeriod::new(6, 0, 9, 0),
+            HeatingState::On,
+        ));
+        schedule.add_entry(entry(
+            "Evening",
+            TimePeriod::new(17, 0, 22, 0),
+            HeatingState::On,
+        ));
+        let morning_id = schedule
+            .entries
+            .iter()
+            .find(|e| e.name == "Morning")
+            .unwrap()
+            .id;
+
+        // Deleting Morning extends the Off before it: Off | Off must merge
+        schedule.delete_entry(morning_id).unwrap();
+
+        assert_normalised(&schedule);
+        assert_eq!(schedule.entries.len(), 2);
+    }
+
+    #[test]
+    fn test_delete_wrapping_entry_extends_previous() {
+        let mut schedule = Schedule::new("Test");
+        schedule.add_entry(entry("Day", TimePeriod::new(6, 0, 22, 0), HeatingState::On));
+        let night_id = schedule.entries[1].id;
+
+        schedule.delete_entry(night_id).unwrap();
+
+        assert_normalised(&schedule);
+        assert_eq!(schedule.entries.len(), 1);
+        assert!(schedule.entries[0].time_period.is_full_day());
+        assert_eq!(schedule.entries[0].heating_state, HeatingState::On);
+    }
+
+    #[test]
+    fn test_delete_only_entry_is_refused() {
+        let mut schedule = Schedule::new("Test");
+        let id = schedule.entries[0].id;
+
+        assert!(schedule.delete_entry(id).is_err());
+        assert_eq!(schedule.entries.len(), 1);
+    }
+
+    #[test]
+    fn test_many_random_edits_stay_normalised() {
+        // Deterministic pseudo-random adds and deletes
+        let mut seed: u32 = 12345;
+        let mut next = |n: u32| {
+            seed = seed.wrapping_mul(1103515245).wrapping_add(12345);
+            (seed >> 16) % n
+        };
+        let mut schedule = Schedule::new("Test");
+        for _ in 0..500 {
+            if next(4) == 0 && schedule.entries.len() > 1 {
+                let i = next(schedule.entries.len() as u32) as usize;
+                schedule.delete_entry(schedule.entries[i].id).unwrap();
+            } else {
+                let state = if next(2) == 0 {
+                    HeatingState::On
+                } else {
+                    HeatingState::Off
+                };
+                let period = TimePeriod::new(next(24), next(4) * 15, next(24), next(4) * 15);
+                schedule.add_entry(entry("Random", period, state));
+            }
+            assert_normalised(&schedule);
+        }
     }
 }
