@@ -16,6 +16,9 @@ pub struct ClimateInfo {
     pub state: HeatingState,
     /// The entity's target temperature, when it reports one
     pub target_temp: Option<f64>,
+    /// The lowest and highest targets the entity accepts, when it reports them
+    pub min_temp: Option<f64>,
+    pub max_temp: Option<f64>,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -229,6 +232,8 @@ impl MockClimate {
                 current_temperature: 20.0,
                 state: initial_state,
                 target_temp: None,
+                min_temp: None,
+                max_temp: None,
             }),
             boosted: Default::default(),
             set_temperatures: Default::default(),
@@ -285,6 +290,9 @@ impl ClimateEntity for MockClimate {
                 .map(|i| i.state.clone())
                 .unwrap_or(HeatingState::Off),
             target_temp,
+            // Keep any limits a test gave the mock, as HA would keep reporting them
+            min_temp: self.info.as_ref().and_then(|i| i.min_temp),
+            max_temp: self.info.as_ref().and_then(|i| i.max_temp),
         });
         Ok(())
     }
@@ -329,6 +337,8 @@ impl From<ApiClimateState> for ClimateInfo {
             },
             // null while the entity is off
             target_temp: state.attributes.temperature.as_f64(),
+            min_temp: Some(state.attributes.min_temp),
+            max_temp: Some(state.attributes.max_temp),
         }
     }
 }

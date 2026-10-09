@@ -478,6 +478,13 @@ mod tests {
             zones: Arc::new(RwLock::new(crate::zones::Zones::default())),
             zones_file_path: dir.path().join("zones.json").to_string_lossy().to_string(),
             area_source: Arc::new(crate::zones::areas::MockAreas::example()),
+            weather: Default::default(),
+            weather_file_path: dir
+                .path()
+                .join("weather.json")
+                .to_string_lossy()
+                .to_string(),
+            mock_weather: None,
         };
         (state, dir)
     }
@@ -673,5 +680,59 @@ mod tests {
 
         assert_eq!(err.0, StatusCode::CONFLICT);
         assert!(err.1.contains("Whole house"), "{}", err.1);
+    }
+
+    #[tokio::test]
+    async fn test_weather_entity_and_mock_routes() {
+        use crate::server::weather::{
+            WeatherEntityRequest, get_weather, set_mock_weather, set_weather_entity,
+        };
+        let (mut state, _dir) = test_state();
+        let set = |id: Option<&str>| {
+            Json(WeatherEntityRequest {
+                entity_id: id.map(str::to_string),
+            })
+        };
+
+        let status = set_weather_entity(State(state.clone()), set(Some(" weather.example ")))
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(status.entity_id.as_deref(), Some("weather.example"));
+        let saved = crate::weather::load_weather_config(&state.weather_file_path).unwrap();
+        assert_eq!(saved.entity_id.as_deref(), Some("weather.example"));
+
+        for bad in ["sensor.outside", "weather."] {
+            let err = set_weather_entity(State(state.clone()), set(Some(bad)))
+                .await
+                .unwrap_err();
+            assert_eq!(err.0, StatusCode::BAD_REQUEST, "{}", bad);
+        }
+
+        let status = set_weather_entity(State(state.clone()), set(None))
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(status.entity_id, None);
+        assert_eq!(get_weather(State(state.clone())).await.0.entity_id, None);
+
+        // Mock weather: 404 without a mock, set when there is one
+        let cold = crate::weather::Weather {
+            temperature: Some(-2.0),
+            ..Default::default()
+        };
+        let err = set_mock_weather(State(state.clone()), Json(cold.clone()))
+            .await
+            .unwrap_err();
+        assert_eq!(err.0, StatusCode::NOT_FOUND);
+
+        let mock = Arc::new(RwLock::new(crate::weather::Weather::default()));
+        state.mock_weather = Some(Arc::clone(&mock));
+        let set = set_mock_weather(State(state), Json(cold.clone()))
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(set, cold);
+        assert_eq!(*mock.read().unwrap(), cold);
     }
 }

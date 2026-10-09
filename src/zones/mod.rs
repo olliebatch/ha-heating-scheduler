@@ -5,6 +5,9 @@ use std::fs;
 use std::path::Path;
 use uuid::Uuid;
 
+use crate::schedule::TimePeriod;
+use crate::weather::adjust::WindExposure;
+
 pub mod areas;
 
 use areas::Area;
@@ -32,6 +35,14 @@ pub struct Zone {
     /// The schedule set this zone follows; None follows the active set
     #[serde(default)]
     pub schedule_set_id: Option<Uuid>,
+    /// Times of day the zone usually gets direct sun
+    #[serde(default)]
+    pub sun_windows: Vec<TimePeriod>,
+    #[serde(default)]
+    pub wind_exposure: WindExposure,
+    /// Adjust this zone's target for the weather
+    #[serde(default)]
+    pub weather_adjust: bool,
 }
 
 impl Zone {
@@ -43,6 +54,9 @@ impl Zone {
             area_ids: Vec::new(),
             entity_ids: Vec::new(),
             schedule_set_id: None,
+            sun_windows: Vec::new(),
+            wind_exposure: WindExposure::default(),
+            weather_adjust: false,
         }
     }
 
@@ -261,6 +275,38 @@ impl Zones {
             .find(|z| z.id == id)
             .ok_or(ZoneError::NotFound)?;
         zone.name = name;
+        Ok(())
+    }
+
+    /// Update the weather profile; leaves out any part that is None
+    pub fn set_profile(
+        &mut self,
+        id: Uuid,
+        sun_windows: Option<Vec<TimePeriod>>,
+        wind_exposure: Option<WindExposure>,
+        weather_adjust: Option<bool>,
+    ) -> Result<(), ZoneError> {
+        if let Some(windows) = &sun_windows {
+            if windows.iter().any(|w| w.start == w.end && !w.is_full_day()) {
+                return Err(ZoneError::Invalid(
+                    "Sun windows need different start and end times".to_string(),
+                ));
+            }
+        }
+        let zone = self
+            .zones
+            .iter_mut()
+            .find(|z| z.id == id)
+            .ok_or(ZoneError::NotFound)?;
+        if let Some(windows) = sun_windows {
+            zone.sun_windows = windows;
+        }
+        if let Some(exposure) = wind_exposure {
+            zone.wind_exposure = exposure;
+        }
+        if let Some(adjust) = weather_adjust {
+            zone.weather_adjust = adjust;
+        }
         Ok(())
     }
 

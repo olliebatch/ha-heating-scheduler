@@ -2,9 +2,12 @@ use crate::api_client::ApiClient;
 use crate::climate::{BoostInfo, ClimateEntity};
 use crate::schedule::HeatingState;
 use crate::schedule::sets::ScheduleSets;
-use crate::zones::Zones;
-use crate::{ScheduleState, ZonesState};
+use crate::weather::adjust::{Reason, adjust_target};
+use crate::weather::{Weather, WeatherSource};
+use crate::zones::{Zone, Zones};
+use crate::{ScheduleState, WeatherState, ZonesState};
 use chrono::Local;
+use serde::Serialize;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
@@ -14,6 +17,8 @@ pub struct SchedulerState<T: ClimateEntity + Clone> {
     pub api_client: ApiClient,
     pub schedule: ScheduleState,
     pub zones: ZonesState,
+    pub weather: WeatherState,
+    pub weather_source: Arc<dyn WeatherSource>,
     pub climate_entities: Arc<RwLock<Vec<T>>>,
 }
 
@@ -107,19 +112,63 @@ pub fn scheduled_for(
     entity_id: &str,
     sets: &ScheduleSets,
     zones: &Zones,
+    weather: Option<&Weather>,
     time: &chrono::DateTime<Local>,
 ) -> Scheduled {
-    let schedule = zones
-        .zone_for(entity_id)
+    let status = zone_status(zones.zone_for(entity_id), sets, weather, time);
+    Scheduled {
+        state: status.state,
+        target_temp: status.target,
+    }
+}
+
+/// What a zone is doing right now and why
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ZoneStatus {
+    pub state: HeatingState,
+    /// The active entry's target from the zone's schedule set (On only)
+    pub scheduled_target: Option<f64>,
+    /// The target after weather adjustment (equal to `scheduled_target` without it)
+    pub target: Option<f64>,
+    pub reasons: Vec<Reason>,
+}
+
+/// A zone's state and target at `time`: from its schedule set (or the active set when it follows
+/// the active set, its set no longer exists, or there is no zone), adjusted for the weather when
+/// the zone has weather adjust on and is scheduled On. Off is never adjusted.
+pub fn zone_status(
+    zone: Option<&Zone>,
+    sets: &ScheduleSets,
+    weather: Option<&Weather>,
+    time: &chrono::DateTime<Local>,
+) -> ZoneStatus {
+    let schedule = zone
         .and_then(|z| z.schedule_set_id)
         .and_then(|id| sets.get(id))
         .unwrap_or_else(|| sets.active());
     let entry = schedule.get_active_entry(time);
-    Scheduled {
-        state: entry
-            .map(|e| e.heating_state.clone())
-            .unwrap_or(HeatingState::Off),
-        target_temp: entry.and_then(|e| e.target_temp),
+    let state = entry
+        .map(|e| e.heating_state.clone())
+        .unwrap_or(HeatingState::Off);
+    let scheduled_target = entry.and_then(|e| e.target_temp);
+
+    let adjusted = match (zone, weather, &state, scheduled_target) {
+        (Some(zone), Some(weather), HeatingState::On, Some(target)) if zone.weather_adjust => {
+            Some(adjust_target(
+                target,
+                weather,
+                &zone.sun_windows,
+                zone.wind_exposure,
+                time.time(),
+            ))
+        }
+        _ => None,
+    };
+    ZoneStatus {
+        state,
+        scheduled_target,
+        target: adjusted.as_ref().map(|a| a.target).or(scheduled_target),
+        reasons: adjusted.map(|a| a.reasons).unwrap_or_default(),
     }
 }
 
@@ -195,10 +244,34 @@ pub async fn apply_schedule_to_entity<T: ClimateEntity>(
         *last_sent = None;
         return;
     };
+    // Keep within what the entity accepts
+    let target = target
+        .max(cached.min_temp.unwrap_or(f64::MIN))
+        .min(cached.max_temp.unwrap_or(f64::MAX));
     if action == HeatingAction::TurnOn || *last_sent != Some(target) {
         match entity.set_temperature(api_client, target).await {
             Ok(()) => *last_sent = Some(target),
             Err(e) => eprintln!("  ✗ Error setting temperature: {}", e),
+        }
+    }
+}
+
+/// Read the weather and record the reading (or the error) in `status`
+pub async fn read_weather(status: &WeatherState, source: &dyn WeatherSource) -> Option<Weather> {
+    let entity_id = status.read().unwrap().entity_id.clone();
+    let result = source.fetch(entity_id.as_deref()).await;
+    let mut status = status.write().unwrap();
+    match result {
+        Ok(weather) => {
+            status.weather = weather.clone();
+            status.error = None;
+            weather
+        }
+        Err(e) => {
+            eprintln!("Failed to read the weather, not adjusting targets: {}", e);
+            status.weather = None;
+            status.error = Some(e.to_string());
+            None
         }
     }
 }
@@ -223,13 +296,16 @@ pub async fn run_scheduler<T: ClimateEntity + Clone>(state: SchedulerState<T>) {
             climates.clone()
         };
 
+        // Read the weather once per tick; without it, targets aren't adjusted
+        let weather = read_weather(&state.weather, state.weather_source.as_ref()).await;
+
         // What each entity's zone schedule asks for right now
         let (scheduled, default_target_temp): (Vec<Scheduled>, f64) = {
             let sets = state.schedule.read().unwrap();
             let zones = state.zones.read().unwrap();
             let scheduled = entities_clone
                 .iter()
-                .map(|e| scheduled_for(e.get_entity_id(), &sets, &zones, &now))
+                .map(|e| scheduled_for(e.get_entity_id(), &sets, &zones, weather.as_ref(), &now))
                 .collect();
             (scheduled, sets.default_target_temp)
         };
@@ -480,23 +556,125 @@ mod tests {
 
         // Every zone follows the active set until assigned one
         assert_eq!(
-            scheduled_for("climate.study", &sets, &zones, &now),
+            scheduled_for("climate.study", &sets, &zones, None, &now),
             scheduled(HeatingState::Off, None)
         );
 
         zones.set_schedule_set(study, Some(warm)).unwrap();
         assert_eq!(
-            scheduled_for("climate.study", &sets, &zones, &now),
+            scheduled_for("climate.study", &sets, &zones, None, &now),
             scheduled(HeatingState::On, Some(21.0))
         );
         assert_eq!(
-            scheduled_for("climate.loft", &sets, &zones, &now),
+            scheduled_for("climate.loft", &sets, &zones, None, &now),
             scheduled(HeatingState::Off, None)
         );
         // An entity in no zone follows the active set
         assert_eq!(
-            scheduled_for("climate.unknown", &sets, &zones, &now),
+            scheduled_for("climate.unknown", &sets, &zones, None, &now),
             scheduled(HeatingState::Off, None)
         );
+    }
+
+    fn zone_with_profile(adjust: bool) -> Zone {
+        let mut zones = Zones::default();
+        zones.reconcile(Some(vec![]), &["climate.a".to_string()]);
+        let mut zone = zones.zones[0].clone();
+        zone.weather_adjust = adjust;
+        zone.wind_exposure = crate::weather::adjust::WindExposure::High;
+        zone
+    }
+
+    fn on_all_day(target: f64) -> ScheduleSets {
+        use crate::schedule::{Schedule, ScheduleEntry, TimePeriod};
+        let mut schedule = Schedule::new("On");
+        schedule.add_entry(
+            ScheduleEntry::new("All day", TimePeriod::new(0, 0, 0, 0), HeatingState::On)
+                .with_target(target),
+        );
+        ScheduleSets::from_schedule(schedule)
+    }
+
+    fn cold_and_windy() -> Weather {
+        Weather {
+            temperature: Some(-5.0),
+            wind_speed: Some(50.0),
+            cloud_coverage: Some(100.0),
+        }
+    }
+
+    #[test]
+    fn test_zone_status_adjusts_only_when_switched_on() {
+        let sets = on_all_day(20.0);
+        let now = Local::now();
+        let weather = cold_and_windy();
+
+        let off = zone_status(Some(&zone_with_profile(false)), &sets, Some(&weather), &now);
+        assert_eq!(off.target, Some(20.0));
+        assert!(off.reasons.is_empty());
+
+        let on = zone_status(Some(&zone_with_profile(true)), &sets, Some(&weather), &now);
+        assert_eq!(on.scheduled_target, Some(20.0));
+        assert_eq!(on.target, Some(22.5));
+        assert_eq!(on.reasons.len(), 2);
+
+        // No weather reading: the scheduled target as is
+        let unread = zone_status(Some(&zone_with_profile(true)), &sets, None, &now);
+        assert_eq!(unread.target, Some(20.0));
+    }
+
+    #[test]
+    fn test_zone_status_never_adjusts_off() {
+        use crate::schedule::Schedule;
+        let sets = ScheduleSets::from_schedule(Schedule::new("Off"));
+        let status = zone_status(
+            Some(&zone_with_profile(true)),
+            &sets,
+            Some(&cold_and_windy()),
+            &Local::now(),
+        );
+        assert_eq!(status.state, HeatingState::Off);
+        assert_eq!(status.target, None);
+        assert!(status.reasons.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_target_clamped_to_entity_limits() {
+        let mut entity = mock(HeatingState::Off);
+        entity.info.as_mut().unwrap().max_temp = Some(21.0);
+        let mut last = None;
+
+        tick(
+            &mut entity,
+            &scheduled(HeatingState::On, Some(22.5)),
+            &mut last,
+        )
+        .await;
+
+        assert_eq!(sent(&entity), vec![21.0]);
+    }
+
+    struct FailingWeather;
+
+    #[async_trait::async_trait]
+    impl WeatherSource for FailingWeather {
+        async fn fetch(&self, _entity_id: Option<&str>) -> anyhow::Result<Option<Weather>> {
+            Err(anyhow::anyhow!("HA unreachable"))
+        }
+    }
+
+    #[tokio::test]
+    async fn test_read_weather_records_reading_and_failure() {
+        let status: WeatherState = Default::default();
+        let mock = crate::weather::MockWeather::default();
+        *mock.weather.write().unwrap() = cold_and_windy();
+
+        assert_eq!(read_weather(&status, &mock).await, Some(cold_and_windy()));
+        assert_eq!(status.read().unwrap().weather, Some(cold_and_windy()));
+
+        assert_eq!(read_weather(&status, &FailingWeather).await, None);
+        let status = status.read().unwrap();
+        assert_eq!(status.weather, None);
+        assert!(status.error.as_deref().unwrap().contains("unreachable"));
     }
 }
