@@ -168,6 +168,8 @@ impl Zones {
         name: Option<&str>,
         managed: &[String],
     ) -> Result<&Zone, ZoneError> {
+        // Check everything before changing anything
+        let name = name.map(valid_name).transpose()?;
         if zone_ids.len() < 2 {
             return Err(ZoneError::Invalid(
                 "Merge needs at least two zones".to_string(),
@@ -196,7 +198,7 @@ impl Zones {
         let zone = self.zones.iter_mut().find(|z| z.id == target).unwrap();
         zone.area_ids = area_ids;
         if let Some(name) = name {
-            zone.name = valid_name(name)?;
+            zone.name = name;
         }
         self.reconcile(None, managed);
         Ok(self.get(target).unwrap())
@@ -578,5 +580,19 @@ mod tests {
                 .zones
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn test_merge_with_blank_name_changes_nothing() {
+        let mut zones = Zones::default();
+        zones.reconcile(Some(areas()), &all_managed());
+        let before = zones.zones.clone();
+        let lounge = by_name(&zones, "LOUNGE").id;
+        let study = by_name(&zones, "STUDY").id;
+
+        let result = zones.merge(&[lounge, study], Some("  "), &all_managed());
+
+        assert!(matches!(result, Err(ZoneError::Invalid(_))));
+        assert_eq!(zones.zones, before);
     }
 }

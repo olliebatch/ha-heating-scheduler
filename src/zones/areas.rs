@@ -1,6 +1,7 @@
 use crate::api_client::ApiClient;
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
+use std::time::Duration;
 
 /// A Home Assistant Area and the climate entities in it
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -14,6 +15,19 @@ pub struct Area {
 #[async_trait::async_trait]
 pub trait AreaSource: Send + Sync {
     async fn fetch_areas(&self) -> Result<Vec<Area>>;
+}
+
+/// How long to wait for Home Assistant to list its areas
+pub const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Fetch areas, giving up after `timeout` so a slow or hung Home Assistant can't hold things up
+pub async fn fetch_areas_with_timeout(
+    source: &dyn AreaSource,
+    timeout: Duration,
+) -> Result<Vec<Area>> {
+    tokio::time::timeout(timeout, source.fetch_areas())
+        .await
+        .map_err(|_| anyhow!("timed out after {} s", timeout.as_secs()))?
 }
 
 /// Renders every area with its climate entities as a JSON list. `area_entities` includes
@@ -108,5 +122,25 @@ mod tests {
     #[test]
     fn test_parse_areas_rejects_garbage() {
         assert!(parse_areas("not json").is_err());
+    }
+
+    struct HungAreas;
+
+    #[async_trait::async_trait]
+    impl AreaSource for HungAreas {
+        async fn fetch_areas(&self) -> Result<Vec<Area>> {
+            std::future::pending().await
+        }
+    }
+
+    #[tokio::test]
+    async fn test_fetch_areas_times_out() {
+        let result = fetch_areas_with_timeout(&HungAreas, Duration::from_millis(20)).await;
+        assert!(result.unwrap_err().to_string().contains("timed out"));
+
+        let areas = fetch_areas_with_timeout(&MockAreas::example(), Duration::from_millis(20))
+            .await
+            .unwrap();
+        assert_eq!(areas.len(), 2);
     }
 }

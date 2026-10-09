@@ -1,5 +1,6 @@
 use crate::climate::ClimateEntity;
 use crate::server::AppState;
+use crate::zones::areas::{DISCOVERY_TIMEOUT, fetch_areas_with_timeout};
 use crate::zones::{Zone, ZoneError, Zones, save_zones};
 use axum::Json;
 use axum::extract::{Path, State};
@@ -69,12 +70,14 @@ pub async fn get_zones<T: ClimateEntity + Clone>(
 pub async fn refresh_zones<T: ClimateEntity + Clone>(
     State(state): State<AppState<T>>,
 ) -> Result<Json<Vec<Zone>>, ApiError> {
-    let areas = state.area_source.fetch_areas().await.map_err(|e| {
-        (
-            StatusCode::BAD_GATEWAY,
-            format!("Failed to fetch areas from Home Assistant: {}", e),
-        )
-    })?;
+    let areas = fetch_areas_with_timeout(state.area_source.as_ref(), DISCOVERY_TIMEOUT)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::BAD_GATEWAY,
+                format!("Failed to fetch areas from Home Assistant: {}", e),
+            )
+        })?;
     let zones = update_zones(&state, |zones, managed| {
         zones.reconcile(Some(areas), managed);
         Ok(zones.zones.clone())
