@@ -191,6 +191,12 @@ impl Schedule {
             return;
         }
 
+        // Work in whole seconds, so a fractional start can't leave an entry owning nothing
+        for e in &mut self.entries {
+            e.time_period.start = time(secs(e.time_period.start));
+            e.time_period.end = time(secs(e.time_period.end));
+        }
+
         // Every start and end is a boundary; between two boundaries the owner can't change.
         let mut bounds: Vec<u32> = vec![0, DAY];
         for e in &self.entries {
@@ -716,6 +722,18 @@ mod tests {
         assert_normalised(&schedule);
         assert_eq!(schedule.entries.len(), 1);
         assert!(schedule.entries[0].time_period.is_full_day());
+        assert_eq!(schedule.entries[0].heating_state, HeatingState::On);
+    }
+
+    #[test]
+    fn test_add_fractional_seconds_is_kept() {
+        let mut schedule = Schedule::new("Test");
+        let start = NaiveTime::from_hms_milli_opt(8, 0, 0, 500).unwrap();
+        let end = NaiveTime::from_hms_opt(9, 0, 0).unwrap();
+        schedule.add_entry(entry("Half", TimePeriod { start, end }, HeatingState::On));
+
+        assert_normalised(&schedule);
+        assert_eq!(schedule.entries[0].time_period, TimePeriod::new(8, 0, 9, 0));
         assert_eq!(schedule.entries[0].heating_state, HeatingState::On);
     }
 
