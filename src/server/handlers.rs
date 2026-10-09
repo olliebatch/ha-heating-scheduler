@@ -1,5 +1,6 @@
 use crate::climate::{BoostInfo, ClimateEntity};
 use crate::schedule::persistence;
+use crate::schedule::sets::{ScheduleSets, SetError};
 use crate::schedule::{Schedule, ScheduleEntry, ScheduleEntryRequest};
 use crate::server::AppState;
 use axum::Json;
@@ -10,77 +11,206 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::climate::ClimateEntityWrapper;
-#[cfg(debug_assertions)]
-use crate::climate::MockClimate;
 #[cfg(not(debug_assertions))]
 use crate::climate::DefaultClimate;
 #[cfg(debug_assertions)]
+use crate::climate::MockClimate;
+#[cfg(debug_assertions)]
 use crate::schedule::HeatingState;
 
-pub async fn get_schedule<T: ClimateEntity + Clone>(
-    State(state): State<AppState<T>>,
-) -> Json<Schedule> {
-    let schedule = state.schedule.read().unwrap().clone();
-    Json(schedule)
-}
+type ApiError = (StatusCode, String);
 
-pub async fn add_schedule_entry<T: ClimateEntity + Clone>(
-    State(state): State<AppState<T>>,
-    Json(payload): Json<ScheduleEntryRequest>,
-) -> Result<Json<Schedule>, (StatusCode, String)> {
-    // Convert request to ScheduleEntry (generates UUID automatically)
-    let entry: ScheduleEntry = payload.into();
-
-    // Add entry to the in-memory schedule
-    let updated_schedule = {
-        let mut schedule = state.schedule.write().unwrap();
-        schedule.add_entry(entry);
-        schedule.clone()
+/// Apply `change` to the schedule sets under the write lock, then persist them.
+/// `change` must not modify the sets when it returns an error.
+fn update_sets<T: ClimateEntity + Clone, R>(
+    state: &AppState<T>,
+    change: impl FnOnce(&mut ScheduleSets) -> Result<R, ApiError>,
+) -> Result<R, ApiError> {
+    let (result, snapshot) = {
+        let mut sets = state.schedule.write().unwrap();
+        let result = change(&mut sets)?;
+        (result, sets.clone())
     };
 
-    // Persist the updated schedule to disk
-    if let Err(e) = persistence::save_schedule(&updated_schedule, &state.schedule_file_path) {
-        eprintln!("Failed to save schedule to disk: {}", e);
+    if let Err(e) = persistence::save_sets(&snapshot, &state.schedule_sets_file_path) {
+        eprintln!("Failed to save schedule sets to disk: {}", e);
         return Err((
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("Failed to persist schedule: {}", e),
         ));
     }
+    Ok(result)
+}
+
+fn set_error(e: SetError) -> ApiError {
+    match e {
+        SetError::NotFound => (StatusCode::NOT_FOUND, "Schedule set not found".to_string()),
+        SetError::Conflict(msg) => (StatusCode::CONFLICT, msg),
+        SetError::Invalid(msg) => (StatusCode::BAD_REQUEST, msg),
+    }
+}
+
+/// The active schedule
+pub async fn get_schedule<T: ClimateEntity + Clone>(
+    State(state): State<AppState<T>>,
+) -> Json<Schedule> {
+    let schedule = state.schedule.read().unwrap().active().clone();
+    Json(schedule)
+}
+
+/// Add an entry to the active schedule
+pub async fn add_schedule_entry<T: ClimateEntity + Clone>(
+    State(state): State<AppState<T>>,
+    Json(payload): Json<ScheduleEntryRequest>,
+) -> Result<Json<Schedule>, ApiError> {
+    // Convert request to ScheduleEntry (generates UUID automatically)
+    let entry: ScheduleEntry = payload.into();
+
+    let updated_schedule = update_sets(&state, |sets| {
+        let schedule = sets.active_mut();
+        schedule.add_entry(entry);
+        Ok(schedule.clone())
+    })?;
 
     println!("Schedule updated and saved");
     Ok(Json(updated_schedule))
 }
 
+/// Delete an entry from the active schedule
 pub async fn delete_schedule_entry<T: ClimateEntity + Clone>(
     State(state): State<AppState<T>>,
     Path(entry_id): Path<Uuid>,
-) -> Result<Json<Schedule>, (StatusCode, String)> {
-    // Delete entry from the in-memory schedule
-    let updated_schedule = {
-        let mut schedule = state.schedule.write().unwrap();
-
-        // Attempt to delete the entry
-        if let Err(e) = schedule.delete_entry(entry_id) {
-            return Err((
+) -> Result<Json<Schedule>, ApiError> {
+    let updated_schedule = update_sets(&state, |sets| {
+        let schedule = sets.active_mut();
+        schedule.delete_entry(entry_id).map_err(|e| {
+            (
                 StatusCode::NOT_FOUND,
                 format!("Failed to delete entry: {}", e),
-            ));
-        }
-
-        schedule.clone()
-    };
-
-    // Persist the updated schedule to disk
-    if let Err(e) = persistence::save_schedule(&updated_schedule, &state.schedule_file_path) {
-        eprintln!("Failed to save schedule to disk: {}", e);
-        return Err((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Failed to persist schedule: {}", e),
-        ));
-    }
+            )
+        })?;
+        Ok(schedule.clone())
+    })?;
 
     println!("Schedule entry deleted and saved");
     Ok(Json(updated_schedule))
+}
+
+pub async fn get_schedule_sets<T: ClimateEntity + Clone>(
+    State(state): State<AppState<T>>,
+) -> Json<ScheduleSets> {
+    Json(state.schedule.read().unwrap().clone())
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct CreateSetRequest {
+    pub name: String,
+    pub copy_from: Option<Uuid>,
+}
+
+/// Create a set: a full-day Off schedule, or a copy of `copy_from`
+pub async fn create_schedule_set<T: ClimateEntity + Clone>(
+    State(state): State<AppState<T>>,
+    Json(payload): Json<CreateSetRequest>,
+) -> Result<Json<Schedule>, ApiError> {
+    let created = update_sets(&state, |sets| {
+        sets.create(&payload.name, payload.copy_from)
+            .cloned()
+            .map_err(set_error)
+    })?;
+    Ok(Json(created))
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct RenameSetRequest {
+    pub name: String,
+}
+
+pub async fn rename_schedule_set<T: ClimateEntity + Clone>(
+    State(state): State<AppState<T>>,
+    Path(set_id): Path<Uuid>,
+    Json(payload): Json<RenameSetRequest>,
+) -> Result<Json<Schedule>, ApiError> {
+    let renamed = update_sets(&state, |sets| {
+        sets.rename(set_id, &payload.name)
+            .cloned()
+            .map_err(set_error)
+    })?;
+    Ok(Json(renamed))
+}
+
+/// Delete a set; the active set and the last set are refused with 409
+pub async fn delete_schedule_set<T: ClimateEntity + Clone>(
+    State(state): State<AppState<T>>,
+    Path(set_id): Path<Uuid>,
+) -> Result<Json<ScheduleSets>, ApiError> {
+    let sets = update_sets(&state, |sets| {
+        sets.delete(set_id).map_err(set_error)?;
+        Ok(sets.clone())
+    })?;
+    Ok(Json(sets))
+}
+
+pub async fn activate_schedule_set<T: ClimateEntity + Clone>(
+    State(state): State<AppState<T>>,
+    Path(set_id): Path<Uuid>,
+) -> Result<Json<ScheduleSets>, ApiError> {
+    let sets = update_sets(&state, |sets| {
+        sets.activate(set_id).map_err(set_error)?;
+        Ok(sets.clone())
+    })?;
+    Ok(Json(sets))
+}
+
+/// Add an entry to any set; a zero-length period is refused with 400
+pub async fn add_set_entry<T: ClimateEntity + Clone>(
+    State(state): State<AppState<T>>,
+    Path(set_id): Path<Uuid>,
+    Json(payload): Json<ScheduleEntryRequest>,
+) -> Result<Json<Schedule>, ApiError> {
+    let period = payload.time_period;
+    if period.start == period.end && !period.is_full_day() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Start and end must differ (use 00:00 - 00:00 for the whole day)".to_string(),
+        ));
+    }
+    let entry: ScheduleEntry = payload.into();
+
+    let updated = update_sets(&state, |sets| {
+        let schedule = sets
+            .get_mut(set_id)
+            .ok_or_else(|| set_error(SetError::NotFound))?;
+        schedule.add_entry(entry);
+        Ok(schedule.clone())
+    })?;
+    Ok(Json(updated))
+}
+
+/// Delete an entry from any set; deleting the only entry is refused with 409
+pub async fn delete_set_entry<T: ClimateEntity + Clone>(
+    State(state): State<AppState<T>>,
+    Path((set_id, entry_id)): Path<(Uuid, Uuid)>,
+) -> Result<Json<Schedule>, ApiError> {
+    let updated = update_sets(&state, |sets| {
+        let schedule = sets
+            .get_mut(set_id)
+            .ok_or_else(|| set_error(SetError::NotFound))?;
+        if !schedule.entries.iter().any(|e| e.id == entry_id) {
+            return Err((StatusCode::NOT_FOUND, "Entry not found".to_string()));
+        }
+        if schedule.entries.len() == 1 {
+            return Err((
+                StatusCode::CONFLICT,
+                "Cannot delete the only schedule entry".to_string(),
+            ));
+        }
+        schedule
+            .delete_entry(entry_id)
+            .map_err(|e| (StatusCode::NOT_FOUND, e))?;
+        Ok(schedule.clone())
+    })?;
+    Ok(Json(updated))
 }
 
 pub async fn boost_all<T: ClimateEntity + Clone>(
@@ -190,16 +320,20 @@ pub async fn add_entities(
     State(state): State<AppState<ClimateEntityWrapper>>,
     Json(payload): Json<AddEntitiesRequest>,
 ) -> Result<Json<Vec<String>>, (StatusCode, String)> {
-    use crate::config::entities_persistence::{save_entities, EntitiesConfig};
+    use crate::config::entities_persistence::{EntitiesConfig, save_entities};
 
     // Get current entity IDs
     let current_ids: Vec<String> = {
         let climates = state.climate_entities.read().unwrap();
-        climates.iter().map(|e| e.get_entity_id().to_string()).collect()
+        climates
+            .iter()
+            .map(|e| e.get_entity_id().to_string())
+            .collect()
     };
 
     // Filter out entities that already exist
-    let new_entity_ids: Vec<String> = payload.entity_ids
+    let new_entity_ids: Vec<String> = payload
+        .entity_ids
         .into_iter()
         .filter(|id| !current_ids.contains(id))
         .collect();
@@ -224,14 +358,19 @@ pub async fn add_entities(
     {
         let mut climates = state.climate_entities.write().unwrap();
         for entity_id in &new_entity_ids {
-            climates.push(ClimateEntityWrapper::Real(DefaultClimate::new(entity_id.clone())));
+            climates.push(ClimateEntityWrapper::Real(DefaultClimate::new(
+                entity_id.clone(),
+            )));
         }
     }
 
     // Get updated list
     let all_entity_ids: Vec<String> = {
         let climates = state.climate_entities.read().unwrap();
-        climates.iter().map(|e| e.get_entity_id().to_string()).collect()
+        climates
+            .iter()
+            .map(|e| e.get_entity_id().to_string())
+            .collect()
     };
 
     // Persist to disk
@@ -253,7 +392,7 @@ pub async fn remove_entity(
     State(state): State<AppState<ClimateEntityWrapper>>,
     Json(payload): Json<RemoveEntityRequest>,
 ) -> Result<Json<Vec<String>>, (StatusCode, String)> {
-    use crate::config::entities_persistence::{save_entities, EntitiesConfig};
+    use crate::config::entities_persistence::{EntitiesConfig, save_entities};
 
     // Remove entity from the list
     {
@@ -264,7 +403,10 @@ pub async fn remove_entity(
     // Get updated list
     let all_entity_ids: Vec<String> = {
         let climates = state.climate_entities.read().unwrap();
-        climates.iter().map(|e| e.get_entity_id().to_string()).collect()
+        climates
+            .iter()
+            .map(|e| e.get_entity_id().to_string())
+            .collect()
     };
 
     // Persist to disk
@@ -279,4 +421,175 @@ pub async fn remove_entity(
 
     println!("Removed entity: {}", payload.entity_id);
     Ok(Json(all_entity_ids))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::climate::MockClimate;
+    use crate::schedule::{HeatingState, TimePeriod};
+    use std::sync::{Arc, RwLock};
+    use tempfile::TempDir;
+
+    fn test_state() -> (AppState<MockClimate>, TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let sets = ScheduleSets::from_schedule(Schedule::new("Work week"));
+        let state = AppState {
+            schedule: Arc::new(RwLock::new(sets)),
+            schedule_sets_file_path: dir
+                .path()
+                .join("schedule_sets.json")
+                .to_string_lossy()
+                .to_string(),
+            climate_entities: Arc::new(RwLock::new(Vec::new())),
+            entities_file_path: dir
+                .path()
+                .join("entities.json")
+                .to_string_lossy()
+                .to_string(),
+        };
+        (state, dir)
+    }
+
+    fn on(start: u32, end: u32) -> ScheduleEntryRequest {
+        ScheduleEntryRequest {
+            name: "On".to_string(),
+            time_period: TimePeriod::new(start, 0, end, 0),
+            heating_state: HeatingState::On,
+        }
+    }
+
+    async fn create(state: &AppState<MockClimate>, name: &str) -> Schedule {
+        create_schedule_set(
+            State(state.clone()),
+            Json(CreateSetRequest {
+                name: name.to_string(),
+                copy_from: None,
+            }),
+        )
+        .await
+        .unwrap()
+        .0
+    }
+
+    #[tokio::test]
+    async fn test_editing_inactive_set_leaves_active_alone_and_persists() {
+        let (state, _dir) = test_state();
+        let holiday = create(&state, "Holiday").await;
+
+        let updated = add_set_entry(State(state.clone()), Path(holiday.id), Json(on(8, 17)))
+            .await
+            .unwrap()
+            .0;
+
+        assert_eq!(updated.entries.len(), 2);
+        let active = get_schedule(State(state.clone())).await.0;
+        assert_eq!(active.name, "Work week");
+        assert_eq!(active.entries.len(), 1);
+
+        let saved = persistence::load_sets(&state.schedule_sets_file_path).unwrap();
+        assert_eq!(saved.get(holiday.id).unwrap().entries.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_legacy_routes_follow_the_active_set() {
+        let (state, _dir) = test_state();
+        let holiday = create(&state, "Holiday").await;
+        let sets = activate_schedule_set(State(state.clone()), Path(holiday.id))
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(sets.active_id, holiday.id);
+
+        let updated = add_schedule_entry(State(state.clone()), Json(on(8, 17)))
+            .await
+            .unwrap()
+            .0;
+
+        assert_eq!(updated.id, holiday.id);
+        let sets = get_schedule_sets(State(state.clone())).await.0;
+        assert_eq!(sets.active_id, holiday.id);
+        assert_eq!(sets.sets[0].entries.len(), 1, "Work week untouched");
+    }
+
+    #[tokio::test]
+    async fn test_delete_set_status_codes() {
+        let (state, _dir) = test_state();
+        let active_id = state.schedule.read().unwrap().active_id;
+        let holiday = create(&state, "Holiday").await;
+
+        let err = delete_schedule_set(State(state.clone()), Path(active_id))
+            .await
+            .unwrap_err();
+        assert_eq!(err.0, StatusCode::CONFLICT);
+
+        let err = delete_schedule_set(State(state.clone()), Path(Uuid::new_v4()))
+            .await
+            .unwrap_err();
+        assert_eq!(err.0, StatusCode::NOT_FOUND);
+
+        let sets = delete_schedule_set(State(state.clone()), Path(holiday.id))
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(sets.sets.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_set_entry_status_codes() {
+        let (state, _dir) = test_state();
+        let set = state.schedule.read().unwrap().active().clone();
+
+        // Zero-length add
+        let err = add_set_entry(State(state.clone()), Path(set.id), Json(on(10, 10)))
+            .await
+            .unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+
+        // Only entry
+        let err = delete_set_entry(State(state.clone()), Path((set.id, set.entries[0].id)))
+            .await
+            .unwrap_err();
+        assert_eq!(err.0, StatusCode::CONFLICT);
+
+        // Missing entry and missing set
+        let err = delete_set_entry(State(state.clone()), Path((set.id, Uuid::new_v4())))
+            .await
+            .unwrap_err();
+        assert_eq!(err.0, StatusCode::NOT_FOUND);
+        let err = add_set_entry(State(state.clone()), Path(Uuid::new_v4()), Json(on(8, 9)))
+            .await
+            .unwrap_err();
+        assert_eq!(err.0, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_rename_and_empty_name() {
+        let (state, _dir) = test_state();
+        let holiday = create(&state, "Holiday").await;
+
+        let renamed = rename_schedule_set(
+            State(state.clone()),
+            Path(holiday.id),
+            Json(RenameSetRequest {
+                name: "Away".to_string(),
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(renamed.id, holiday.id);
+        assert_eq!(renamed.name, "Away");
+
+        let err = rename_schedule_set(
+            State(state.clone()),
+            Path(holiday.id),
+            Json(RenameSetRequest {
+                name: " ".to_string(),
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+    }
 }
