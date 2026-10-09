@@ -4,6 +4,7 @@ use std::fmt;
 use uuid::Uuid;
 
 pub mod persistence;
+pub mod sets;
 
 /// Represents a time period within a day (e.g., 08:00 - 22:00)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -122,6 +123,9 @@ impl Default for ScheduleEntry {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Schedule {
+    /// Stable across renames and restarts. Files saved before ids existed get a new one on load.
+    #[serde(default = "Uuid::new_v4")]
+    pub id: Uuid,
     pub name: String,
     pub entries: Vec<ScheduleEntry>,
 }
@@ -129,6 +133,7 @@ pub struct Schedule {
 impl Schedule {
     pub fn new(name: impl Into<String>) -> Self {
         Schedule {
+            id: Uuid::new_v4(),
             name: name.into(),
             entries: vec![ScheduleEntry::default()],
         }
@@ -600,6 +605,7 @@ mod tests {
         let day = entry("Day", TimePeriod::new(6, 0, 22, 0), HeatingState::On);
         let late_id = late.id;
         let mut schedule = Schedule {
+            id: Uuid::new_v4(),
             name: "Test".into(),
             entries: vec![early, day, late],
         };

@@ -8,4 +8,4 @@ pub mod server;
 
 pub mod scheduler;
 
-pub type ScheduleState = Arc<RwLock<schedule::Schedule>>;
+pub type ScheduleState = Arc<RwLock<schedule::sets::ScheduleSets>>;

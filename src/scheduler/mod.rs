@@ -103,8 +103,8 @@ pub async fn run_scheduler<T: ClimateEntity + Clone>(state: SchedulerState<T>) {
 
         // Get current scheduled state
         let desired_state = {
-            let schedule = state.schedule.read().unwrap();
-            schedule.get_current_state(&now)
+            let sets = state.schedule.read().unwrap();
+            sets.active().get_current_state(&now)
         };
 
         // Clone entities to avoid holding lock across await points
@@ -115,10 +115,7 @@ pub async fn run_scheduler<T: ClimateEntity + Clone>(state: SchedulerState<T>) {
 
         // Process entities outside the lock
         for entity in entities_clone.iter_mut() {
-            if let Err(e) = entity
-                .fetch_and_update_state(&state.api_client)
-                .await
-            {
+            if let Err(e) = entity.fetch_and_update_state(&state.api_client).await {
                 eprintln!(
                     "[{}] Error fetching state for {}: {}",
                     now.format("%Y-%m-%d %H:%M:%S"),

@@ -26,10 +26,22 @@ CLIMATE_ENTITY=climate.living_room,climate.bedroom
 
 ## API Endpoints
 
-### Schedule
-- `GET /schedule` - Get current schedule
-- `POST /schedule` - Add schedule entry
-- `DELETE /schedule/{id}` - Delete schedule entry
+### Schedule sets
+Schedules are kept as named sets in `data/schedule_sets.json`; one is active and drives the heating.
+On first run, an existing `data/schedule.json` becomes the only (active) set and is left on disk as a backup.
+
+- `GET /schedule_sets` - All sets and the `active_id`
+- `POST /schedule_sets` - Create a set: `{"name": "Holiday", "copy_from": "<set id>"}` (`copy_from` optional; without it the set is Off all day). Returns the set
+- `PATCH /schedule_sets/{id}` - Rename: `{"name": "Away"}`. Returns the set
+- `DELETE /schedule_sets/{id}` - Delete a set (409 for the active or last set). Returns all sets
+- `POST /schedule_sets/{id}/activate` - Make a set active. Returns all sets
+- `POST /schedule_sets/{id}/entries` - Add an entry to a set (400 if start equals end, except 00:00 - 00:00). Returns the set
+- `DELETE /schedule_sets/{id}/entries/{entry_id}` - Delete an entry (409 for the only entry). Returns the set
+
+### Schedule (active set)
+- `GET /schedule` - Get the active schedule
+- `POST /schedule` - Add an entry to the active schedule
+- `DELETE /schedule/{id}` - Delete an entry from the active schedule
 
 ### Entities
 - `GET /entities` - List all entities with status

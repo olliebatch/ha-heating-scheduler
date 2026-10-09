@@ -1,4 +1,5 @@
 use super::Schedule;
+use super::sets::ScheduleSets;
 use anyhow::{Context, Result};
 use std::fs;
 use std::path::Path;
@@ -49,6 +50,69 @@ pub fn load_or_create_default<P: AsRef<Path>>(path: P) -> Result<Schedule> {
         println!("Default schedule saved to: {}", path.display());
         Ok(schedule)
     }
+}
+
+/// Load schedule sets from a JSON file
+pub fn load_sets<P: AsRef<Path>>(path: P) -> Result<ScheduleSets> {
+    let path = path.as_ref();
+    let contents = fs::read_to_string(path)
+        .with_context(|| format!("Failed to read schedule sets file: {}", path.display()))?;
+
+    let mut sets: ScheduleSets = serde_json::from_str(&contents).with_context(|| {
+        format!(
+            "Failed to parse schedule sets JSON from: {}",
+            path.display()
+        )
+    })?;
+
+    sets.normalise();
+    Ok(sets)
+}
+
+/// Save schedule sets to a JSON file
+pub fn save_sets<P: AsRef<Path>>(sets: &ScheduleSets, path: P) -> Result<()> {
+    let path = path.as_ref();
+    let json =
+        serde_json::to_string_pretty(sets).context("Failed to serialize schedule sets to JSON")?;
+
+    fs::write(path, json)
+        .with_context(|| format!("Failed to write schedule sets file: {}", path.display()))?;
+
+    Ok(())
+}
+
+/// Load schedule sets, or migrate from a single schedule if there are none yet.
+///
+/// When `sets_path` doesn't exist, the schedule at `schedule_path` (or the default schedule)
+/// becomes the only set, marked active, and is saved to `sets_path`. `schedule_path` is left
+/// on disk untouched as a backup.
+pub fn load_or_migrate<P: AsRef<Path>, Q: AsRef<Path>>(
+    sets_path: P,
+    schedule_path: Q,
+) -> Result<ScheduleSets> {
+    let sets_path = sets_path.as_ref();
+    let schedule_path = schedule_path.as_ref();
+
+    if sets_path.exists() {
+        println!("Loading schedule sets from: {}", sets_path.display());
+        return load_sets(sets_path);
+    }
+
+    let schedule = if schedule_path.exists() {
+        println!(
+            "Migrating schedule from {} into schedule sets",
+            schedule_path.display()
+        );
+        load_schedule(schedule_path)?
+    } else {
+        println!("No schedule found, creating default schedule set...");
+        Schedule::new("Default Heating Schedule")
+    };
+
+    let sets = ScheduleSets::from_schedule(schedule);
+    save_sets(&sets, sets_path).context("Failed to save migrated schedule sets")?;
+    println!("Schedule sets saved to: {}", sets_path.display());
+    Ok(sets)
 }
 
 #[cfg(test)]
@@ -106,6 +170,7 @@ mod tests {
         let file_path = dir.path().join("schedule.json");
 
         let schedule = Schedule {
+            id: uuid::Uuid::new_v4(),
             name: "Fragmented".into(),
             entries: vec![
                 ScheduleEntry::new("a", TimePeriod::new(0, 0, 6, 0), HeatingState::Off),
@@ -125,5 +190,69 @@ mod tests {
         );
         assert_eq!(loaded.entries[0].name, "b");
         assert_eq!(loaded.entries[1].name, "d");
+    }
+
+    #[test]
+    fn test_migrate_from_legacy_schedule_file() {
+        let dir = tempdir().unwrap();
+        let schedule_path = dir.path().join("schedule.json");
+        let sets_path = dir.path().join("schedule_sets.json");
+
+        // A schedule.json as saved before schedules had ids
+        let legacy = r#"{
+            "name": "Old",
+            "entries": [
+                {"id": "00000000-0000-4000-8000-000000000001", "name": "night",
+                 "time_period": {"start": "22:00:00", "end": "00:00:00"}, "heating_state": "OFF"},
+                {"id": "00000000-0000-4000-8000-000000000002", "name": "early",
+                 "time_period": {"start": "00:00:00", "end": "06:00:00"}, "heating_state": "OFF"},
+                {"id": "00000000-0000-4000-8000-000000000003", "name": "day",
+                 "time_period": {"start": "06:00:00", "end": "22:00:00"}, "heating_state": "ON"}
+            ]
+        }"#;
+        fs::write(&schedule_path, legacy).unwrap();
+
+        let sets = load_or_migrate(&sets_path, &schedule_path).unwrap();
+
+        assert_eq!(sets.sets.len(), 1);
+        assert_eq!(sets.active().name, "Old");
+        assert_eq!(sets.active().entries.len(), 2, "migrated set is normalised");
+        assert!(sets_path.exists());
+        assert_eq!(fs::read_to_string(&schedule_path).unwrap(), legacy);
+
+        // The id given on migration is stable across restarts
+        let reloaded = load_or_migrate(&sets_path, &schedule_path).unwrap();
+        assert_eq!(reloaded.active_id, sets.active_id);
+        assert_eq!(reloaded.active().id, sets.active().id);
+    }
+
+    #[test]
+    fn test_migrate_without_any_file_creates_default() {
+        let dir = tempdir().unwrap();
+        let schedule_path = dir.path().join("schedule.json");
+        let sets_path = dir.path().join("schedule_sets.json");
+
+        let sets = load_or_migrate(&sets_path, &schedule_path).unwrap();
+
+        assert_eq!(sets.sets.len(), 1);
+        assert!(sets.active().entries[0].time_period.is_full_day());
+        assert!(sets_path.exists());
+        assert!(!schedule_path.exists());
+    }
+
+    #[test]
+    fn test_save_and_load_sets() {
+        let dir = tempdir().unwrap();
+        let sets_path = dir.path().join("schedule_sets.json");
+        let mut sets = ScheduleSets::from_schedule(Schedule::new("Work week"));
+        let holiday = sets.create("Holiday", None).unwrap().id;
+        sets.activate(holiday).unwrap();
+
+        save_sets(&sets, &sets_path).unwrap();
+        let loaded = load_sets(&sets_path).unwrap();
+
+        assert_eq!(loaded.active_id, holiday);
+        let ids: Vec<_> = loaded.sets.iter().map(|s| s.id).collect();
+        assert_eq!(ids, sets.sets.iter().map(|s| s.id).collect::<Vec<_>>());
     }
 }
