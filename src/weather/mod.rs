@@ -9,6 +9,7 @@ use std::path::Path;
 use std::sync::{Arc, RwLock};
 
 pub mod adjust;
+pub mod early;
 
 /// Outside conditions, in °C, km/h and percent. Any of them can be missing.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]

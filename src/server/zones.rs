@@ -137,6 +137,7 @@ pub struct UpdateZoneRequest {
     pub sun_windows: Option<Vec<TimePeriod>>,
     pub wind_exposure: Option<WindExposure>,
     pub weather_adjust: Option<bool>,
+    pub max_early_start_minutes: Option<u32>,
 }
 
 pub async fn update_zone<T: ClimateEntity + Clone>(
@@ -169,6 +170,7 @@ pub async fn update_zone<T: ClimateEntity + Clone>(
                 payload.sun_windows.clone(),
                 payload.wind_exposure,
                 payload.weather_adjust,
+                payload.max_early_start_minutes,
             )
             .map_err(zone_error)?;
         if let Some(name) = &payload.name {

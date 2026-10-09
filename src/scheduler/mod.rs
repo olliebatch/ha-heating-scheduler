@@ -4,6 +4,7 @@ use crate::schedule::HeatingState;
 use crate::schedule::TARGET_TEMP_RANGE;
 use crate::schedule::sets::ScheduleSets;
 use crate::weather::adjust::{Reason, adjust_target};
+use crate::weather::early::{EarlyStart, early_start};
 use crate::weather::{Held, KEEP_READING_FOR, Weather, WeatherSource};
 use crate::zones::{Zone, Zones};
 use crate::{ScheduleState, WeatherState, ZonesState};
@@ -122,6 +123,9 @@ pub struct ZoneStatus {
     pub raw_target: Option<f64>,
     /// The target was kept at its previous value because the weather moved it only slightly
     pub held: bool,
+    /// Set while an upcoming On period is being started early; `state` and the targets are
+    /// then that period's
+    pub early_start: Option<EarlyStart>,
 }
 
 /// How far the unrounded target must move from a held target before the target changes:
@@ -131,6 +135,9 @@ const HOLD_BAND: f64 = 0.5;
 /// A zone's state and target at `time`: from its schedule set (or the active set when it follows
 /// the active set, its set no longer exists, or there is no zone), adjusted for the weather when
 /// the zone has weather adjust on and is scheduled On. Off is never adjusted.
+///
+/// With weather adjust on, a zone that is Off is turned On early for its next On period when the
+/// weather calls for it (see [`early_start`]), at that period's (adjusted) target.
 ///
 /// `held` is the zone's previous adjusted target. While the scheduled target is the same and the
 /// unrounded target stays within [`HOLD_BAND`] of it, the held target is kept, so an outside
@@ -146,7 +153,24 @@ pub fn zone_status(
         .and_then(|z| z.schedule_set_id)
         .and_then(|id| sets.get(id))
         .unwrap_or_else(|| sets.active());
-    let entry = schedule.get_active_entry(time);
+    let mut entry = schedule.get_active_entry(time);
+
+    // Start the next On period early when it's cold or windy (weather adjust zones only)
+    let early_start = match (zone, weather) {
+        (Some(zone), Some(weather)) if zone.weather_adjust => early_start(
+            schedule,
+            time.time(),
+            weather,
+            zone.wind_exposure,
+            zone.max_early_start_minutes,
+        ),
+        _ => None,
+    };
+    let early_start = early_start.map(|(next, early)| {
+        entry = Some(next);
+        early
+    });
+
     let state = entry
         .map(|e| e.heating_state.clone())
         .unwrap_or(HeatingState::Off);
@@ -186,6 +210,7 @@ pub fn zone_status(
         raw_target: adjusted.as_ref().map(|a| a.raw),
         reasons: adjusted.map(|a| a.reasons).unwrap_or_default(),
         held: hold,
+        early_start,
     }
 }
 
@@ -903,5 +928,125 @@ mod tests {
         }
 
         assert_eq!(sent(&entity), vec![22.0], "one send, none for the hiccup");
+    }
+
+    /// Today at hh:mm, local time
+    fn today_at(hour: u32, minute: u32) -> chrono::DateTime<Local> {
+        use chrono::TimeZone;
+        let time = chrono::NaiveTime::from_hms_opt(hour, minute, 0).unwrap();
+        Local
+            .from_local_datetime(&Local::now().date_naive().and_time(time))
+            .earliest()
+            .unwrap()
+    }
+
+    fn morning_sets() -> ScheduleSets {
+        use crate::schedule::{Schedule, ScheduleEntry, TimePeriod};
+        let mut schedule = Schedule::new("Mornings");
+        schedule.add_entry(
+            ScheduleEntry::new("Morning", TimePeriod::new(7, 0, 9, 0), HeatingState::On)
+                .with_target(21.0),
+        );
+        ScheduleSets::from_schedule(schedule)
+    }
+
+    fn adjusting_zone() -> (Zones, Uuid) {
+        let mut zones = Zones::default();
+        zones.reconcile(Some(vec![]), &["climate.test".to_string()]);
+        zones.zones[0].weather_adjust = true;
+        let id = zones.zones[0].id;
+        (zones, id)
+    }
+
+    fn freezing() -> Weather {
+        Weather {
+            temperature: Some(-2.0),
+            wind_speed: Some(0.0),
+            cloud_coverage: Some(100.0),
+        }
+    }
+
+    #[test]
+    fn test_zone_status_starts_early_when_cold() {
+        let sets = morning_sets();
+        let (zones, _) = adjusting_zone();
+        let zone = &zones.zones[0];
+
+        let status = zone_status(Some(zone), &sets, Some(&freezing()), None, &today_at(6, 45));
+
+        assert_eq!(status.state, HeatingState::On);
+        assert_eq!(status.scheduled_target, Some(21.0));
+        // -2 °C also adjusts the target: +1.1 cold -> 22.1, rounded to 22.0
+        assert_eq!(status.target, Some(22.0));
+        let early = status.early_start.unwrap();
+        assert_eq!(
+            early.period_start,
+            chrono::NaiveTime::from_hms_opt(7, 0, 0).unwrap()
+        );
+        assert_eq!(early.lead_minutes, 30);
+
+        // Too early yet, weather adjust off, or early start disabled: still Off
+        let too_early = zone_status(Some(zone), &sets, Some(&freezing()), None, &today_at(6, 20));
+        assert_eq!(too_early.state, HeatingState::Off);
+        let mut off_zone = zone.clone();
+        off_zone.weather_adjust = false;
+        let status = zone_status(
+            Some(&off_zone),
+            &sets,
+            Some(&freezing()),
+            None,
+            &today_at(6, 45),
+        );
+        assert_eq!(status.state, HeatingState::Off);
+        let mut disabled = zone.clone();
+        disabled.max_early_start_minutes = 0;
+        let status = zone_status(
+            Some(&disabled),
+            &sets,
+            Some(&freezing()),
+            None,
+            &today_at(6, 45),
+        );
+        assert_eq!(status.state, HeatingState::Off);
+        assert!(status.early_start.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_early_start_sends_once_into_the_period() {
+        let sets = morning_sets();
+        let (zones, id) = adjusting_zone();
+        let mut held = HashMap::new();
+        let mut entity = mock(HeatingState::Off);
+        let mut last = None;
+
+        let mut states = Vec::new();
+        for (hour, minute) in [(6, 20), (6, 35), (6, 50), (7, 0), (7, 30), (9, 0)] {
+            let now = today_at(hour, minute);
+            let status =
+                zone_statuses(&zones, &sets, Some(&freezing()), &mut held, &now)[&id].clone();
+            states.push((status.state.clone(), status.early_start.is_some()));
+            tick(
+                &mut entity,
+                &scheduled(status.state, status.target),
+                &mut last,
+            )
+            .await;
+        }
+
+        use HeatingState::*;
+        assert_eq!(
+            states,
+            vec![
+                (Off, false),
+                (On, true),
+                (On, true),
+                (On, false),
+                (On, false),
+                (Off, false),
+            ]
+        );
+        // Turned On at 06:35 with 22.0, unchanged into the period, nothing sent when Off
+        assert_eq!(sent(&entity), vec![22.0]);
+        assert_eq!(*entity.mode.lock().unwrap(), Some(Off));
     }
 }

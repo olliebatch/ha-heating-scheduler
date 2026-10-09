@@ -74,13 +74,19 @@ The result is clamped to 5-30 °C and to the climate's own min/max, and rounded 
 target is held until the unrounded value moves at least 0.5 °C from it (0.25 °C past the rounding boundary), so an
 outside temperature wobbling around a boundary doesn't re-command TRVs. Off periods are never adjusted.
 
+Early start: with weather adjust on, a zone's next On period starts up to `max_early_start_minutes` early (default
+30, 0 disables) when it's cold or windy: none at 10 °C or warmer outside, the full amount at -2 °C or colder, with
+wind adding up to a quarter (medium exposure) or half (high) of it. The zone then heats to that period's (adjusted)
+target. End times never move, and nothing else turns heating on during an Off period.
+
 - `GET /weather` - The configured weather entity, the last reading and any error
 - `PUT /weather` - Choose the weather entity: `{"entity_id": "weather.home"}` (`null` to stop); stored in `data/weather.json`
 - `POST /weather/mock` - Debug builds only: set the mock weather, e.g. `{"temperature": -2, "wind_speed": 40, "cloud_coverage": 10}`
 - `PATCH /zones/{id}` also takes `sun_windows` (`[{"start": "08:00", "end": "11:00"}]`), `wind_exposure`
-  (`low`/`medium`/`high`) and `weather_adjust` (`true`/`false`)
+  (`low`/`medium`/`high`), `weather_adjust` (`true`/`false`) and `max_early_start_minutes` (0-180)
 - `GET /zones` includes each zone's `status`: `state`, `scheduled_target`, adjusted `target`, `reasons`,
-  `raw_target` (before clamping, rounding and holding) and `held`
+  `raw_target` (before clamping, rounding and holding), `held` and `early_start` (`period_start`, `lead_minutes`,
+  `causes`) while a period is being started early
 
 ### Schedule (active set)
 - `GET /schedule` - Get the active schedule
