@@ -44,9 +44,10 @@ impl AreaSource for HomeAssistantAreas {
     async fn fetch_areas(&self) -> Result<Vec<Area>> {
         let text = self
             .api_client
-            .post("/api/template")
-            .json(&serde_json::json!({ "template": AREAS_TEMPLATE }))
-            .send()
+            .post(
+                "/api/template",
+                &serde_json::json!({ "template": AREAS_TEMPLATE }),
+            )
             .await?
             .error_for_status()?
             .text()

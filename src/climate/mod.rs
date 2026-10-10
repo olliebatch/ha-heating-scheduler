@@ -162,11 +162,8 @@ impl ClimateEntity for DefaultClimate {
         });
 
         api_client
-            .post("/api/services/climate/set_hvac_mode")
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| anyhow!(e))?;
+            .post("/api/services/climate/set_hvac_mode", &body)
+            .await?;
 
         Ok(())
     }
@@ -179,11 +176,8 @@ impl ClimateEntity for DefaultClimate {
         });
 
         api_client
-            .post("/api/services/climate/set_hvac_mode")
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| anyhow!(e))?;
+            .post("/api/services/climate/set_hvac_mode", &body)
+            .await?;
 
         Ok(())
     }
@@ -200,12 +194,9 @@ impl ClimateEntity for DefaultClimate {
         });
 
         api_client
-            .post("/api/services/climate/set_temperature")
-            .json(&body)
-            .send()
-            .await
-            .and_then(|response| response.error_for_status())
-            .map_err(|e| anyhow!(e))?;
+            .post("/api/services/climate/set_temperature", &body)
+            .await?
+            .error_for_status()?;
 
         Ok(())
     }

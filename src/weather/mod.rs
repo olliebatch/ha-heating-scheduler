@@ -40,7 +40,6 @@ impl WeatherSource for HomeAssistantWeather {
         let state: Value = self
             .api_client
             .get(&format!("/api/states/{}", entity_id))
-            .send()
             .await?
             .error_for_status()?
             .json()
