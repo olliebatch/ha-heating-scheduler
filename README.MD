@@ -115,6 +115,23 @@ Production mode:
 cargo run --release
 ```
 
+## Try it locally (fake data)
+
+One command runs the debug backend (mock climates, mock areas and mock weather) and the panel's dev server, so you
+can try zones and weather without a Home Assistant. It needs Rust, Node 24 with corepack (`corepack enable` once if
+`corepack pnpm` isn't found), curl, and the panel cloned next to this repo as `../ha-heating-scheduler-panel` (or
+set `PANEL_DIR`).
+
+```bash
+scripts/demo.sh
+```
+
+It demos this clone's current branch, with the panel branch of the same name if there is one, else panel `main`;
+`scripts/demo.sh <backend-ref> <panel-ref>` picks others (`--help` has the details). It works in throwaway git
+worktrees and an empty data folder, so your checkouts and any real `data/` or `.env` are left alone, and nothing
+talks to a real Home Assistant. Open the panel URL it prints and follow its "what to try" list; Ctrl-C stops both
+and cleans up. It needs ports 3000 and 5173 free (`PANEL_PORT` changes the panel's).
+
 ## Testing
 
 ```bash
