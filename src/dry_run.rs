@@ -40,13 +40,27 @@ pub struct DryRun {
     calls: Mutex<VecDeque<WouldBeCall>>,
 }
 
-/// Dry run is on with `--dry-run` or `DRY_RUN=1` (or `true`); off by default
-pub fn enabled(args: impl IntoIterator<Item = String>, env: Option<String>) -> bool {
-    args.into_iter().any(|a| a == "--dry-run")
-        || matches!(
-            env.as_deref().map(str::trim),
-            Some("1" | "true" | "TRUE" | "yes")
-        )
+/// Whether to dry-run: `--dry-run`, or `DRY_RUN` set to 1/true/yes/on (on) or 0/false/no/off
+/// (off), in any case. Unset is off. Any other value, empty included, is an error: a mistyped
+/// `DRY_RUN` must never quietly control the real heating, so the backend refuses to start.
+pub fn enabled(
+    args: impl IntoIterator<Item = String>,
+    env: Option<String>,
+) -> Result<bool, String> {
+    if args.into_iter().any(|a| a == "--dry-run") {
+        return Ok(true);
+    }
+    let Some(value) = env else {
+        return Ok(false);
+    };
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Ok(true),
+        "0" | "false" | "no" | "off" => Ok(false),
+        _ => Err(format!(
+            "DRY_RUN must be 1, true, yes or on (dry run) or 0, false, no or off, not {value:?}; \
+             not starting, so this can't control the heating by mistake"
+        )),
+    }
 }
 
 /// Requests that only read Home Assistant, so they're still sent in a dry run. Anything not
@@ -141,14 +155,27 @@ mod tests {
     const MODE: &str = "/api/services/climate/set_hvac_mode";
 
     #[test]
-    fn test_enabled() {
+    fn test_enabled_fails_closed() {
         let args = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
-        assert!(!enabled(args(&["bin"]), None));
-        assert!(enabled(args(&["bin", "--dry-run"]), None));
-        assert!(enabled(args(&["bin"]), Some("1".to_string())));
-        assert!(enabled(args(&["bin"]), Some("true".to_string())));
-        assert!(!enabled(args(&["bin"]), Some("0".to_string())));
-        assert!(!enabled(args(&["bin"]), Some(String::new())));
+        let env = |v: &str| Some(v.to_string());
+        assert_eq!(enabled(args(&["bin"]), None), Ok(false));
+        assert_eq!(enabled(args(&["bin", "--dry-run"]), None), Ok(true));
+        for on in [
+            "1", "true", "TRUE", "True", "yes", "Yes", "on", "ON", " on ",
+        ] {
+            assert_eq!(enabled(args(&["bin"]), env(on)), Ok(true), "{on:?}");
+        }
+        for off in ["0", "false", "False", "no", "NO", "off", "Off"] {
+            assert_eq!(enabled(args(&["bin"]), env(off)), Ok(false), "{off:?}");
+        }
+        // Anything else refuses to start rather than running live
+        for unknown in ["", " ", "y", "2", "enabled", "dry", "tru"] {
+            let err = enabled(args(&["bin"]), env(unknown)).unwrap_err();
+            assert!(err.contains("not starting"), "{unknown:?}: {err}");
+        }
+        // --dry-run wins over any DRY_RUN, so it can only make things safer
+        assert_eq!(enabled(args(&["bin", "--dry-run"]), env("0")), Ok(true));
+        assert_eq!(enabled(args(&["bin", "--dry-run"]), env("bogus")), Ok(true));
     }
 
     #[test]

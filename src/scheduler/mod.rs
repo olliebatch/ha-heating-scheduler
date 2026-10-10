@@ -606,6 +606,7 @@ mod tests {
         ApiClient::new(
             reqwest::Url::parse("http://fake").unwrap(),
             "fake_token".to_string(),
+            None,
         )
     }
 

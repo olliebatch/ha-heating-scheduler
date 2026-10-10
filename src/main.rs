@@ -33,6 +33,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Dry run: read Home Assistant, but record the calls that would change it instead of sending them
     let dry_run = dry_run::enabled(std::env::args(), std::env::var("DRY_RUN").ok())
+        .map_err(|e| anyhow::anyhow!(e))?
         .then(|| Arc::new(DryRun::default()));
     if dry_run.is_some() {
         println!("\n=== DRY RUN: NOT CONTROLLING THE HEATING ===");
@@ -41,8 +42,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let api_client = api_client::ApiClient::new(
         reqwest::Url::parse(&config.ha_url)?,
         config.ha_token.clone(),
-    )
-    .with_dry_run(dry_run.clone());
+        dry_run.clone(),
+    );
 
     let data_dir = Path::new(&config.data_path);
     std::fs::create_dir_all(data_dir)?;
@@ -113,8 +114,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 api_client: api_client::ApiClient::new(
                     reqwest::Url::parse(&config.ha_url)?,
                     config.ha_token.clone(),
-                )
-                .with_dry_run(dry_run.clone()),
+                    dry_run.clone(),
+                ),
             })
         }
     };
@@ -170,8 +171,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             api_client: api_client::ApiClient::new(
                 reqwest::Url::parse(&config.ha_url)?,
                 config.ha_token.clone(),
-            )
-            .with_dry_run(dry_run.clone()),
+                dry_run.clone(),
+            ),
         }) as Arc<dyn WeatherSource>,
         None,
     );
