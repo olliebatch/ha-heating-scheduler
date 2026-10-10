@@ -62,7 +62,7 @@ pub fn lead_minutes(
 }
 
 /// Seconds from `now` until `start`, wrapping past midnight (0 when they're equal)
-fn seconds_until(now: NaiveTime, start: NaiveTime) -> u32 {
+pub(super) fn seconds_until(now: NaiveTime, start: NaiveTime) -> u32 {
     const DAY: u32 = 24 * 60 * 60;
     let (now, start) = (
         now.num_seconds_from_midnight(),

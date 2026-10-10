@@ -82,16 +82,25 @@ Early start: with weather adjust on, a zone's next On period starts up to `max_e
 30, 0 disables) when it's cold or windy: none at 10 °C or warmer outside, the full amount at -2 °C or colder, with
 wind adding up to a quarter (medium exposure) or half (high) of it. The zone then heats to that period's (adjusted)
 target. Once an early start begins it carries on until the period starts, even if it warms up meanwhile, so the
-heating isn't turned off and on again. End times never move, and nothing else turns heating on during an Off period.
+heating isn't turned off and on again.
+
+Late finish: with weather adjust on and `max_late_finish_minutes` set (default 0, off), an On period keeps heating up to
+that many minutes past its end on cold or windy days, on the same scale as early start, at the ended period's
+(adjusted) target. It's decided when the period ends and then carries on for those minutes whatever the weather does,
+and the heating turns off once, when it's over. It only extends into the Off that follows; if it meets the next
+period's early start, the early start takes over with no gap. Start times never move, and nothing else turns heating
+on during an Off period.
 
 - `GET /weather` - The configured weather entity, the last reading and any error
 - `PUT /weather` - Choose the weather entity: `{"entity_id": "weather.home"}` (`null` to stop); stored in `data/weather.json`
 - `POST /weather/mock` - Debug builds only: set the mock weather, e.g. `{"temperature": -2, "wind_speed": 40, "cloud_coverage": 10}`
 - `PATCH /zones/{id}` also takes `sun_windows` (`[{"start": "08:00", "end": "11:00"}]`), `wind_exposure`
-  (`low`/`medium`/`high`), `weather_adjust` (`true`/`false`) and `max_early_start_minutes` (0-180)
+  (`low`/`medium`/`high`), `weather_adjust` (`true`/`false`), `max_early_start_minutes` and
+  `max_late_finish_minutes` (both 0-180)
 - `GET /zones` includes each zone's `status`: `state`, `scheduled_target`, adjusted `target`, `reasons`,
   `raw_target` (before clamping, rounding and holding), `held` and `early_start` (`period_start`, `lead_minutes`
-  allowed by the weather, `minutes_early` it actually started, and `causes`) while a period is being started early
+  allowed by the weather, `minutes_early` it actually started, and `causes`) while a period is being started early, and
+  `late_finish` (`period_end`, `extra_minutes`, `causes`) while one is kept going past its end
 
 ### Schedule (active set)
 - `GET /schedule` - Get the active schedule
