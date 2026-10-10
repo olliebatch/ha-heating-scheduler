@@ -4,8 +4,10 @@ use crate::dry_run::CALL_CONTEXT;
 use crate::schedule::HeatingState;
 use crate::schedule::TARGET_TEMP_RANGE;
 use crate::schedule::sets::ScheduleSets;
+use crate::weather::Begun;
 use crate::weather::adjust::{Reason, adjust_target};
 use crate::weather::early::{EarlyStart, continue_early_start, early_start};
+use crate::weather::late::{LateFinish, continue_late_finish, late_finish};
 use crate::weather::{Held, KEEP_READING_FOR, Weather, WeatherSource, WeatherStatus};
 use crate::zones::{Zone, Zones};
 use crate::{ScheduleState, WeatherState, ZonesState};
@@ -127,6 +129,9 @@ pub struct ZoneStatus {
     /// Set while an upcoming On period is being started early; `state` and the targets are
     /// then that period's
     pub early_start: Option<EarlyStart>,
+    /// Set while an On period that has ended is kept going; `state` and the targets are then
+    /// that period's
+    pub late_finish: Option<LateFinish>,
 }
 
 /// How far the unrounded target must move from a held target before the target changes:
@@ -148,9 +153,10 @@ pub fn zone_status(
     sets: &ScheduleSets,
     weather: Option<&Weather>,
     held: Option<Held>,
-    begun_early: Option<&EarlyStart>,
+    begun: Option<&Begun>,
     time: &chrono::DateTime<Local>,
 ) -> ZoneStatus {
+    let begun_early = begun.and_then(|b| b.early_start.as_ref());
     let schedule = zone
         .and_then(|z| z.schedule_set_id)
         .and_then(|id| sets.get(id))
@@ -182,6 +188,34 @@ pub fn zone_status(
         }
         entry = Some(next);
         early
+    });
+
+    // Keep an On period going past its end when it's cold or windy (weather adjust zones only),
+    // for the minutes decided at the end. Starting the next period early takes over if they meet.
+    let late = match zone {
+        Some(zone)
+            if zone.weather_adjust && zone.max_late_finish_minutes > 0 && early_start.is_none() =>
+        {
+            let begun_late = begun.and_then(|b| b.late_finish.as_ref());
+            begun_late
+                .and_then(|b| {
+                    continue_late_finish(schedule, time.time(), b).map(|e| (e, b.clone()))
+                })
+                .or_else(|| {
+                    late_finish(
+                        schedule,
+                        time.time(),
+                        weather?,
+                        zone.wind_exposure,
+                        zone.max_late_finish_minutes,
+                    )
+                })
+        }
+        _ => None,
+    };
+    let late_finish = late.map(|(ended, late)| {
+        entry = Some(ended);
+        late
     });
 
     let state = entry
@@ -224,6 +258,7 @@ pub fn zone_status(
         reasons: adjusted.map(|a| a.reasons).unwrap_or_default(),
         held: hold,
         early_start,
+        late_finish,
     }
 }
 
@@ -234,7 +269,7 @@ pub fn zone_statuses(
     sets: &ScheduleSets,
     weather: Option<&Weather>,
     held: &mut HashMap<Uuid, Held>,
-    early_starts: &mut HashMap<Uuid, EarlyStart>,
+    begun: &mut HashMap<Uuid, Begun>,
     time: &chrono::DateTime<Local>,
 ) -> HashMap<Uuid, ZoneStatus> {
     let statuses: HashMap<Uuid, ZoneStatus> = zones
@@ -246,22 +281,28 @@ pub fn zone_statuses(
                 sets,
                 weather,
                 held.get(&z.id).copied(),
-                early_starts.get(&z.id),
+                begun.get(&z.id),
                 time,
             );
             (z.id, status)
         })
         .collect();
     held.clear();
-    early_starts.clear();
+    begun.clear();
     for (id, status) in &statuses {
         if let (Some(_), Some(scheduled), Some(target)) =
             (status.raw_target, status.scheduled_target, status.target)
         {
             held.insert(*id, Held { scheduled, target });
         }
-        if let Some(early) = &status.early_start {
-            early_starts.insert(*id, early.clone());
+        if status.early_start.is_some() || status.late_finish.is_some() {
+            begun.insert(
+                *id,
+                Begun {
+                    early_start: status.early_start.clone(),
+                    late_finish: status.late_finish.clone(),
+                },
+            );
         }
     }
     statuses
@@ -410,6 +451,9 @@ pub fn call_context(zone: Option<&str>, status: &ZoneStatus, boosted: bool) -> S
     if let Some(early) = &status.early_start {
         why += &format!(", early start for {}", early.period_start.format("%H:%M"));
     }
+    if let Some(late) = &status.late_finish {
+        why += &format!(", late finish for {}", late.period_end.format("%H:%M"));
+    }
     if boosted {
         why += ", boost";
     }
@@ -444,10 +488,8 @@ pub async fn run_scheduler<T: ClimateEntity + Clone>(state: SchedulerState<T>) {
             let sets = state.schedule.read().unwrap();
             let zones = state.zones.read().unwrap();
             let mut weather_status = state.weather.write().unwrap();
-            let WeatherStatus {
-                held, early_starts, ..
-            } = &mut *weather_status;
-            let statuses = zone_statuses(&zones, &sets, weather.as_ref(), held, early_starts, &now);
+            let WeatherStatus { held, begun, .. } = &mut *weather_status;
+            let statuses = zone_statuses(&zones, &sets, weather.as_ref(), held, begun, &now);
             let no_zone = zone_status(None, &sets, weather.as_ref(), None, None, &now);
             let (scheduled, contexts) = entities_clone
                 .iter()
@@ -516,6 +558,7 @@ mod tests {
             raw_target: Some(21.5),
             held: false,
             early_start: None,
+            late_finish: None,
         };
         assert_eq!(
             call_context(Some("Lounge"), &on, false),
@@ -1060,7 +1103,7 @@ mod tests {
                     &sets,
                     weather.as_ref(),
                     &mut status.held,
-                    &mut status.early_starts,
+                    &mut status.begun,
                     &now,
                 )[&id]
                     .clone()
@@ -1293,11 +1336,14 @@ mod tests {
         // Switching weather adjust off ends a begun early start
         let mut early = HashMap::from([(
             id,
-            crate::weather::early::EarlyStart {
-                period_start: chrono::NaiveTime::from_hms_opt(7, 0, 0).unwrap(),
-                lead_minutes: 30,
-                minutes_early: 30,
-                causes: vec![],
+            Begun {
+                early_start: Some(EarlyStart {
+                    period_start: chrono::NaiveTime::from_hms_opt(7, 0, 0).unwrap(),
+                    lead_minutes: 30,
+                    minutes_early: 30,
+                    causes: vec![],
+                }),
+                late_finish: None,
             },
         )]);
         zones.zones[0].weather_adjust = false;
@@ -1311,5 +1357,144 @@ mod tests {
         )[&id]
             .clone();
         assert_eq!(status.state, HeatingState::Off);
+    }
+
+    /// The Lounge-style zone with late finishes enabled
+    fn late_zone(minutes: u32) -> (Zones, Uuid) {
+        let (mut zones, id) = adjusting_zone();
+        zones.zones[0].max_late_finish_minutes = minutes;
+        (zones, id)
+    }
+
+    /// Run ticks at the given times, returning (state, target, early start?, late finish?) each time
+    async fn run_ticks(
+        zones: &Zones,
+        sets: &ScheduleSets,
+        weather: &[Weather],
+        times: &[(u32, u32)],
+        entity: &mut crate::climate::MockClimate,
+    ) -> Vec<(HeatingState, Option<f64>, bool, bool)> {
+        let id = zones.zones[0].id;
+        let (mut held, mut begun, mut last) = (HashMap::new(), HashMap::new(), None);
+        let mut seen = Vec::new();
+        for (i, &(hour, minute)) in times.iter().enumerate() {
+            let weather = &weather[i.min(weather.len() - 1)];
+            let status = zone_statuses(
+                zones,
+                sets,
+                Some(weather),
+                &mut held,
+                &mut begun,
+                &today_at(hour, minute),
+            )[&id]
+                .clone();
+            seen.push((
+                status.state.clone(),
+                status.target,
+                status.early_start.is_some(),
+                status.late_finish.is_some(),
+            ));
+            tick(entity, &scheduled(status.state, status.target), &mut last).await;
+        }
+        seen
+    }
+
+    #[tokio::test]
+    async fn test_late_finish_keeps_heating_then_turns_off_once() {
+        use HeatingState::*;
+        let sets = morning_sets();
+        let (zones, _) = late_zone(30);
+        let mut entity = mock(On);
+        // Warming at 09:10 doesn't cut the extension short: it was decided at 09:00
+        let weather = [freezing(), freezing(), freezing(), Weather::default()];
+        let seen = run_ticks(
+            &zones,
+            &sets,
+            &weather,
+            &[(8, 55), (9, 0), (9, 5), (9, 10), (9, 29), (9, 30), (9, 45)],
+            &mut entity,
+        )
+        .await;
+        assert_eq!(
+            seen,
+            vec![
+                (On, Some(22.0), false, false),
+                (On, Some(22.0), false, true),
+                (On, Some(22.0), false, true),
+                // No weather now, so the ended period's plain target
+                (On, Some(21.0), false, true),
+                (On, Some(21.0), false, true),
+                (Off, None, false, false),
+                (Off, None, false, false),
+            ]
+        );
+        // One send per real change, and turned off once, when the extension ended
+        assert_eq!(sent(&entity), vec![22.0, 21.0]);
+        assert_eq!(*entity.mode.lock().unwrap(), Some(Off));
+    }
+
+    #[tokio::test]
+    async fn test_late_finish_meets_the_next_early_start() {
+        use crate::schedule::{Schedule, ScheduleEntry, TimePeriod};
+        use HeatingState::*;
+        let mut schedule = Schedule::new("Two");
+        schedule.add_entry(
+            ScheduleEntry::new("Early", TimePeriod::new(6, 0, 7, 0), On).with_target(21.0),
+        );
+        schedule.add_entry(
+            ScheduleEntry::new("Later", TimePeriod::new(7, 40, 9, 0), On).with_target(23.0),
+        );
+        let sets = ScheduleSets::from_schedule(schedule);
+        let (zones, _) = late_zone(30);
+        let mut entity = mock(On);
+        // 07:00 starts a 30 minute late finish; the 07:40 period may start 30 minutes early (07:10)
+        let seen = run_ticks(
+            &zones,
+            &sets,
+            &[freezing()],
+            &[(6, 55), (7, 0), (7, 5), (7, 10), (7, 20), (7, 35), (7, 40)],
+            &mut entity,
+        )
+        .await;
+        assert_eq!(
+            seen,
+            vec![
+                (On, Some(22.0), false, false),
+                (On, Some(22.0), false, true),
+                (On, Some(22.0), false, true),
+                // The early start takes over: no gap, and one change of target
+                (On, Some(24.0), true, false),
+                (On, Some(24.0), true, false),
+                (On, Some(24.0), true, false),
+                (On, Some(24.0), false, false),
+            ]
+        );
+        assert_eq!(sent(&entity), vec![22.0, 24.0]);
+        // It was already On, so no mode was ever commanded: in particular, never Off
+        assert_eq!(*entity.mode.lock().unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn test_late_finish_needs_weather_adjust_and_a_cap() {
+        use HeatingState::*;
+        let sets = morning_sets();
+        for (adjust, minutes) in [(false, 30), (true, 0)] {
+            let (mut zones, _) = late_zone(minutes);
+            zones.zones[0].weather_adjust = adjust;
+            let mut entity = mock(On);
+            let seen = run_ticks(
+                &zones,
+                &sets,
+                &[freezing()],
+                &[(8, 55), (9, 0)],
+                &mut entity,
+            )
+            .await;
+            assert_eq!(
+                seen[1],
+                (Off, None, false, false),
+                "adjust {adjust}, {minutes} min"
+            );
+        }
     }
 }
