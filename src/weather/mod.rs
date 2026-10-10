@@ -11,6 +11,7 @@ use std::sync::{Arc, RwLock};
 pub mod adjust;
 pub mod early;
 pub mod late;
+pub mod warmup;
 
 /// Outside conditions, in °C, km/h and percent. Any of them can be missing.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -129,6 +130,7 @@ pub struct WeatherStatus {
 pub struct Begun {
     pub early_start: Option<early::EarlyStart>,
     pub late_finish: Option<late::LateFinish>,
+    pub warm_up: Option<warmup::WarmUp>,
 }
 
 /// A zone's adjusted target, held until the weather moves it clearly
