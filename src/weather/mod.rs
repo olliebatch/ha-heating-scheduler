@@ -9,6 +9,7 @@ use std::path::Path;
 use std::sync::{Arc, RwLock};
 
 pub mod adjust;
+pub mod early;
 
 /// Outside conditions, in °C, km/h and percent. Any of them can be missing.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -118,6 +119,9 @@ pub struct WeatherStatus {
     /// The adjusted target each zone is held at, by zone id (see `scheduler::zone_status`)
     #[serde(skip)]
     pub held: HashMap<uuid::Uuid, Held>,
+    /// Early starts in progress, by zone id, kept until their period starts
+    #[serde(skip)]
+    pub early_starts: HashMap<uuid::Uuid, early::EarlyStart>,
 }
 
 /// A zone's adjusted target, held until the weather moves it clearly

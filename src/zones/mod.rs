@@ -43,6 +43,18 @@ pub struct Zone {
     /// Adjust this zone's target for the weather
     #[serde(default)]
     pub weather_adjust: bool,
+    /// Start On periods up to this many minutes early when it's cold or windy (0 disables)
+    #[serde(default = "default_max_early_start")]
+    pub max_early_start_minutes: u32,
+}
+
+/// Default for [`Zone::max_early_start_minutes`]
+pub const DEFAULT_MAX_EARLY_START: u32 = 30;
+/// Largest allowed [`Zone::max_early_start_minutes`]
+pub const MAX_EARLY_START_LIMIT: u32 = 180;
+
+fn default_max_early_start() -> u32 {
+    DEFAULT_MAX_EARLY_START
 }
 
 impl Zone {
@@ -57,6 +69,7 @@ impl Zone {
             sun_windows: Vec::new(),
             wind_exposure: WindExposure::default(),
             weather_adjust: false,
+            max_early_start_minutes: DEFAULT_MAX_EARLY_START,
         }
     }
 
@@ -285,7 +298,14 @@ impl Zones {
         sun_windows: Option<Vec<TimePeriod>>,
         wind_exposure: Option<WindExposure>,
         weather_adjust: Option<bool>,
+        max_early_start_minutes: Option<u32>,
     ) -> Result<(), ZoneError> {
+        if max_early_start_minutes.is_some_and(|m| m > MAX_EARLY_START_LIMIT) {
+            return Err(ZoneError::Invalid(format!(
+                "max_early_start_minutes must be 0-{}",
+                MAX_EARLY_START_LIMIT
+            )));
+        }
         if let Some(windows) = &sun_windows {
             if windows.iter().any(|w| w.start == w.end && !w.is_full_day()) {
                 return Err(ZoneError::Invalid(
@@ -306,6 +326,9 @@ impl Zones {
         }
         if let Some(adjust) = weather_adjust {
             zone.weather_adjust = adjust;
+        }
+        if let Some(minutes) = max_early_start_minutes {
+            zone.max_early_start_minutes = minutes;
         }
         Ok(())
     }
@@ -640,5 +663,27 @@ mod tests {
 
         assert!(matches!(result, Err(ZoneError::Invalid(_))));
         assert_eq!(zones.zones, before);
+    }
+
+    #[test]
+    fn test_max_early_start_bounds() {
+        let mut zones = Zones::default();
+        zones.reconcile(Some(areas()), &all_managed());
+        let id = zones.zones[0].id;
+        assert_eq!(zones.zones[0].max_early_start_minutes, 30);
+
+        zones.set_profile(id, None, None, None, Some(0)).unwrap();
+        assert_eq!(zones.get(id).unwrap().max_early_start_minutes, 0);
+        assert!(matches!(
+            zones.set_profile(id, None, None, Some(true), Some(181)),
+            Err(ZoneError::Invalid(_))
+        ));
+        assert!(!zones.get(id).unwrap().weather_adjust, "nothing changed");
+
+        // Older zones.json files get the default
+        let json = r#"{"id": "00000000-0000-4000-8000-000000000001", "name": "Old",
+                       "kind": "manual", "entity_ids": []}"#;
+        let zone: Zone = serde_json::from_str(json).unwrap();
+        assert_eq!(zone.max_early_start_minutes, 30);
     }
 }

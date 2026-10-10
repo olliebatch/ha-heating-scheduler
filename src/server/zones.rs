@@ -79,9 +79,13 @@ pub async fn get_zones<T: ClimateEntity + Clone>(
 ) -> Json<Vec<ZoneView>> {
     let now = Local::now();
     // The scheduler's last reading and the targets it is holding, so this shows what it sends
-    let (weather, held) = {
+    let (weather, held, early_starts) = {
         let status = state.weather.read().unwrap();
-        (status.weather.clone(), status.held.clone())
+        (
+            status.weather.clone(),
+            status.held.clone(),
+            status.early_starts.clone(),
+        )
     };
     // Lock order everywhere: schedule sets, then zones
     let sets = state.schedule.read().unwrap();
@@ -97,6 +101,7 @@ pub async fn get_zones<T: ClimateEntity + Clone>(
                     &sets,
                     weather.as_ref(),
                     held.get(&zone.id).copied(),
+                    early_starts.get(&zone.id),
                     &now,
                 ),
             })
@@ -137,6 +142,7 @@ pub struct UpdateZoneRequest {
     pub sun_windows: Option<Vec<TimePeriod>>,
     pub wind_exposure: Option<WindExposure>,
     pub weather_adjust: Option<bool>,
+    pub max_early_start_minutes: Option<u32>,
 }
 
 pub async fn update_zone<T: ClimateEntity + Clone>(
@@ -169,6 +175,7 @@ pub async fn update_zone<T: ClimateEntity + Clone>(
                 payload.sun_windows.clone(),
                 payload.wind_exposure,
                 payload.weather_adjust,
+                payload.max_early_start_minutes,
             )
             .map_err(zone_error)?;
         if let Some(name) = &payload.name {
