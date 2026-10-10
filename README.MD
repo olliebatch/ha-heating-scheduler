@@ -158,7 +158,8 @@ of sent, and the scheduler carries on as if HA had accepted it. Only reads reach
    DRY_RUN=1 PORT=3100 DATA_PATH=~/heating-dry-run target/release/ha-heating-scheduler
    ```
 
-   `--dry-run` works too, and wins over any `DRY_RUN`. An unrecognised `DRY_RUN` value refuses to start. Set `CLIMATE_ENTITY` the same way as in your `.env` the first time, since the new data
+   `--dry-run` works too, and wins over any `DRY_RUN`. An unrecognised `DRY_RUN` value, or any other command-line
+   argument (a mistyped `--dryrun`, say), refuses to start. Set `CLIMATE_ENTITY` the same way as in your `.env` the first time, since the new data
    folder has no `entities.json` yet. If you'd rather keep port 3000, stop your normal instance first.
 3. Before trusting it, check that it's really a dry run:
    - the startup log says `=== DRY RUN: NOT CONTROLLING THE HEATING ===`;
