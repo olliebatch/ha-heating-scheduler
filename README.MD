@@ -35,8 +35,15 @@ On first run, an existing `data/schedule.json` becomes the only (active) set and
 - `PATCH /schedule_sets/{id}` - Rename: `{"name": "Away"}`. Returns the set
 - `DELETE /schedule_sets/{id}` - Delete a set (409 for the active or last set). Returns all sets
 - `POST /schedule_sets/{id}/activate` - Make a set active. Returns all sets
-- `POST /schedule_sets/{id}/entries` - Add an entry to a set (400 if start equals end, except 00:00 - 00:00). Returns the set
+- `POST /schedule_sets/{id}/entries` - Add an entry to a set (400 if start equals end, except 00:00 - 00:00). Returns the set.
+  On entries need a `target_temp` between 5 and 30 °C; Off entries have none, e.g.
+  `{"name": "Morning", "time_period": {"start": "06:00", "end": "09:00"}, "heating_state": "ON", "target_temp": 21}`
 - `DELETE /schedule_sets/{id}/entries/{entry_id}` - Delete an entry (409 for the only entry). Returns the set
+
+While an On entry is active, the scheduler sets its `target_temp` on each climate (after turning it on).
+Off stays off, with no temperature set. Boost uses the active On entry's target, or `default_target_temp`
+(stored in `schedule_sets.json`, 20 °C unless changed there) when nothing On is scheduled. On entries
+saved before targets existed get `default_target_temp` when loaded.
 
 ### Schedule (active set)
 - `GET /schedule` - Get the active schedule

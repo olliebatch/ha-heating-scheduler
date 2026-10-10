@@ -1,4 +1,4 @@
-use super::Schedule;
+use super::{HeatingState, Schedule};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -7,6 +7,16 @@ use uuid::Uuid;
 pub struct ScheduleSets {
     pub active_id: Uuid,
     pub sets: Vec<Schedule>,
+    /// Comfort temperature (°C) given to On entries saved before targets existed, and used by
+    /// boost when no On entry is active
+    #[serde(default = "default_target_temp")]
+    pub default_target_temp: f64,
+}
+
+pub const DEFAULT_TARGET_TEMP: f64 = 20.0;
+
+fn default_target_temp() -> f64 {
+    DEFAULT_TARGET_TEMP
 }
 
 #[derive(Debug, PartialEq)]
@@ -22,10 +32,13 @@ pub enum SetError {
 impl ScheduleSets {
     /// Sets holding just `schedule`, marked active
     pub fn from_schedule(schedule: Schedule) -> Self {
-        ScheduleSets {
+        let mut sets = ScheduleSets {
             active_id: schedule.id,
             sets: vec![schedule],
-        }
+            default_target_temp: DEFAULT_TARGET_TEMP,
+        };
+        sets.normalise();
+        sets
     }
 
     pub fn active(&self) -> &Schedule {
@@ -99,7 +112,8 @@ impl ScheduleSets {
         Ok(())
     }
 
-    /// Repair sets loaded from disk: normalise each schedule, give duplicate set ids a new id,
+    /// Repair sets loaded from disk: give On entries without a target the default target (and
+    /// drop targets on Off entries), normalise each schedule, give duplicate set ids a new id,
     /// and point `active_id` at the first set if it names none.
     pub fn normalise(&mut self) {
         if self.sets.is_empty() {
@@ -109,6 +123,12 @@ impl ScheduleSets {
         for schedule in &mut self.sets {
             if !seen.insert(schedule.id) {
                 schedule.id = Uuid::new_v4();
+            }
+            for entry in &mut schedule.entries {
+                entry.target_temp = match entry.heating_state {
+                    HeatingState::On => entry.target_temp.or(Some(self.default_target_temp)),
+                    HeatingState::Off => None,
+                };
             }
             schedule.normalise();
         }
