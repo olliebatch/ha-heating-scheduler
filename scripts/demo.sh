@@ -12,7 +12,8 @@ throwaway git worktrees of each ref. Ctrl-C stops both and removes the worktrees
 
   backend-ref  Default: this clone's current branch (or commit, if detached).
   panel-ref    Default: the panel branch with the same name as backend-ref (local, else origin/),
-               else main. So running it from a PR branch demos that PR and its panel PR.
+               else origin/main (else main). So running it from a PR branch demos that PR and its
+               panel PR. Refs are used as already fetched; run git fetch in both clones for the latest.
 
 The panel clone is ha-heating-scheduler-panel next to this repo (its main clone), or PANEL_DIR.
 Needs: Rust (cargo), Node 24 with corepack, curl.
@@ -59,6 +60,8 @@ elif git -C "$panel_dir" rev-parse --verify --quiet "refs/heads/$backend_ref" >/
   panel_ref=$backend_ref
 elif git -C "$panel_dir" rev-parse --verify --quiet "refs/remotes/origin/$backend_ref" >/dev/null; then
   panel_ref=origin/$backend_ref
+elif git -C "$panel_dir" rev-parse --verify --quiet refs/remotes/origin/main >/dev/null; then
+  panel_ref=origin/main
 else
   panel_ref=main
 fi
@@ -68,8 +71,9 @@ tmp=$(mktemp -d "${TMPDIR:-/tmp}/heating-demo.XXXXXX")
 pids=()
 cleanup() {
   trap - EXIT INT TERM
-  for pid in "${pids[@]}"; do kill "$pid" 2>/dev/null || true; done
-  for pid in "${pids[@]}"; do wait "$pid" 2>/dev/null || true; done
+  # ${pids[@]+...}: an empty array counts as unset under set -u in bash < 4.4 (macOS has 3.2)
+  for pid in ${pids[@]+"${pids[@]}"}; do kill "$pid" 2>/dev/null || true; done
+  for pid in ${pids[@]+"${pids[@]}"}; do wait "$pid" 2>/dev/null || true; done
   git -C "$backend_dir" worktree remove --force "$tmp/backend" 2>/dev/null || true
   git -C "$panel_dir" worktree remove --force "$tmp/panel" 2>/dev/null || true
   rm -rf "$tmp"
@@ -78,7 +82,9 @@ cleanup() {
 trap cleanup EXIT
 trap 'exit 130' INT TERM
 
-echo "demo: backend $backend_ref, panel $panel_ref"
+describe() { git -C "$1" log -1 --format='%h, committed %cr' "$2"; }
+echo "demo: backend $backend_ref ($(describe "$backend_dir" "$backend_ref"))"
+echo "demo: panel $panel_ref ($(describe "$panel_dir" "$panel_ref"))"
 git -C "$backend_dir" worktree add --quiet --detach "$tmp/backend" "$backend_ref"
 git -C "$panel_dir" worktree add --quiet --detach "$tmp/panel" "$panel_ref"
 
@@ -105,8 +111,9 @@ pids+=($!)
 show_logs() { for log in "$tmp"/*.log; do echo "--- $(basename "$log")" >&2; tail -n 20 "$log" >&2; done; }
 wait_for() {
   for _ in $(seq 1 60); do
-    port_busy "$1" && return 0
+    # Our processes first, so another server on the port doesn't count as ours starting
     for pid in "${pids[@]}"; do kill -0 "$pid" 2>/dev/null || { show_logs; die "$2 exited"; }; done
+    port_busy "$1" && return 0
     sleep 0.5
   done
   show_logs; die "$2 didn't start"
