@@ -174,7 +174,11 @@ pub fn zone_status(
         let begun = begun_early?;
         continue_early_start(schedule, time.time(), begun).map(|next| (next, begun.clone()))
     });
-    let early_start = early_start.map(|(next, early)| {
+    let early_start = early_start.map(|(next, mut early)| {
+        // Keep when heating began: a fresh check each tick would count down to the period
+        if let Some(begun) = begun_early.filter(|b| b.period_start == early.period_start) {
+            early.minutes_early = begun.minutes_early;
+        }
         entry = Some(next);
         early
     });
@@ -1135,6 +1139,28 @@ mod tests {
         assert_eq!(*entity.mode.lock().unwrap(), Some(Off));
     }
 
+    #[test]
+    fn test_early_start_keeps_when_heating_began() {
+        let sets = morning_sets();
+        let (zones, id) = adjusting_zone();
+        let (mut held, mut early) = (HashMap::new(), HashMap::new());
+
+        // Heating begins at 06:35, 25 minutes before 07:00 (the lead allows 30)
+        let minutes = [(6, 35), (6, 45), (6, 55)].map(|(hour, minute)| {
+            let status = &zone_statuses(
+                &zones,
+                &sets,
+                Some(&freezing()),
+                &mut held,
+                &mut early,
+                &today_at(hour, minute),
+            )[&id];
+            let early = status.early_start.as_ref().unwrap();
+            (early.lead_minutes, early.minutes_early)
+        });
+        assert_eq!(minutes, [(30, 25); 3]);
+    }
+
     #[tokio::test]
     async fn test_warming_mid_lead_keeps_the_early_start() {
         let sets = morning_sets();
@@ -1189,6 +1215,7 @@ mod tests {
             crate::weather::early::EarlyStart {
                 period_start: chrono::NaiveTime::from_hms_opt(7, 0, 0).unwrap(),
                 lead_minutes: 30,
+                minutes_early: 30,
                 causes: vec![],
             },
         )]);

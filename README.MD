@@ -86,8 +86,8 @@ heating isn't turned off and on again. End times never move, and nothing else tu
 - `PATCH /zones/{id}` also takes `sun_windows` (`[{"start": "08:00", "end": "11:00"}]`), `wind_exposure`
   (`low`/`medium`/`high`), `weather_adjust` (`true`/`false`) and `max_early_start_minutes` (0-180)
 - `GET /zones` includes each zone's `status`: `state`, `scheduled_target`, adjusted `target`, `reasons`,
-  `raw_target` (before clamping, rounding and holding), `held` and `early_start` (`period_start`, `lead_minutes`,
-  `causes`) while a period is being started early
+  `raw_target` (before clamping, rounding and holding), `held` and `early_start` (`period_start`, `lead_minutes`
+  allowed by the weather, `minutes_early` it actually started, and `causes`) while a period is being started early
 
 ### Schedule (active set)
 - `GET /schedule` - Get the active schedule

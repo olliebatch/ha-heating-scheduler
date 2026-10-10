@@ -11,6 +11,9 @@ pub struct EarlyStart {
     pub period_start: NaiveTime,
     /// How early the weather says to start it
     pub lead_minutes: u32,
+    /// How many minutes before the period heating actually started: less than `lead_minutes`
+    /// when the period was added, or the weather turned cold, within the lead
+    pub minutes_early: u32,
     pub causes: Vec<Cause>,
 }
 
@@ -103,6 +106,7 @@ pub fn early_start<'a>(
         EarlyStart {
             period_start: next_on.time_period.start,
             lead_minutes: lead,
+            minutes_early: (until + 30) / 60,
             causes,
         },
     ))
@@ -245,7 +249,37 @@ mod tests {
         .unwrap();
         assert_eq!(entry.target_temp, Some(21.0));
         assert_eq!(early.lead_minutes, 15);
+        assert_eq!(early.minutes_early, 10);
         assert_eq!(early.causes, vec![Cause::Cold]);
+    }
+
+    #[test]
+    fn test_early_start_added_within_the_lead() {
+        // A period added 10 minutes before it starts, on a day calling for 30 minutes' lead
+        let late = schedule(&[(12, 4, 13, 0)]);
+        let (_, early) = early_start(
+            &late,
+            at(11, 54),
+            &outside(-2.0, 0.0),
+            WindExposure::Medium,
+            30,
+        )
+        .unwrap();
+        assert_eq!(early.lead_minutes, 30);
+        assert_eq!(early.minutes_early, 10);
+
+        // Across midnight, and rounded to the nearest minute
+        let after_midnight = schedule(&[(0, 5, 6, 0)]);
+        let now = NaiveTime::from_hms_opt(23, 52, 40).unwrap();
+        let (_, early) = early_start(
+            &after_midnight,
+            now,
+            &outside(-2.0, 0.0),
+            WindExposure::Medium,
+            30,
+        )
+        .unwrap();
+        assert_eq!(early.minutes_early, 12);
     }
 
     #[test]
@@ -254,6 +288,7 @@ mod tests {
         let begun = EarlyStart {
             period_start: at(7, 0),
             lead_minutes: 30,
+            minutes_early: 30,
             causes: vec![Cause::Cold],
         };
 
