@@ -8,6 +8,7 @@ use crate::weather::Begun;
 use crate::weather::adjust::{Reason, adjust_target};
 use crate::weather::early::{EarlyStart, continue_early_start, early_start};
 use crate::weather::late::{LateFinish, continue_late_finish, late_finish};
+use crate::weather::warmup::{WarmUp, continue_warm_up, warm_up};
 use crate::weather::{Held, KEEP_READING_FOR, Weather, WeatherSource, WeatherStatus};
 use crate::zones::{Zone, Zones};
 use crate::{ScheduleState, WeatherState, ZonesState};
@@ -132,6 +133,8 @@ pub struct ZoneStatus {
     /// Set while an On period that has ended is kept going; `state` and the targets are then
     /// that period's
     pub late_finish: Option<LateFinish>,
+    /// Set during a cold-day warm-up in an Off gap; `state` is then On at the default target
+    pub warm_up: Option<WarmUp>,
 }
 
 /// How far the unrounded target must move from a held target before the target changes:
@@ -218,13 +221,48 @@ pub fn zone_status(
         late
     });
 
-    let state = entry
+    // A short warm-up partway through a long Off gap on a very cold day, for zones that opt in.
+    // The slots keep clear of the zone's early starts and late finishes.
+    let warm_up = match zone {
+        Some(zone)
+            if zone.cold_warmups.enabled && early_start.is_none() && late_finish.is_none() =>
+        {
+            let (before_on, after_on) = if zone.weather_adjust {
+                (zone.max_early_start_minutes, zone.max_late_finish_minutes)
+            } else {
+                (0, 0)
+            };
+            begun
+                .and_then(|b| b.warm_up.as_ref())
+                .and_then(|b| continue_warm_up(schedule, time.time(), b))
+                .or_else(|| {
+                    warm_up(
+                        schedule,
+                        time.time(),
+                        weather,
+                        &zone.cold_warmups,
+                        before_on,
+                        after_on,
+                    )
+                })
+        }
+        _ => None,
+    };
+
+    let mut state = entry
         .map(|e| e.heating_state.clone())
         .unwrap_or(HeatingState::Off);
-    let scheduled_target = entry.and_then(|e| e.target_temp);
+    let mut scheduled_target = entry.and_then(|e| e.target_temp);
+    // During a warm-up: On at the default target, not adjusted for the weather
+    if warm_up.is_some() {
+        state = HeatingState::On;
+        scheduled_target = Some(sets.default_target_temp);
+    }
 
     let adjusted = match (zone, weather, &state, scheduled_target) {
-        (Some(zone), Some(weather), HeatingState::On, Some(target)) if zone.weather_adjust => {
+        (Some(zone), Some(weather), HeatingState::On, Some(target))
+            if zone.weather_adjust && warm_up.is_none() =>
+        {
             Some(adjust_target(
                 target,
                 weather,
@@ -259,6 +297,7 @@ pub fn zone_status(
         held: hold,
         early_start,
         late_finish,
+        warm_up,
     }
 }
 
@@ -295,12 +334,14 @@ pub fn zone_statuses(
         {
             held.insert(*id, Held { scheduled, target });
         }
-        if status.early_start.is_some() || status.late_finish.is_some() {
+        if status.early_start.is_some() || status.late_finish.is_some() || status.warm_up.is_some()
+        {
             begun.insert(
                 *id,
                 Begun {
                     early_start: status.early_start.clone(),
                     late_finish: status.late_finish.clone(),
+                    warm_up: status.warm_up.clone(),
                 },
             );
         }
@@ -454,6 +495,9 @@ pub fn call_context(zone: Option<&str>, status: &ZoneStatus, boosted: bool) -> S
     if let Some(late) = &status.late_finish {
         why += &format!(", late finish for {}", late.period_end.format("%H:%M"));
     }
+    if let Some(warm) = &status.warm_up {
+        why += &format!(", cold warm-up ({} °C outside)", warm.outside_c);
+    }
     if boosted {
         why += ", boost";
     }
@@ -559,6 +603,7 @@ mod tests {
             held: false,
             early_start: None,
             late_finish: None,
+            warm_up: None,
         };
         assert_eq!(
             call_context(Some("Lounge"), &on, false),
@@ -1344,6 +1389,7 @@ mod tests {
                     causes: vec![],
                 }),
                 late_finish: None,
+                warm_up: None,
             },
         )]);
         zones.zones[0].weather_adjust = false;
@@ -1496,5 +1542,101 @@ mod tests {
                 "adjust {adjust}, {minutes} min"
             );
         }
+    }
+
+    /// Mornings 06:00-09:00 and evenings 17:00-22:00, so 09:00-17:00 is an 8-hour Off gap
+    fn day_sets() -> ScheduleSets {
+        use crate::schedule::{Schedule, ScheduleEntry, TimePeriod};
+        let mut schedule = Schedule::new("Day");
+        for (sh, eh) in [(6, 9), (17, 22)] {
+            schedule.add_entry(
+                ScheduleEntry::new("On", TimePeriod::new(sh, 0, eh, 0), HeatingState::On)
+                    .with_target(21.0),
+            );
+        }
+        ScheduleSets::from_schedule(schedule)
+    }
+
+    fn warmup_zone(enabled: bool) -> (Zones, Uuid) {
+        let (mut zones, id) = adjusting_zone();
+        zones.zones[0].cold_warmups.enabled = enabled;
+        (zones, id)
+    }
+
+    #[tokio::test]
+    async fn test_warm_ups_turn_on_and_off_once_each() {
+        use HeatingState::*;
+        let sets = day_sets();
+        let (zones, _) = warmup_zone(true);
+        let mut entity = mock(Off);
+        let mild = Weather {
+            temperature: Some(5.0),
+            ..freezing()
+        };
+        // Freezing at each slot's start; milder at 12:10 doesn't end the 12:00 warm-up early
+        let weather = [freezing(), freezing(), mild, freezing()];
+        let seen = run_ticks(
+            &zones,
+            &sets,
+            &weather,
+            &[
+                (11, 59),
+                (12, 0),
+                (12, 10),
+                (12, 19),
+                (12, 20),
+                (14, 0),
+                (15, 0),
+                (15, 20),
+            ],
+            &mut entity,
+        )
+        .await;
+        let states: Vec<_> = seen.iter().map(|(s, t, ..)| (s.clone(), *t)).collect();
+        assert_eq!(
+            states,
+            vec![
+                (Off, None),
+                // The default target (20), not adjusted for the freezing weather
+                (On, Some(20.0)),
+                (On, Some(20.0)),
+                (On, Some(20.0)),
+                (Off, None),
+                (Off, None),
+                (On, Some(20.0)),
+                (Off, None),
+            ]
+        );
+        // One target send per warm-up (each turns On), and Off at the end
+        assert_eq!(sent(&entity), vec![20.0, 20.0]);
+        assert_eq!(*entity.mode.lock().unwrap(), Some(Off));
+    }
+
+    #[test]
+    fn test_warm_ups_only_for_zones_that_opt_in() {
+        let sets = day_sets();
+        let (zones, _) = warmup_zone(false);
+        let status = zone_status(
+            Some(&zones.zones[0]),
+            &sets,
+            Some(&freezing()),
+            None,
+            None,
+            &today_at(12, 0),
+        );
+        assert_eq!(status.state, HeatingState::Off);
+        assert!(status.warm_up.is_none());
+
+        // And none without a weather reading
+        let (zones, _) = warmup_zone(true);
+        let status = zone_status(
+            Some(&zones.zones[0]),
+            &sets,
+            None,
+            None,
+            None,
+            &today_at(12, 0),
+        );
+        assert_eq!(status.state, HeatingState::Off);
     }
 }

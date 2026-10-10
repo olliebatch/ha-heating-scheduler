@@ -141,6 +141,8 @@ pub struct UpdateZoneRequest {
     pub weather_adjust: Option<bool>,
     pub max_early_start_minutes: Option<u32>,
     pub max_late_finish_minutes: Option<u32>,
+    /// The whole block; fields left out get their defaults
+    pub cold_warmups: Option<crate::weather::warmup::ColdWarmups>,
 }
 
 pub async fn update_zone<T: ClimateEntity + Clone>(
@@ -166,6 +168,12 @@ pub async fn update_zone<T: ClimateEntity + Clone>(
                 "Name must not be empty".to_string(),
             )));
         }
+        // Check the warm-up settings before changing anything
+        if let Some(warmups) = &payload.cold_warmups {
+            warmups
+                .validate()
+                .map_err(|e| zone_error(ZoneError::Invalid(e)))?;
+        }
         // set_profile checks the sun windows before changing anything
         zones
             .set_profile(
@@ -177,6 +185,11 @@ pub async fn update_zone<T: ClimateEntity + Clone>(
                 payload.max_late_finish_minutes,
             )
             .map_err(zone_error)?;
+        if let Some(warmups) = payload.cold_warmups {
+            zones
+                .set_cold_warmups(zone_id, warmups)
+                .map_err(zone_error)?;
+        }
         if let Some(name) = &payload.name {
             zones.rename(zone_id, name).map_err(zone_error)?;
         }
@@ -525,5 +538,48 @@ mod tests {
         let json = serde_json::to_value(study_view).unwrap();
         assert_eq!(json["name"], "Study", "zone fields are flattened");
         assert_eq!(json["status"]["reasons"][0]["cause"], "cold");
+    }
+
+    #[tokio::test]
+    async fn test_cold_warmups_update() {
+        let (state, _dir) = test_state();
+        let zones = refresh_zones(State(state.clone())).await.unwrap().0;
+        let study = zone_named(&zones, "Study").id;
+        let request = |json: &str| Json(serde_json::from_str::<UpdateZoneRequest>(json).unwrap());
+
+        // Fields left out of the block get their defaults
+        let zone = update_zone(
+            State(state.clone()),
+            Path(study),
+            request(r#"{"cold_warmups": {"enabled": true, "below_c": -3}}"#),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert!(zone.cold_warmups.enabled);
+        assert_eq!(zone.cold_warmups.below_c, -3.0);
+        assert_eq!(zone.cold_warmups.every_minutes, 180);
+
+        // A burst as long as the interval is refused with readable text, and changes nothing
+        let err = update_zone(
+            State(state.clone()),
+            Path(study),
+            request(
+                r#"{"weather_adjust": true,
+                    "cold_warmups": {"enabled": true, "burst_minutes": 60, "every_minutes": 60}}"#,
+            ),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert!(
+            err.1
+                .contains("burst_minutes must be less than every_minutes"),
+            "{}",
+            err.1
+        );
+        let zone = state.zones.read().unwrap().get(study).unwrap().clone();
+        assert!(!zone.weather_adjust);
+        assert_eq!(zone.cold_warmups.below_c, -3.0);
     }
 }
