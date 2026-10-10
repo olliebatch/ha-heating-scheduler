@@ -358,65 +358,22 @@ pub struct RemoveEntityRequest {
     pub entity_id: String,
 }
 
-/// Add new climate entities
-pub async fn add_entities(
-    State(state): State<AppState<ClimateEntityWrapper>>,
-    Json(payload): Json<AddEntitiesRequest>,
-) -> Result<Json<Vec<String>>, (StatusCode, String)> {
+/// Change the climate entities and save entities.json while still holding the lock, so
+/// concurrent adds and removes reach disk in order (like [`update_sets`]). Returns `change`'s
+/// result and the entity ids afterwards. Zones are reconciled by the caller, after the lock is
+/// released, since that reads the entities too.
+fn update_entities<R>(
+    state: &AppState<ClimateEntityWrapper>,
+    change: impl FnOnce(&mut Vec<ClimateEntityWrapper>) -> R,
+) -> Result<(R, Vec<String>), (StatusCode, String)> {
     use crate::config::entities_persistence::{EntitiesConfig, save_entities};
 
-    // Get current entity IDs
-    let current_ids: Vec<String> = {
-        let climates = state.climate_entities.read().unwrap();
-        climates
-            .iter()
-            .map(|e| e.get_entity_id().to_string())
-            .collect()
-    };
-
-    // Filter out entities that already exist
-    let new_entity_ids: Vec<String> = payload
-        .entity_ids
-        .into_iter()
-        .filter(|id| !current_ids.contains(id))
+    let mut climates = state.climate_entities.write().unwrap();
+    let result = change(&mut climates);
+    let all_entity_ids: Vec<String> = climates
+        .iter()
+        .map(|e| e.get_entity_id().to_string())
         .collect();
-
-    if new_entity_ids.is_empty() {
-        return Ok(Json(current_ids));
-    }
-
-    // Add new entities to the climate_entities list
-    #[cfg(debug_assertions)]
-    {
-        let mut climates = state.climate_entities.write().unwrap();
-        for entity_id in &new_entity_ids {
-            climates.push(ClimateEntityWrapper::Mock(MockClimate::new(
-                entity_id.clone(),
-                HeatingState::Off,
-            )));
-        }
-    }
-
-    #[cfg(not(debug_assertions))]
-    {
-        let mut climates = state.climate_entities.write().unwrap();
-        for entity_id in &new_entity_ids {
-            climates.push(ClimateEntityWrapper::Real(DefaultClimate::new(
-                entity_id.clone(),
-            )));
-        }
-    }
-
-    // Get updated list
-    let all_entity_ids: Vec<String> = {
-        let climates = state.climate_entities.read().unwrap();
-        climates
-            .iter()
-            .map(|e| e.get_entity_id().to_string())
-            .collect()
-    };
-
-    // Persist to disk
     let entities_config = EntitiesConfig::new(all_entity_ids.clone());
     if let Err(e) = save_entities(&entities_config, &state.entities_file_path) {
         eprintln!("Failed to save entities to disk: {}", e);
@@ -425,9 +382,37 @@ pub async fn add_entities(
             format!("Failed to persist entities: {}", e),
         ));
     }
+    Ok((result, all_entity_ids))
+}
 
-    crate::server::zones::reconcile_zones(&state)?;
-    println!("Added {} new entities", new_entity_ids.len());
+/// Add new climate entities
+pub async fn add_entities(
+    State(state): State<AppState<ClimateEntityWrapper>>,
+    Json(payload): Json<AddEntitiesRequest>,
+) -> Result<Json<Vec<String>>, (StatusCode, String)> {
+    // Check for existing entities under the same lock as the add, so two requests can't both add one
+    let (added, all_entity_ids) = update_entities(&state, |climates| {
+        let mut added = 0;
+        for entity_id in payload.entity_ids {
+            if climates.iter().any(|e| e.get_entity_id() == entity_id) {
+                continue;
+            }
+            #[cfg(debug_assertions)]
+            climates.push(ClimateEntityWrapper::Mock(MockClimate::new(
+                entity_id,
+                HeatingState::Off,
+            )));
+            #[cfg(not(debug_assertions))]
+            climates.push(ClimateEntityWrapper::Real(DefaultClimate::new(entity_id)));
+            added += 1;
+        }
+        added
+    })?;
+
+    if added > 0 {
+        crate::server::zones::reconcile_zones(&state)?;
+        println!("Added {} new entities", added);
+    }
     Ok(Json(all_entity_ids))
 }
 
@@ -436,32 +421,9 @@ pub async fn remove_entity(
     State(state): State<AppState<ClimateEntityWrapper>>,
     Json(payload): Json<RemoveEntityRequest>,
 ) -> Result<Json<Vec<String>>, (StatusCode, String)> {
-    use crate::config::entities_persistence::{EntitiesConfig, save_entities};
-
-    // Remove entity from the list
-    {
-        let mut climates = state.climate_entities.write().unwrap();
+    let ((), all_entity_ids) = update_entities(&state, |climates| {
         climates.retain(|e| e.get_entity_id() != payload.entity_id);
-    }
-
-    // Get updated list
-    let all_entity_ids: Vec<String> = {
-        let climates = state.climate_entities.read().unwrap();
-        climates
-            .iter()
-            .map(|e| e.get_entity_id().to_string())
-            .collect()
-    };
-
-    // Persist to disk
-    let entities_config = EntitiesConfig::new(all_entity_ids.clone());
-    if let Err(e) = save_entities(&entities_config, &state.entities_file_path) {
-        eprintln!("Failed to save entities to disk: {}", e);
-        return Err((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Failed to persist entities: {}", e),
-        ));
-    }
+    })?;
 
     crate::server::zones::reconcile_zones(&state)?;
     println!("Removed entity: {}", payload.entity_id);
@@ -817,6 +779,120 @@ mod tests {
         assert_eq!(
             serde_json::to_value(&saved).unwrap(),
             serde_json::to_value(&memory).unwrap()
+        );
+    }
+
+    /// The entity handlers take the real wrapper type (mock climates in test builds)
+    fn wrapper_state() -> (AppState<ClimateEntityWrapper>, TempDir) {
+        let (state, dir) = test_state();
+        let state = AppState {
+            schedule: state.schedule,
+            schedule_sets_file_path: state.schedule_sets_file_path,
+            climate_entities: Arc::new(RwLock::new(Vec::new())),
+            entities_file_path: state.entities_file_path,
+            zones: state.zones,
+            zones_file_path: state.zones_file_path,
+            area_source: state.area_source,
+            weather: state.weather,
+            weather_file_path: state.weather_file_path,
+            mock_weather: None,
+            dry_run: None,
+        };
+        (state, dir)
+    }
+
+    fn ids(state: &AppState<ClimateEntityWrapper>) -> Vec<String> {
+        let climates = state.climate_entities.read().unwrap();
+        climates
+            .iter()
+            .map(|e| e.get_entity_id().to_string())
+            .collect()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn test_concurrent_entity_changes_reach_disk_in_order() {
+        use crate::config::entities_persistence::load_entities;
+        let (state, _dir) = wrapper_state();
+
+        // Only the last save of a burst decides the file, so check after each of many short
+        // bursts of 8 requests, released together so they really overlap
+        for round in 0..300 {
+            let barrier = Arc::new(tokio::sync::Barrier::new(8));
+            let tasks: Vec<_> = (0..8)
+                .map(|i| {
+                    let (state, barrier) = (state.clone(), Arc::clone(&barrier));
+                    tokio::spawn(async move {
+                        let a = format!("climate.trv_{}", (round + i) % 8);
+                        let b = format!("climate.trv_{}", (round + i + 3) % 8);
+                        barrier.wait().await;
+                        if i % 2 == 1 {
+                            let request = RemoveEntityRequest { entity_id: a };
+                            let _ = remove_entity(State(state), Json(request)).await.unwrap();
+                        } else {
+                            let request = AddEntitiesRequest {
+                                entity_ids: vec![a, b],
+                            };
+                            let _ = add_entities(State(state), Json(request)).await.unwrap();
+                        }
+                    })
+                })
+                .collect();
+            for task in tasks {
+                task.await.unwrap();
+            }
+
+            // The file holds the current list, not an earlier snapshot saved late, without duplicates
+            let saved = load_entities(&state.entities_file_path)
+                .unwrap()
+                .climate_entities;
+            let memory = ids(&state);
+            assert_eq!(saved, memory, "after round {round}");
+            let mut unique = memory.clone();
+            unique.sort();
+            unique.dedup();
+            assert_eq!(
+                unique.len(),
+                memory.len(),
+                "duplicates after round {round}: {memory:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_add_entities_skips_existing_and_repeated_ids() {
+        use crate::config::entities_persistence::load_entities;
+        let (state, _dir) = wrapper_state();
+        let add = |ids: &[&str]| AddEntitiesRequest {
+            entity_ids: ids.iter().map(|s| s.to_string()).collect(),
+        };
+        let all = add_entities(
+            State(state.clone()),
+            Json(add(&["climate.a", "climate.a", "climate.b"])),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(all, vec!["climate.a", "climate.b"]);
+        let all = add_entities(State(state.clone()), Json(add(&["climate.b", "climate.c"])))
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(all, vec!["climate.a", "climate.b", "climate.c"]);
+        let all = remove_entity(
+            State(state.clone()),
+            Json(RemoveEntityRequest {
+                entity_id: "climate.a".to_string(),
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(all, vec!["climate.b", "climate.c"]);
+        assert_eq!(
+            load_entities(&state.entities_file_path)
+                .unwrap()
+                .climate_entities,
+            all
         );
     }
 }
