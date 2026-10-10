@@ -7,6 +7,7 @@ use uuid::Uuid;
 
 use crate::schedule::TimePeriod;
 use crate::weather::adjust::WindExposure;
+use crate::weather::warmup::ColdWarmups;
 
 pub mod areas;
 
@@ -50,6 +51,9 @@ pub struct Zone {
     /// (0, the default, disables)
     #[serde(default)]
     pub max_late_finish_minutes: u32,
+    /// Short warm-ups in long Off gaps on very cold days (off by default)
+    #[serde(default)]
+    pub cold_warmups: ColdWarmups,
 }
 
 /// Default for [`Zone::max_early_start_minutes`]
@@ -75,6 +79,7 @@ impl Zone {
             weather_adjust: false,
             max_early_start_minutes: DEFAULT_MAX_EARLY_START,
             max_late_finish_minutes: 0,
+            cold_warmups: ColdWarmups::default(),
         }
     }
 
@@ -344,6 +349,18 @@ impl Zones {
         if let Some(minutes) = max_late_finish_minutes {
             zone.max_late_finish_minutes = minutes;
         }
+        Ok(())
+    }
+
+    /// Replace a zone's cold-day warm-up settings, if they're valid
+    pub fn set_cold_warmups(&mut self, id: Uuid, warmups: ColdWarmups) -> Result<(), ZoneError> {
+        warmups.validate().map_err(ZoneError::Invalid)?;
+        let zone = self
+            .zones
+            .iter_mut()
+            .find(|z| z.id == id)
+            .ok_or(ZoneError::NotFound)?;
+        zone.cold_warmups = warmups;
         Ok(())
     }
 
