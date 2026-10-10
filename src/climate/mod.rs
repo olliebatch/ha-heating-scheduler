@@ -16,6 +16,9 @@ pub struct ClimateInfo {
     pub state: HeatingState,
     /// The entity's target temperature, when it reports one
     pub target_temp: Option<f64>,
+    /// The lowest and highest targets the entity accepts, when it reports them
+    pub min_temp: Option<f64>,
+    pub max_temp: Option<f64>,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -219,6 +222,8 @@ pub struct MockClimate {
     pub target_step: Option<f64>,
     /// Make `set_temperature` fail, like a rejected HA call
     pub fail_set_temperature: bool,
+    /// The mode last set by `turn_on`/`turn_off`, reported on the next fetch as HA would
+    pub mode: Arc<Mutex<Option<HeatingState>>>,
 }
 
 impl MockClimate {
@@ -229,11 +234,14 @@ impl MockClimate {
                 current_temperature: 20.0,
                 state: initial_state,
                 target_temp: None,
+                min_temp: None,
+                max_temp: None,
             }),
             boosted: Default::default(),
             set_temperatures: Default::default(),
             target_step: None,
             fail_set_temperature: false,
+            mode: Default::default(),
         }
     }
 }
@@ -277,27 +285,32 @@ impl ClimateEntity for MockClimate {
                 None => *t,
             })
             .or_else(|| self.info.as_ref().and_then(|i| i.target_temp));
-        self.info = Some(ClimateInfo {
-            current_temperature: 21.0,
-            state: self
-                .info
+        let state = self.mode.lock().unwrap().clone().unwrap_or_else(|| {
+            self.info
                 .as_ref()
                 .map(|i| i.state.clone())
-                .unwrap_or(HeatingState::Off),
+                .unwrap_or(HeatingState::Off)
+        });
+        self.info = Some(ClimateInfo {
+            current_temperature: 21.0,
+            state,
             target_temp,
+            // Keep any limits a test gave the mock, as HA would keep reporting them
+            min_temp: self.info.as_ref().and_then(|i| i.min_temp),
+            max_temp: self.info.as_ref().and_then(|i| i.max_temp),
         });
         Ok(())
     }
 
     async fn turn_on(&self, _api_client: &ApiClient) -> Result<(), anyhow::Error> {
         println!("[MOCK] Turning ON: {}", self.entity_id);
-        // In a real mock, you might update internal state here
+        *self.mode.lock().unwrap() = Some(HeatingState::On);
         Ok(())
     }
 
     async fn turn_off(&self, _api_client: &ApiClient) -> Result<(), anyhow::Error> {
         println!("[MOCK] Turning OFF: {}", self.entity_id);
-        // In a real mock, you might update internal state here
+        *self.mode.lock().unwrap() = Some(HeatingState::Off);
         Ok(())
     }
 
@@ -329,6 +342,8 @@ impl From<ApiClimateState> for ClimateInfo {
             },
             // null while the entity is off
             target_temp: state.attributes.temperature.as_f64(),
+            min_temp: Some(state.attributes.min_temp),
+            max_temp: Some(state.attributes.max_temp),
         }
     }
 }

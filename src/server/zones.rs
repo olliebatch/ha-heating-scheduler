@@ -1,10 +1,14 @@
 use crate::climate::ClimateEntity;
+use crate::schedule::TimePeriod;
+use crate::scheduler::{ZoneStatus, zone_status};
 use crate::server::AppState;
+use crate::weather::adjust::WindExposure;
 use crate::zones::areas::{DISCOVERY_TIMEOUT, fetch_areas_with_timeout};
 use crate::zones::{Zone, ZoneError, Zones, save_zones};
 use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
+use chrono::Local;
 use serde::{Deserialize, Deserializer, Serialize};
 use uuid::Uuid;
 
@@ -60,10 +64,44 @@ pub fn reconcile_zones<T: ClimateEntity + Clone>(state: &AppState<T>) -> Result<
     })
 }
 
+/// A zone with what it is doing right now and why
+#[derive(Serialize)]
+pub struct ZoneView {
+    #[serde(flatten)]
+    pub zone: Zone,
+    pub status: ZoneStatus,
+}
+
+/// All zones, each with its current state, scheduled and adjusted target, and the reasons,
+/// using the scheduler's last weather reading
 pub async fn get_zones<T: ClimateEntity + Clone>(
     State(state): State<AppState<T>>,
-) -> Json<Vec<Zone>> {
-    Json(state.zones.read().unwrap().zones.clone())
+) -> Json<Vec<ZoneView>> {
+    let now = Local::now();
+    // The scheduler's last reading and the targets it is holding, so this shows what it sends
+    let (weather, held) = {
+        let status = state.weather.read().unwrap();
+        (status.weather.clone(), status.held.clone())
+    };
+    // Lock order everywhere: schedule sets, then zones
+    let sets = state.schedule.read().unwrap();
+    let zones = state.zones.read().unwrap();
+    Json(
+        zones
+            .zones
+            .iter()
+            .map(|zone| ZoneView {
+                zone: zone.clone(),
+                status: zone_status(
+                    Some(zone),
+                    &sets,
+                    weather.as_ref(),
+                    held.get(&zone.id).copied(),
+                    &now,
+                ),
+            })
+            .collect(),
+    )
 }
 
 /// Ask Home Assistant for its areas again and rebuild the zones
@@ -96,6 +134,9 @@ pub struct UpdateZoneRequest {
     /// A set id, or null to follow the active set; leave out to keep the current one
     #[serde(default, deserialize_with = "double_option")]
     pub schedule_set_id: Option<Option<Uuid>>,
+    pub sun_windows: Option<Vec<TimePeriod>>,
+    pub wind_exposure: Option<WindExposure>,
+    pub weather_adjust: Option<bool>,
 }
 
 pub async fn update_zone<T: ClimateEntity + Clone>(
@@ -116,12 +157,21 @@ pub async fn update_zone<T: ClimateEntity + Clone>(
             return Err(zone_error(ZoneError::NotFound));
         }
         // Check the name before changing anything
+        if payload.name.as_deref().is_some_and(|n| n.trim().is_empty()) {
+            return Err(zone_error(ZoneError::Invalid(
+                "Name must not be empty".to_string(),
+            )));
+        }
+        // set_profile checks the sun windows before changing anything
+        zones
+            .set_profile(
+                zone_id,
+                payload.sun_windows.clone(),
+                payload.wind_exposure,
+                payload.weather_adjust,
+            )
+            .map_err(zone_error)?;
         if let Some(name) = &payload.name {
-            if name.trim().is_empty() {
-                return Err(zone_error(ZoneError::Invalid(
-                    "Name must not be empty".to_string(),
-                )));
-            }
             zones.rename(zone_id, name).map_err(zone_error)?;
         }
         if let Some(set_id) = payload.schedule_set_id {
@@ -219,6 +269,9 @@ mod tests {
             zones: Arc::new(RwLock::new(Zones::default())),
             zones_file_path: path("zones.json"),
             area_source: Arc::new(MockAreas::example()),
+            weather: Default::default(),
+            weather_file_path: path("weather.json"),
+            mock_weather: None,
         };
         (state, dir)
     }
@@ -397,5 +450,73 @@ mod tests {
         .await
         .unwrap_err();
         assert_eq!(err.0, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_profile_update_and_status() {
+        let (state, _dir) = test_state();
+        let zones = refresh_zones(State(state.clone())).await.unwrap().0;
+        let study = zone_named(&zones, "Study").id;
+        let request = |json: &str| Json(serde_json::from_str::<UpdateZoneRequest>(json).unwrap());
+
+        let zone = update_zone(
+            State(state.clone()),
+            Path(study),
+            request(
+                r#"{"weather_adjust": true, "wind_exposure": "high",
+                    "sun_windows": [{"start": "08:00:00", "end": "11:00:00"}]}"#,
+            ),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert!(zone.weather_adjust);
+        assert_eq!(zone.wind_exposure, WindExposure::High);
+        assert_eq!(zone.sun_windows.len(), 1);
+
+        // A zero-length sun window is refused and changes nothing
+        let err = update_zone(
+            State(state.clone()),
+            Path(study),
+            request(
+                r#"{"name": "Office", "sun_windows": [{"start": "08:00:00", "end": "08:00:00"}]}"#,
+            ),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            state.zones.read().unwrap().get(study).unwrap().name,
+            "Study"
+        );
+
+        // With an On schedule and cold, windy weather, GET /zones explains the adjustment
+        state.schedule.write().unwrap().active_mut().add_entry(
+            crate::schedule::ScheduleEntry::new(
+                "All day",
+                TimePeriod::new(0, 0, 0, 0),
+                HeatingState::On,
+            )
+            .with_target(20.0),
+        );
+        state.weather.write().unwrap().weather = Some(crate::weather::Weather {
+            temperature: Some(-5.0),
+            wind_speed: Some(50.0),
+            cloud_coverage: Some(100.0),
+        });
+        let views = get_zones(State(state.clone())).await.0;
+        let study_view = views.iter().find(|v| v.zone.id == study).unwrap();
+        assert_eq!(study_view.status.scheduled_target, Some(20.0));
+        assert_eq!(study_view.status.target, Some(22.5));
+        let lounge_view = views.iter().find(|v| v.zone.name == "Lounge").unwrap();
+        assert_eq!(
+            lounge_view.status.target,
+            Some(20.0),
+            "weather adjust is off"
+        );
+
+        let json = serde_json::to_value(study_view).unwrap();
+        assert_eq!(json["name"], "Study", "zone fields are flattened");
+        assert_eq!(json["status"]["reasons"][0]["cause"], "cold");
     }
 }

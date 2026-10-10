@@ -7,14 +7,16 @@ use crate::server::handlers::{
 use crate::server::zones::{
     create_zone, delete_zone, get_zones, merge_zones, refresh_zones, update_zone,
 };
+use crate::weather::Weather;
 use crate::zones::areas::AreaSource;
-use crate::{ScheduleState, ZonesState};
+use crate::{ScheduleState, WeatherState, ZonesState};
 use axum::routing::{delete, patch, post};
 use axum::{Router, routing::get};
 use std::sync::{Arc, RwLock};
 use tower_http::cors::CorsLayer;
 
 mod handlers;
+mod weather;
 mod zones;
 
 #[derive(Clone)]
@@ -26,26 +28,13 @@ pub struct AppState<T: ClimateEntity + Clone> {
     pub zones: ZonesState,
     pub zones_file_path: String,
     pub area_source: Arc<dyn AreaSource>,
+    pub weather: WeatherState,
+    pub weather_file_path: String,
+    /// The mock weather to set in debug builds; None in release
+    pub mock_weather: Option<Arc<RwLock<Weather>>>,
 }
 
-pub async fn start_server(
-    schedule: ScheduleState,
-    schedule_sets_file_path: String,
-    climate_entities: Arc<RwLock<Vec<ClimateEntityWrapper>>>,
-    entities_file_path: String,
-    zones: ZonesState,
-    zones_file_path: String,
-    area_source: Arc<dyn AreaSource>,
-) {
-    let app_state = AppState {
-        schedule,
-        schedule_sets_file_path,
-        climate_entities,
-        entities_file_path,
-        zones,
-        zones_file_path,
-        area_source,
-    };
+pub async fn start_server(app_state: AppState<ClimateEntityWrapper>) {
     let cors_layer = CorsLayer::permissive();
     let app = Router::new()
         .route("/schedule", get(get_schedule::<ClimateEntityWrapper>))
@@ -92,13 +81,25 @@ pub async fn start_server(
             "/zones/{id}",
             patch(update_zone::<ClimateEntityWrapper>).delete(delete_zone::<ClimateEntityWrapper>),
         )
+        .route(
+            "/weather",
+            get(weather::get_weather::<ClimateEntityWrapper>)
+                .put(weather::set_weather_entity::<ClimateEntityWrapper>),
+        )
         .route("/entities", get(get_entities::<ClimateEntityWrapper>))
         .route("/entities", post(add_entities))
         .route("/entities", delete(remove_entity))
         .route("/boost_all", post(boost_all::<ClimateEntityWrapper>))
-        .route("/boost", post(boost::<ClimateEntityWrapper>))
-        .layer(cors_layer)
-        .with_state(app_state);
+        .route("/boost", post(boost::<ClimateEntityWrapper>));
+
+    // Set the mock weather by hand (debug builds only)
+    #[cfg(debug_assertions)]
+    let app = app.route(
+        "/weather/mock",
+        post(weather::set_mock_weather::<ClimateEntityWrapper>),
+    );
+
+    let app = app.layer(cors_layer).with_state(app_state);
 
     // run our app with hyper, listening globally on port 3000
     let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();

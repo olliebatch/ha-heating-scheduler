@@ -9,13 +9,18 @@ use ha_heating_scheduler::config;
 use ha_heating_scheduler::schedule::HeatingState;
 use ha_heating_scheduler::schedule::persistence;
 use ha_heating_scheduler::scheduler::{SchedulerState, run_scheduler};
-use ha_heating_scheduler::server::start_server;
+use ha_heating_scheduler::server::{AppState, start_server};
+#[cfg(not(debug_assertions))]
+use ha_heating_scheduler::weather::HomeAssistantWeather;
+#[cfg(debug_assertions)]
+use ha_heating_scheduler::weather::MockWeather;
+use ha_heating_scheduler::weather::WeatherSource;
 #[cfg(not(debug_assertions))]
 use ha_heating_scheduler::zones::areas::HomeAssistantAreas;
 #[cfg(debug_assertions)]
 use ha_heating_scheduler::zones::areas::MockAreas;
 use ha_heating_scheduler::zones::areas::{AreaSource, DISCOVERY_TIMEOUT, fetch_areas_with_timeout};
-use ha_heating_scheduler::{ScheduleState, ZonesState, api_client, zones};
+use ha_heating_scheduler::{ScheduleState, WeatherState, ZonesState, api_client, weather, zones};
 use std::path::Path;
 use std::sync::{Arc, RwLock};
 
@@ -35,6 +40,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let schedule_sets_file_path = data_dir.join("schedule_sets.json");
     let entities_file_path = data_dir.join("entities.json");
     let zones_file_path = data_dir.join("zones.json");
+    let weather_file_path = data_dir.join("weather.json");
 
     let schedule_sets =
         persistence::load_or_migrate(&schedule_sets_file_path, &schedule_file_path)?;
@@ -134,21 +140,50 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ));
     }
 
+    // Weather from a Home Assistant weather entity (mock weather in debug mode)
+    let weather_config = weather::load_weather_config(&weather_file_path)?;
+    let weather: WeatherState = Arc::new(RwLock::new(weather::WeatherStatus {
+        entity_id: weather_config.entity_id,
+        ..Default::default()
+    }));
+    #[cfg(debug_assertions)]
+    let mock_weather = {
+        let mock = MockWeather::default();
+        let handle = Arc::clone(&mock.weather);
+        (Arc::new(mock) as Arc<dyn WeatherSource>, Some(handle))
+    };
+    #[cfg(not(debug_assertions))]
+    let mock_weather = (
+        Arc::new(HomeAssistantWeather {
+            api_client: api_client::ApiClient::new(
+                reqwest::Url::parse(&config.ha_url)?,
+                config.ha_token.clone(),
+            ),
+        }) as Arc<dyn WeatherSource>,
+        None,
+    );
+    let (weather_source, mock_weather) = mock_weather;
+
     let schedule: ScheduleState = Arc::new(RwLock::new(schedule_sets));
-    let api_task = tokio::spawn(start_server(
-        Arc::clone(&schedule),
-        schedule_sets_file_path.to_string_lossy().to_string(),
-        Arc::clone(&climate_entities),
-        entities_file_path.to_string_lossy().to_string(),
-        Arc::clone(&zones),
-        zones_file_path.to_string_lossy().to_string(),
+    let api_task = tokio::spawn(start_server(AppState {
+        schedule: Arc::clone(&schedule),
+        schedule_sets_file_path: schedule_sets_file_path.to_string_lossy().to_string(),
+        climate_entities: Arc::clone(&climate_entities),
+        entities_file_path: entities_file_path.to_string_lossy().to_string(),
+        zones: Arc::clone(&zones),
+        zones_file_path: zones_file_path.to_string_lossy().to_string(),
         area_source,
-    ));
+        weather: Arc::clone(&weather),
+        weather_file_path: weather_file_path.to_string_lossy().to_string(),
+        mock_weather,
+    }));
 
     let scheduler_task = tokio::spawn(run_scheduler(SchedulerState {
         api_client,
         schedule,
         zones,
+        weather,
+        weather_source,
         climate_entities: Arc::clone(&climate_entities),
     }));
 

@@ -59,6 +59,29 @@ zone follows can't be deleted (409 naming the zones).
 - `POST /zones` - Manual zone: `{"name": "Loft", "entity_ids": ["climate.loft"]}` (its entities leave their area zones)
 - `DELETE /zones/{id}` - Delete a manual or merged zone; its entities fall back to their area zones or Whole house
 
+### Weather
+With "weather adjust" on, a zone's On target is adjusted for the weather from a Home Assistant weather entity
+(debug mode uses mock weather). The entity is read once per scheduler tick; if a read fails, the last good reading is
+used for up to 30 minutes, and after that targets aren't adjusted.
+It uses the entity's `temperature`, `wind_speed` and `cloud_coverage` attributes (converting °F, m/s, mph and
+knots; without `cloud_coverage`, the condition such as `sunny` or `cloudy` gives a rough cloud cover).
+
+- Cold: from 0 at 5 °C outside up to +1.5 °C at -5 °C
+- Wind: from 0 at 20 km/h up to the zone's exposure maximum at 50 km/h (low: none, medium: +0.5 °C, high: +1 °C)
+- Sun: inside one of the zone's sun windows, from -1.5 °C under clear skies to none at 30 % cloud
+
+The result is clamped to 5-30 °C and to the climate's own min/max, and rounded to 0.5 °C. Once set, a zone's adjusted
+target is held until the unrounded value moves at least 0.5 °C from it (0.25 °C past the rounding boundary), so an
+outside temperature wobbling around a boundary doesn't re-command TRVs. Off periods are never adjusted.
+
+- `GET /weather` - The configured weather entity, the last reading and any error
+- `PUT /weather` - Choose the weather entity: `{"entity_id": "weather.home"}` (`null` to stop); stored in `data/weather.json`
+- `POST /weather/mock` - Debug builds only: set the mock weather, e.g. `{"temperature": -2, "wind_speed": 40, "cloud_coverage": 10}`
+- `PATCH /zones/{id}` also takes `sun_windows` (`[{"start": "08:00", "end": "11:00"}]`), `wind_exposure`
+  (`low`/`medium`/`high`) and `weather_adjust` (`true`/`false`)
+- `GET /zones` includes each zone's `status`: `state`, `scheduled_target`, adjusted `target`, `reasons`,
+  `raw_target` (before clamping, rounding and holding) and `held`
+
 ### Schedule (active set)
 - `GET /schedule` - Get the active schedule
 - `POST /schedule` - Add an entry to the active schedule
