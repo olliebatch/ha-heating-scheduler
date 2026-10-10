@@ -13,10 +13,13 @@ pub struct ColdWarmups {
     /// Warm up only when it's colder than this outside (°C)
     pub below_c: f64,
     /// Only in Off gaps longer than this
+    #[serde(deserialize_with = "crate::zones::minutes")]
     pub min_gap_minutes: u32,
     /// How long each warm-up lasts
+    #[serde(deserialize_with = "crate::zones::minutes")]
     pub burst_minutes: u32,
     /// One warm-up this long after the gap starts, then again every this many minutes
+    #[serde(deserialize_with = "crate::zones::minutes")]
     pub every_minutes: u32,
 }
 

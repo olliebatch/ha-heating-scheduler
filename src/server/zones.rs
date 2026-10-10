@@ -6,6 +6,7 @@ use crate::weather::adjust::WindExposure;
 use crate::zones::areas::{DISCOVERY_TIMEOUT, fetch_areas_with_timeout};
 use crate::zones::{Zone, ZoneError, Zones, save_zones};
 use axum::Json;
+use axum::extract::rejection::JsonRejection;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use chrono::Local;
@@ -139,17 +140,35 @@ pub struct UpdateZoneRequest {
     pub sun_windows: Option<Vec<TimePeriod>>,
     pub wind_exposure: Option<WindExposure>,
     pub weather_adjust: Option<bool>,
+    #[serde(default, deserialize_with = "crate::zones::optional_minutes")]
     pub max_early_start_minutes: Option<u32>,
+    #[serde(default, deserialize_with = "crate::zones::optional_minutes")]
     pub max_late_finish_minutes: Option<u32>,
     /// The whole block; fields left out get their defaults
     pub cold_warmups: Option<crate::weather::warmup::ColdWarmups>,
 }
 
+/// A request body that couldn't be read, as a 400 saying which field and why, e.g.
+/// "max_late_finish_minutes: must be a whole number of minutes, 0 or more, not -5"
+fn unreadable(rejection: JsonRejection) -> ApiError {
+    let text = rejection.body_text();
+    let text = text
+        .strip_prefix("Failed to deserialize the JSON body into the target type: ")
+        .unwrap_or(&text);
+    // serde adds where in the JSON it stopped, which means nothing to a person
+    let text = match text.rfind(" at line ") {
+        Some(i) if text[i..].contains(" column ") => &text[..i],
+        _ => text,
+    };
+    (StatusCode::BAD_REQUEST, text.to_string())
+}
+
 pub async fn update_zone<T: ClimateEntity + Clone>(
     State(state): State<AppState<T>>,
     Path(zone_id): Path<Uuid>,
-    Json(payload): Json<UpdateZoneRequest>,
+    payload: Result<Json<UpdateZoneRequest>, JsonRejection>,
 ) -> Result<Json<Zone>, ApiError> {
+    let Json(payload) = payload.map_err(unreadable)?;
     if let Some(Some(set_id)) = payload.schedule_set_id {
         if state.schedule.read().unwrap().get(set_id).is_none() {
             return Err((
@@ -355,7 +374,7 @@ mod tests {
             .unwrap()
             .id;
 
-        let request = |json: &str| Json(serde_json::from_str::<UpdateZoneRequest>(json).unwrap());
+        let request = |json: &str| Json::<UpdateZoneRequest>::from_bytes(json.as_bytes());
 
         let zone = update_zone(
             State(state.clone()),
@@ -477,7 +496,7 @@ mod tests {
         let (state, _dir) = test_state();
         let zones = refresh_zones(State(state.clone())).await.unwrap().0;
         let study = zone_named(&zones, "Study").id;
-        let request = |json: &str| Json(serde_json::from_str::<UpdateZoneRequest>(json).unwrap());
+        let request = |json: &str| Json::<UpdateZoneRequest>::from_bytes(json.as_bytes());
 
         let zone = update_zone(
             State(state.clone()),
@@ -545,7 +564,7 @@ mod tests {
         let (state, _dir) = test_state();
         let zones = refresh_zones(State(state.clone())).await.unwrap().0;
         let study = zone_named(&zones, "Study").id;
-        let request = |json: &str| Json(serde_json::from_str::<UpdateZoneRequest>(json).unwrap());
+        let request = |json: &str| Json::<UpdateZoneRequest>::from_bytes(json.as_bytes());
 
         // Fields left out of the block get their defaults
         let zone = update_zone(
@@ -581,5 +600,78 @@ mod tests {
         let zone = state.zones.read().unwrap().get(study).unwrap().clone();
         assert!(!zone.weather_adjust);
         assert_eq!(zone.cold_warmups.below_c, -3.0);
+    }
+
+    #[tokio::test]
+    async fn test_unreadable_numbers_are_400_with_plain_text() {
+        let (state, _dir) = test_state();
+        let zones = refresh_zones(State(state.clone())).await.unwrap().0;
+        let study = zone_named(&zones, "Study").id;
+        let request = |json: &str| Json::<UpdateZoneRequest>::from_bytes(json.as_bytes());
+
+        for (json, text) in [
+            (
+                r#"{"max_late_finish_minutes": -5}"#,
+                "max_late_finish_minutes: must be a whole number of minutes, 0 or more, not -5",
+            ),
+            (
+                r#"{"max_early_start_minutes": -1}"#,
+                "max_early_start_minutes: must be a whole number of minutes, 0 or more, not -1",
+            ),
+            (
+                r#"{"max_early_start_minutes": 2.5}"#,
+                "max_early_start_minutes: must be a whole number of minutes, 0 or more, not 2.5",
+            ),
+            (
+                r#"{"cold_warmups": {"enabled": true, "burst_minutes": -10}}"#,
+                "cold_warmups.burst_minutes: must be a whole number of minutes, 0 or more, not -10",
+            ),
+            (
+                r#"{"cold_warmups": {"every_minutes": "often"}}"#,
+                "cold_warmups.every_minutes: must be a whole number of minutes, 0 or more, not \"often\"",
+            ),
+        ] {
+            let err = update_zone(State(state.clone()), Path(study), request(json))
+                .await
+                .unwrap_err();
+            assert_eq!(err, (StatusCode::BAD_REQUEST, text.to_string()), "{json}");
+        }
+        // Too big is still refused by the range check, with its own message
+        let err = update_zone(
+            State(state.clone()),
+            Path(study),
+            request(r#"{"max_late_finish_minutes": 181}"#),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.1, "max_late_finish_minutes must be 0-180");
+        // null leaves a limit as it is, as before
+        let _ = update_zone(
+            State(state.clone()),
+            Path(study),
+            request(r#"{"max_early_start_minutes": null}"#),
+        )
+        .await
+        .unwrap();
+        // Nothing changed, and a valid value still works
+        assert_eq!(
+            state
+                .zones
+                .read()
+                .unwrap()
+                .get(study)
+                .unwrap()
+                .max_early_start_minutes,
+            30
+        );
+        let zone = update_zone(
+            State(state),
+            Path(study),
+            request(r#"{"max_late_finish_minutes": 15}"#),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(zone.max_late_finish_minutes, 15);
     }
 }

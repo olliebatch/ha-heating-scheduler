@@ -61,6 +61,28 @@ pub const DEFAULT_MAX_EARLY_START: u32 = 30;
 /// Largest allowed [`Zone::max_early_start_minutes`] and [`Zone::max_late_finish_minutes`]
 pub const MAX_EARLY_START_LIMIT: u32 = 180;
 
+/// A whole number of minutes, 0 or more, with a plain message for anything else (a negative
+/// number, say), rather than serde's "expected u32"
+pub fn minutes<'de, D: serde::Deserializer<'de>>(d: D) -> Result<u32, D::Error> {
+    let value = serde_json::Value::deserialize(d)?;
+    value
+        .as_u64()
+        .and_then(|m| u32::try_from(m).ok())
+        .ok_or_else(|| {
+            serde::de::Error::custom(format!(
+                "must be a whole number of minutes, 0 or more, not {value}"
+            ))
+        })
+}
+
+/// [`minutes`], for a field that may be left out or null (both meaning "leave it as it is")
+pub fn optional_minutes<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<u32>, D::Error> {
+    match Option::<serde_json::Value>::deserialize(d)? {
+        None => Ok(None),
+        Some(value) => minutes(value).map(Some).map_err(serde::de::Error::custom),
+    }
+}
+
 fn default_max_early_start() -> u32 {
     DEFAULT_MAX_EARLY_START
 }
