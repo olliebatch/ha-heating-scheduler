@@ -1,23 +1,31 @@
-use crate::ScheduleState;
 use crate::climate::{ClimateEntity, ClimateEntityWrapper};
 use crate::server::handlers::{
     activate_schedule_set, add_entities, add_schedule_entry, add_set_entry, boost, boost_all,
     create_schedule_set, delete_schedule_entry, delete_schedule_set, delete_set_entry,
     get_entities, get_schedule, get_schedule_sets, remove_entity, rename_schedule_set,
 };
+use crate::server::zones::{
+    create_zone, delete_zone, get_zones, merge_zones, refresh_zones, update_zone,
+};
+use crate::zones::areas::AreaSource;
+use crate::{ScheduleState, ZonesState};
 use axum::routing::{delete, patch, post};
 use axum::{Router, routing::get};
 use std::sync::{Arc, RwLock};
 use tower_http::cors::CorsLayer;
 
 mod handlers;
+mod zones;
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct AppState<T: ClimateEntity + Clone> {
     pub schedule: ScheduleState,
     pub schedule_sets_file_path: String,
     pub climate_entities: Arc<RwLock<Vec<T>>>,
     pub entities_file_path: String,
+    pub zones: ZonesState,
+    pub zones_file_path: String,
+    pub area_source: Arc<dyn AreaSource>,
 }
 
 pub async fn start_server(
@@ -25,12 +33,18 @@ pub async fn start_server(
     schedule_sets_file_path: String,
     climate_entities: Arc<RwLock<Vec<ClimateEntityWrapper>>>,
     entities_file_path: String,
+    zones: ZonesState,
+    zones_file_path: String,
+    area_source: Arc<dyn AreaSource>,
 ) {
     let app_state = AppState {
         schedule,
         schedule_sets_file_path,
         climate_entities,
         entities_file_path,
+        zones,
+        zones_file_path,
+        area_source,
     };
     let cors_layer = CorsLayer::permissive();
     let app = Router::new()
@@ -64,6 +78,19 @@ pub async fn start_server(
         .route(
             "/schedule_sets/{id}/entries/{entry_id}",
             delete(delete_set_entry::<ClimateEntityWrapper>),
+        )
+        .route(
+            "/zones",
+            get(get_zones::<ClimateEntityWrapper>).post(create_zone::<ClimateEntityWrapper>),
+        )
+        .route(
+            "/zones/refresh",
+            post(refresh_zones::<ClimateEntityWrapper>),
+        )
+        .route("/zones/merge", post(merge_zones::<ClimateEntityWrapper>))
+        .route(
+            "/zones/{id}",
+            patch(update_zone::<ClimateEntityWrapper>).delete(delete_zone::<ClimateEntityWrapper>),
         )
         .route("/entities", get(get_entities::<ClimateEntityWrapper>))
         .route("/entities", post(add_entities))

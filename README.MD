@@ -45,6 +45,20 @@ Off stays off, with no temperature set. Boost uses the active On entry's target,
 (stored in `schedule_sets.json`, 20 °C unless changed there) when nothing On is scheduled. On entries
 saved before targets existed get `default_target_temp` when loaded.
 
+### Zones
+Each Home Assistant Area with managed climate entities is a zone (found through HA's `/api/template` endpoint;
+debug mode uses mock areas). Zones are stored in `data/zones.json` and keep their ids across refreshes and restarts.
+Each managed entity is in exactly one zone: a manual zone first, else its area's zone, else "Whole house". Each zone
+follows its own schedule set, or the active set when `schedule_set_id` is null (the default). A schedule set that a
+zone follows can't be deleted (409 naming the zones).
+
+- `GET /zones` - All zones
+- `POST /zones/refresh` - Fetch areas from Home Assistant again and rebuild the zones (502 if HA can't be reached)
+- `PATCH /zones/{id}` - `{"name": "Office", "schedule_set_id": "<set id>"}`; both optional, `null` set id follows the active set
+- `POST /zones/merge` - Merge area zones into the first: `{"zone_ids": ["<id>", "<id>"], "name": "Downstairs"}`
+- `POST /zones` - Manual zone: `{"name": "Loft", "entity_ids": ["climate.loft"]}` (its entities leave their area zones)
+- `DELETE /zones/{id}` - Delete a manual or merged zone; its entities fall back to their area zones or Whole house
+
 ### Schedule (active set)
 - `GET /schedule` - Get the active schedule
 - `POST /schedule` - Add an entry to the active schedule

@@ -1,3 +1,4 @@
+use ha_heating_scheduler::climate::ClimateEntity;
 use ha_heating_scheduler::climate::ClimateEntityWrapper;
 #[cfg(not(debug_assertions))]
 use ha_heating_scheduler::climate::DefaultClimate;
@@ -9,7 +10,12 @@ use ha_heating_scheduler::schedule::HeatingState;
 use ha_heating_scheduler::schedule::persistence;
 use ha_heating_scheduler::scheduler::{SchedulerState, run_scheduler};
 use ha_heating_scheduler::server::start_server;
-use ha_heating_scheduler::{ScheduleState, api_client};
+#[cfg(not(debug_assertions))]
+use ha_heating_scheduler::zones::areas::HomeAssistantAreas;
+#[cfg(debug_assertions)]
+use ha_heating_scheduler::zones::areas::MockAreas;
+use ha_heating_scheduler::zones::areas::{AreaSource, DISCOVERY_TIMEOUT, fetch_areas_with_timeout};
+use ha_heating_scheduler::{ScheduleState, ZonesState, api_client, zones};
 use std::path::Path;
 use std::sync::{Arc, RwLock};
 
@@ -28,6 +34,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let schedule_file_path = data_dir.join("schedule.json");
     let schedule_sets_file_path = data_dir.join("schedule_sets.json");
     let entities_file_path = data_dir.join("entities.json");
+    let zones_file_path = data_dir.join("zones.json");
 
     let schedule_sets =
         persistence::load_or_migrate(&schedule_sets_file_path, &schedule_file_path)?;
@@ -77,20 +84,107 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
     println!();
+    // Zones come from Home Assistant Areas (mock areas in debug mode)
+    let area_source: Arc<dyn AreaSource> = {
+        #[cfg(debug_assertions)]
+        {
+            Arc::new(MockAreas::example())
+        }
+        #[cfg(not(debug_assertions))]
+        {
+            Arc::new(HomeAssistantAreas {
+                api_client: api_client::ApiClient::new(
+                    reqwest::Url::parse(&config.ha_url)?,
+                    config.ha_token.clone(),
+                ),
+            })
+        }
+    };
+    // Start with the saved zones if Home Assistant is slow or down, and keep trying in the background
+    let mut zones = zones::load_zones(&zones_file_path)?;
+    let areas = match fetch_areas_with_timeout(area_source.as_ref(), DISCOVERY_TIMEOUT).await {
+        Ok(areas) => Some(areas),
+        Err(e) => {
+            eprintln!(
+                "Failed to fetch areas, starting with the saved zones: {}",
+                e
+            );
+            None
+        }
+    };
+    let discovery_failed = areas.is_none();
+    let managed: Vec<String> = climate_entities
+        .read()
+        .unwrap()
+        .iter()
+        .map(|e| e.get_entity_id().to_string())
+        .collect();
+    zones.reconcile(areas, &managed);
+    zones::save_zones(&zones, &zones_file_path)?;
+    for zone in &zones.zones {
+        println!("Zone {}: {}", zone.name, zone.entity_ids.join(", "));
+    }
+    let zones: ZonesState = Arc::new(RwLock::new(zones));
+    if discovery_failed {
+        tokio::spawn(retry_area_discovery(
+            Arc::clone(&area_source),
+            Arc::clone(&zones),
+            zones_file_path.clone(),
+            Arc::clone(&climate_entities),
+        ));
+    }
+
     let schedule: ScheduleState = Arc::new(RwLock::new(schedule_sets));
     let api_task = tokio::spawn(start_server(
         Arc::clone(&schedule),
         schedule_sets_file_path.to_string_lossy().to_string(),
         Arc::clone(&climate_entities),
         entities_file_path.to_string_lossy().to_string(),
+        Arc::clone(&zones),
+        zones_file_path.to_string_lossy().to_string(),
+        area_source,
     ));
 
     let scheduler_task = tokio::spawn(run_scheduler(SchedulerState {
         api_client,
         schedule,
+        zones,
         climate_entities: Arc::clone(&climate_entities),
     }));
 
     tokio::try_join!(api_task, scheduler_task).unwrap();
     Ok(())
+}
+
+/// Retry area discovery every minute until it works, then rebuild and save the zones
+async fn retry_area_discovery(
+    area_source: Arc<dyn AreaSource>,
+    zones: ZonesState,
+    zones_file_path: std::path::PathBuf,
+    climate_entities: Arc<RwLock<Vec<ClimateEntityWrapper>>>,
+) {
+    loop {
+        tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+        match fetch_areas_with_timeout(area_source.as_ref(), DISCOVERY_TIMEOUT).await {
+            Ok(areas) => {
+                let managed: Vec<String> = climate_entities
+                    .read()
+                    .unwrap()
+                    .iter()
+                    .map(|e| e.get_entity_id().to_string())
+                    .collect();
+                let snapshot = {
+                    let mut zones = zones.write().unwrap();
+                    zones.reconcile(Some(areas), &managed);
+                    zones.clone()
+                };
+                if let Err(e) = zones::save_zones(&snapshot, &zones_file_path) {
+                    eprintln!("Failed to save zones after discovery: {}", e);
+                }
+                println!("Area discovery succeeded; zones updated");
+                return;
+            }
+            Err(e) => eprintln!("Area discovery failed again, retrying in 60 s: {}", e),
+        }
+    }
 }

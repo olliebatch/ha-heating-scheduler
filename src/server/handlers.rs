@@ -142,12 +142,30 @@ pub async fn rename_schedule_set<T: ClimateEntity + Clone>(
     Ok(Json(renamed))
 }
 
-/// Delete a set; the active set and the last set are refused with 409
+/// Delete a set; the active set, the last set and a set zones follow are refused with 409.
+/// (Refusing, rather than moving those zones to the active set, means a room's heating never
+/// changes as a side effect of tidying up sets.)
 pub async fn delete_schedule_set<T: ClimateEntity + Clone>(
     State(state): State<AppState<T>>,
     Path(set_id): Path<Uuid>,
 ) -> Result<Json<ScheduleSets>, ApiError> {
     let sets = update_sets(&state, |sets| {
+        // Lock order everywhere: schedule sets, then zones
+        let zones = state.zones.read().unwrap();
+        let users: Vec<String> = zones
+            .using_set(set_id)
+            .iter()
+            .map(|z| format!("\"{}\"", z.name))
+            .collect();
+        if !users.is_empty() {
+            return Err((
+                StatusCode::CONFLICT,
+                format!(
+                    "Schedule set is used by zone(s) {}; move them to another set first",
+                    users.join(", ")
+                ),
+            ));
+        }
         sets.delete(set_id).map_err(set_error)?;
         Ok(sets.clone())
     })?;
@@ -391,6 +409,7 @@ pub async fn add_entities(
         ));
     }
 
+    crate::server::zones::reconcile_zones(&state)?;
     println!("Added {} new entities", new_entity_ids.len());
     Ok(Json(all_entity_ids))
 }
@@ -427,6 +446,7 @@ pub async fn remove_entity(
         ));
     }
 
+    crate::server::zones::reconcile_zones(&state)?;
     println!("Removed entity: {}", payload.entity_id);
     Ok(Json(all_entity_ids))
 }
@@ -455,6 +475,9 @@ mod tests {
                 .join("entities.json")
                 .to_string_lossy()
                 .to_string(),
+            zones: Arc::new(RwLock::new(crate::zones::Zones::default())),
+            zones_file_path: dir.path().join("zones.json").to_string_lossy().to_string(),
+            area_source: Arc::new(crate::zones::areas::MockAreas::example()),
         };
         (state, dir)
     }
@@ -631,5 +654,24 @@ mod tests {
             .unwrap()
             .0;
         assert_eq!(added.entries[0].target_temp, Some(21.0));
+    }
+
+    #[tokio::test]
+    async fn test_delete_set_used_by_zone_is_conflict() {
+        let (state, _dir) = test_state();
+        let holiday = create(&state, "Holiday").await;
+        {
+            let mut zones = state.zones.write().unwrap();
+            zones.reconcile(Some(vec![]), &[]);
+            let whole = zones.zones[0].id;
+            zones.set_schedule_set(whole, Some(holiday.id)).unwrap();
+        }
+
+        let err = delete_schedule_set(State(state.clone()), Path(holiday.id))
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.0, StatusCode::CONFLICT);
+        assert!(err.1.contains("Whole house"), "{}", err.1);
     }
 }
