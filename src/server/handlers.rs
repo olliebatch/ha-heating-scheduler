@@ -358,7 +358,6 @@ pub struct RemoveEntityRequest {
     pub entity_id: String,
 }
 
-/// Add new climate entities
 /// Change the climate entities and save entities.json while still holding the lock, so
 /// concurrent adds and removes reach disk in order (like [`update_sets`]). Returns `change`'s
 /// result and the entity ids afterwards. Zones are reconciled by the caller, after the lock is
@@ -386,6 +385,7 @@ fn update_entities<R>(
     Ok((result, all_entity_ids))
 }
 
+/// Add new climate entities
 pub async fn add_entities(
     State(state): State<AppState<ClimateEntityWrapper>>,
     Json(payload): Json<AddEntitiesRequest>,
@@ -416,6 +416,7 @@ pub async fn add_entities(
     Ok(Json(all_entity_ids))
 }
 
+/// Remove a climate entity
 pub async fn remove_entity(
     State(state): State<AppState<ClimateEntityWrapper>>,
     Json(payload): Json<RemoveEntityRequest>,
