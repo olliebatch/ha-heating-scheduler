@@ -107,7 +107,7 @@ else turns heating on during an Off period.
   `max_late_finish_minutes` (both 0-180), and `cold_warmups`: `{"enabled": true, "below_c": 0, "min_gap_minutes": 240,
   "burst_minutes": 20, "every_minutes": 180}` (the defaults, apart from `enabled`, which is false; fields left out get
   them). The gap and interval must be 1-1440 minutes, the burst 1-180 and shorter than the interval, and `below_c`
-  -30 to 20 °C
+  -30 to 20 °C. A value that isn't a whole number of minutes (a negative one, say) gets a 400 naming the field
 - `GET /zones` includes each zone's `status`: `state`, `scheduled_target`, adjusted `target`, `reasons`,
   `raw_target` (before clamping, rounding and holding), `held` and `early_start` (`period_start`, `lead_minutes`
   allowed by the weather, `minutes_early` it actually started, and `causes`) while a period is being started early, and
