@@ -295,6 +295,26 @@ pub struct ClimateEntityInfo {
     pub boost_end: Option<String>,
 }
 
+/// Whether this is a dry run, and the calls it would have made to Home Assistant, newest first
+#[derive(Serialize)]
+pub struct DryRunView {
+    pub dry_run: bool,
+    pub calls: Vec<crate::dry_run::WouldBeCall>,
+}
+
+pub async fn get_dry_run<T: ClimateEntity + Clone>(
+    State(state): State<AppState<T>>,
+) -> Json<DryRunView> {
+    Json(DryRunView {
+        dry_run: state.dry_run.is_some(),
+        calls: state
+            .dry_run
+            .as_ref()
+            .map(|d| d.calls())
+            .unwrap_or_default(),
+    })
+}
+
 pub async fn get_entities<T: ClimateEntity + Clone>(
     State(state): State<AppState<T>>,
 ) -> Result<Json<Vec<ClimateEntityInfo>>, (StatusCode, String)> {
@@ -482,6 +502,7 @@ mod tests {
                 .to_string_lossy()
                 .to_string(),
             mock_weather: None,
+            dry_run: None,
         };
         (state, dir)
     }

@@ -9,6 +9,16 @@ pub struct Config {
     pub data_path: String,
 }
 
+/// The port to listen on: `PORT`, or 3000
+pub fn port(env: Option<String>) -> anyhow::Result<u16> {
+    match env.as_deref().map(str::trim) {
+        None | Some("") => Ok(3000),
+        Some(port) => port
+            .parse()
+            .map_err(|_| anyhow::anyhow!("PORT must be a port number, not {port:?}")),
+    }
+}
+
 impl Config {
     pub fn new(
         ha_url: &str,
@@ -96,5 +106,19 @@ impl Config {
         };
 
         Ok(Config::new(&ha_url, &ha_token, climate_entities, data_path))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_port() {
+        assert_eq!(port(None).unwrap(), 3000);
+        assert_eq!(port(Some(String::new())).unwrap(), 3000);
+        assert_eq!(port(Some("3100".to_string())).unwrap(), 3100);
+        assert!(port(Some("http".to_string())).is_err());
+        assert!(port(Some("70000".to_string())).is_err());
     }
 }

@@ -12,6 +12,9 @@ HA_TOKEN=your-long-lived-access-token
 DATA_PATH=./data
 ```
 
+Optional: `PORT` (default 3000) for the API, and `DRY_RUN=1` to read Home Assistant without changing it (see
+"Dry run against your Home Assistant").
+
 ### Entity Management
 
 Climate entities are stored in `data/entities.json` and can be managed via API.
@@ -99,6 +102,10 @@ heating isn't turned off and on again. End times never move, and nothing else tu
 - `POST /entities` - Add entities: `{"entity_ids": ["climate.living_room"]}`
 - `DELETE /entities` - Remove entity: `{"entity_id": "climate.living_room"}`
 
+### Dry run
+- `GET /dry_run` - `{"dry_run": true|false, "calls": [...]}`: the calls a dry run would have made, newest first. Each
+  has `summary`, `context` (why), `method`, `endpoint`, `body`, `at`, `last_at` and `repeats`
+
 ### Boost
 - `POST /boost_all` - Boost all entities (45 min)
 - `POST /boost` - Boost specific entities: `{"climate_names": ["climate.living_room"], "time_length": 30}`
@@ -131,6 +138,37 @@ It demos this clone's current branch, with the panel branch of the same name if 
 worktrees and an empty data folder, so your checkouts and any real `data/` or `.env` are left alone, and nothing
 talks to a real Home Assistant. Open the panel URL it prints and follow its "what to try" list; Ctrl-C stops both
 and cleans up. It needs ports 3000 and 5173 free (`PANEL_PORT` changes the panel's).
+
+## Dry run against your Home Assistant
+
+Dry run reads your Home Assistant (areas, climates and weather) and works out exactly what it would do, without
+changing anything. Use it to check zones and weather adjustment on your own house before trusting them.
+
+Every request that would change Home Assistant (`/api/services/...`) is cut at the HA client: it's recorded instead
+of sent, and the scheduler carries on as if HA had accepted it. Only reads reach HA: `GET /api/states/...` and
+`POST /api/template`, which renders a template. Boost and anything you do in the panel go through the same client.
+
+1. Build the release version (debug builds use mock climates): `cargo build --release`.
+2. Use a separate, empty data folder, so the dry run doesn't share state with your real instance. Your normal
+   instance keeps port 3000, so give the dry run another port. From the folder that has your `.env`:
+
+   ```bash
+   mkdir -p ~/heating-dry-run
+   DRY_RUN=1 PORT=3100 DATA_PATH=~/heating-dry-run target/release/ha-heating-scheduler
+   ```
+
+   `--dry-run` works too. Set `CLIMATE_ENTITY` the same way as in your `.env` the first time, since the new data
+   folder has no `entities.json` yet. If you'd rather keep port 3000, stop your normal instance first.
+3. Before trusting it, check that it's really a dry run:
+   - the startup log says `=== DRY RUN: NOT CONTROLLING THE HEATING ===`;
+   - `curl localhost:3100/dry_run` answers `{"dry_run": true, ...}`;
+   - the panel shows a "DRY RUN" banner. For the dev panel, run it with `VITE_API_BASE_URL=http://localhost:3100`.
+4. Watch what it would do: `GET /dry_run` lists the would-be calls, newest first (up to 200), e.g. "would set
+   climate.lounge_trv to 21.5 °C" with why: "Lounge: 20 °C scheduled, +1.5 cold = 21.5 °C". Your real heating doesn't
+   change, so the scheduler keeps asking for the same thing every tick; a repeat only counts in `repeats`, so the
+   list has one entry per change. The panel shows the same list.
+
+Stop it with Ctrl-C. Nothing it did needs undoing.
 
 ## Testing
 

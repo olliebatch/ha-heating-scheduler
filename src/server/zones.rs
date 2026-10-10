@@ -276,6 +276,7 @@ mod tests {
             weather: Default::default(),
             weather_file_path: path("weather.json"),
             mock_weather: None,
+            dry_run: None,
         };
         (state, dir)
     }
