@@ -15,22 +15,17 @@ pub struct ApiClient {
 }
 
 impl ApiClient {
+    /// A client for Home Assistant at `base_url`. With `dry_run`, it only reads HA: every other
+    /// request is recorded there and answered with an empty 200, as if HA had accepted it.
+    /// Required, so no client can be live just because someone forgot to pass it.
     #[must_use]
-    pub fn new(base_url: Url, token: String) -> Self {
+    pub fn new(base_url: Url, token: String, dry_run: Option<Arc<DryRun>>) -> Self {
         ApiClient {
             client: Client::new(),
             base_url,
             token,
-            dry_run: None,
+            dry_run,
         }
-    }
-
-    /// Only read Home Assistant: record every other request in `dry_run` and answer it with
-    /// an empty 200, as if HA had accepted it
-    #[must_use]
-    pub fn with_dry_run(mut self, dry_run: Option<Arc<DryRun>>) -> Self {
-        self.dry_run = dry_run;
-        self
     }
 
     pub async fn fetch_climate_state(&self, entity_id: &str) -> Result<ClimateInfo, anyhow::Error> {

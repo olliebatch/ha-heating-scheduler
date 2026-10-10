@@ -116,8 +116,7 @@ fn count(ha: &FakeHa, prefix: &str) -> usize {
 async fn test_dry_run_sends_no_service_calls_but_still_reads() {
     let (ha, url) = fake_ha().await;
     let dry_run = Arc::new(DryRun::default());
-    let client =
-        || ApiClient::new(url.clone(), "fake".to_string()).with_dry_run(Some(Arc::clone(&dry_run)));
+    let client = || ApiClient::new(url.clone(), "fake".to_string(), Some(Arc::clone(&dry_run)));
 
     run_through(&client(), &ha).await;
     HomeAssistantAreas {
@@ -165,7 +164,7 @@ async fn test_dry_run_sends_no_service_calls_but_still_reads() {
 #[tokio::test]
 async fn test_without_dry_run_the_same_steps_reach_ha() {
     let (ha, url) = fake_ha().await;
-    run_through(&ApiClient::new(url, "fake".to_string()), &ha).await;
+    run_through(&ApiClient::new(url, "fake".to_string(), None), &ha).await;
     // The fake HA keeps reporting Off, so each On step turns it on again
     assert_eq!(count(&ha, "POST /api/services/climate/set_hvac_mode"), 5);
     assert!(count(&ha, "POST /api/services/climate/set_temperature") >= 3);

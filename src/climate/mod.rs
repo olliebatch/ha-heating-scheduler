@@ -363,6 +363,7 @@ mod tests {
         let fake_client = ApiClient::new(
             reqwest::Url::parse("http://fake").unwrap(),
             "fake_token".to_string(),
+            None,
         );
 
         // Test fetch doesn't actually call API
