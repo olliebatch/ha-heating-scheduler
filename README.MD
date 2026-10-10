@@ -92,7 +92,7 @@ heating isn't turned off and on again. End times never move, and nothing else tu
 ### Schedule (active set)
 - `GET /schedule` - Get the active schedule
 - `POST /schedule` - Add an entry to the active schedule
-- `DELETE /schedule/{id}` - Delete an entry from the active schedule
+- `DELETE /schedule/{id}` - Delete an entry from the active schedule (409 for the only entry)
 
 ### Entities
 - `GET /entities` - List all entities with status

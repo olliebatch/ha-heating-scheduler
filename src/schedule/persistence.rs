@@ -95,7 +95,17 @@ pub fn load_or_migrate<P: AsRef<Path>, Q: AsRef<Path>>(
 
     if sets_path.exists() {
         println!("Loading schedule sets from: {}", sets_path.display());
-        return load_sets(sets_path);
+        let sets = load_sets(sets_path)?;
+        // If loading normalised or filled in anything, save it so the file matches what's served
+        let on_disk: serde_json::Value = serde_json::from_str(&fs::read_to_string(sets_path)?)?;
+        if serde_json::to_value(&sets)? != on_disk {
+            println!(
+                "Saving normalised schedule sets to: {}",
+                sets_path.display()
+            );
+            save_sets(&sets, sets_path).context("Failed to save normalised schedule sets")?;
+        }
+        return Ok(sets);
     }
 
     let schedule = if schedule_path.exists() {
@@ -298,5 +308,49 @@ mod tests {
 
         save_sets(&sets, &sets_path).unwrap();
         assert_eq!(load_sets(&sets_path).unwrap().default_target_temp, 19.5);
+    }
+
+    #[test]
+    fn test_load_saves_what_it_normalised() {
+        let dir = tempdir().unwrap();
+        let sets_path = dir.path().join("schedule_sets.json");
+        let schedule_path = dir.path().join("schedule.json");
+        // Saved before targets existed, with two Off pieces that should merge
+        let old = r#"{
+            "active_id": "10000000-0000-4000-8000-000000000000",
+            "sets": [{
+                "id": "10000000-0000-4000-8000-000000000000",
+                "name": "Work week",
+                "entries": [
+                    {"id": "00000000-0000-4000-8000-000000000001", "name": "day",
+                     "time_period": {"start": "06:00:00", "end": "22:00:00"}, "heating_state": "ON"},
+                    {"id": "00000000-0000-4000-8000-000000000002", "name": "late",
+                     "time_period": {"start": "22:00:00", "end": "00:00:00"}, "heating_state": "OFF"},
+                    {"id": "00000000-0000-4000-8000-000000000003", "name": "early",
+                     "time_period": {"start": "00:00:00", "end": "06:00:00"}, "heating_state": "OFF"}
+                ]
+            }]
+        }"#;
+        fs::write(&sets_path, old).unwrap();
+
+        let served = load_or_migrate(&sets_path, &schedule_path).unwrap();
+
+        // The file now matches what is served
+        let on_disk: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&sets_path).unwrap()).unwrap();
+        assert_eq!(on_disk, serde_json::to_value(&served).unwrap());
+        assert_eq!(served.active().entries.len(), 2);
+        assert_eq!(on_disk["sets"][0]["entries"][0]["target_temp"], 20.0);
+
+        // A file that needs no changes is left alone
+        let before = fs::read_to_string(&sets_path).unwrap();
+        fs::write(&sets_path, &before).unwrap();
+        let modified = fs::metadata(&sets_path).unwrap().modified().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        load_or_migrate(&sets_path, &schedule_path).unwrap();
+        assert_eq!(
+            fs::metadata(&sets_path).unwrap().modified().unwrap(),
+            modified
+        );
     }
 }

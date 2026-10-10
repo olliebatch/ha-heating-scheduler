@@ -208,12 +208,10 @@ async fn retry_area_discovery(
                     .iter()
                     .map(|e| e.get_entity_id().to_string())
                     .collect();
-                let snapshot = {
-                    let mut zones = zones.write().unwrap();
-                    zones.reconcile(Some(areas), &managed);
-                    zones.clone()
-                };
-                if let Err(e) = zones::save_zones(&snapshot, &zones_file_path) {
+                // Save under the lock, like the server does
+                let mut zones = zones.write().unwrap();
+                zones.reconcile(Some(areas), &managed);
+                if let Err(e) = zones::save_zones(&zones, &zones_file_path) {
                     eprintln!("Failed to save zones after discovery: {}", e);
                 }
                 println!("Area discovery succeeded; zones updated");
