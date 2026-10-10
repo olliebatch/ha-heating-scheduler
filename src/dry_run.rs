@@ -41,13 +41,26 @@ pub struct DryRun {
 }
 
 /// Whether to dry-run: `--dry-run`, or `DRY_RUN` set to 1/true/yes/on (on) or 0/false/no/off
-/// (off), in any case. Unset is off. Any other value, empty included, is an error: a mistyped
-/// `DRY_RUN` must never quietly control the real heating, so the backend refuses to start.
+/// (off), in any case. Unset is off. Anything else is an error, so the backend refuses to start:
+/// a `DRY_RUN` value it doesn't know (empty included), or any command-line argument other than
+/// `--dry-run` (a mistyped `--dryrun` must never quietly control the real heating). `args`
+/// includes the program name first, as `std::env::args` gives it.
 pub fn enabled(
     args: impl IntoIterator<Item = String>,
     env: Option<String>,
 ) -> Result<bool, String> {
-    if args.into_iter().any(|a| a == "--dry-run") {
+    let mut dry_run_flag = false;
+    for arg in args.into_iter().skip(1) {
+        if arg == "--dry-run" {
+            dry_run_flag = true;
+        } else {
+            return Err(format!(
+                "unknown argument {arg:?}; the only option is --dry-run; \
+                 not starting, so this can't control the heating by mistake"
+            ));
+        }
+    }
+    if dry_run_flag {
         return Ok(true);
     }
     let Some(value) = env else {
@@ -176,6 +189,36 @@ mod tests {
         // --dry-run wins over any DRY_RUN, so it can only make things safer
         assert_eq!(enabled(args(&["bin", "--dry-run"]), env("0")), Ok(true));
         assert_eq!(enabled(args(&["bin", "--dry-run"]), env("bogus")), Ok(true));
+        assert_eq!(
+            enabled(args(&["bin", "--dry-run", "--dry-run"]), None),
+            Ok(true)
+        );
+    }
+
+    #[test]
+    fn test_unknown_arguments_refuse_to_start() {
+        let args = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        for bad in [
+            "--dryrun",
+            "--dry_run",
+            "-dry-run",
+            "--Dry-Run",
+            "dry-run",
+            "-n",
+            "--help",
+            "",
+        ] {
+            let err = enabled(args(&["bin", bad]), None).unwrap_err();
+            assert!(
+                err.contains("not starting") && err.contains(&format!("{bad:?}")),
+                "{bad:?}: {err}"
+            );
+        }
+        // Even next to a correct --dry-run, and whatever DRY_RUN says
+        assert!(enabled(args(&["bin", "--dry-run", "--dryrun"]), None).is_err());
+        assert!(enabled(args(&["bin", "--dryrun"]), Some("1".to_string())).is_err());
+        // The program name itself is never an argument
+        assert_eq!(enabled(args(&["--dryrun"]), None), Ok(false));
     }
 
     #[test]

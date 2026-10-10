@@ -27,6 +27,9 @@ use std::sync::{Arc, RwLock};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Refuse a mistyped argument (e.g. --dryrun) before anything else, .env included
+    dry_run::enabled(std::env::args(), None).map_err(|e| anyhow::anyhow!(e))?;
+
     // Load config with persisted entities
     let config = config::Config::from_env_with_persisted_entities()?;
     let port = config::port(std::env::var("PORT").ok())?;
