@@ -1,7 +1,8 @@
 use crate::climate::{ClimateEntity, ClimateEntityWrapper};
+use crate::dry_run::DryRun;
 use crate::server::handlers::{
     activate_schedule_set, add_entities, add_schedule_entry, add_set_entry, boost, boost_all,
-    create_schedule_set, delete_schedule_entry, delete_schedule_set, delete_set_entry,
+    create_schedule_set, delete_schedule_entry, delete_schedule_set, delete_set_entry, get_dry_run,
     get_entities, get_schedule, get_schedule_sets, remove_entity, rename_schedule_set,
 };
 use crate::server::zones::{
@@ -32,9 +33,11 @@ pub struct AppState<T: ClimateEntity + Clone> {
     pub weather_file_path: String,
     /// The mock weather to set in debug builds; None in release
     pub mock_weather: Option<Arc<RwLock<Weather>>>,
+    /// Set in a dry run: the calls the HA client would have made
+    pub dry_run: Option<Arc<DryRun>>,
 }
 
-pub async fn start_server(app_state: AppState<ClimateEntityWrapper>) {
+pub async fn start_server(app_state: AppState<ClimateEntityWrapper>, port: u16) {
     let cors_layer = CorsLayer::permissive();
     let app = Router::new()
         .route("/schedule", get(get_schedule::<ClimateEntityWrapper>))
@@ -90,7 +93,8 @@ pub async fn start_server(app_state: AppState<ClimateEntityWrapper>) {
         .route("/entities", post(add_entities))
         .route("/entities", delete(remove_entity))
         .route("/boost_all", post(boost_all::<ClimateEntityWrapper>))
-        .route("/boost", post(boost::<ClimateEntityWrapper>));
+        .route("/boost", post(boost::<ClimateEntityWrapper>))
+        .route("/dry_run", get(get_dry_run::<ClimateEntityWrapper>));
 
     // Set the mock weather by hand (debug builds only)
     #[cfg(debug_assertions)]
@@ -101,7 +105,9 @@ pub async fn start_server(app_state: AppState<ClimateEntityWrapper>) {
 
     let app = app.layer(cors_layer).with_state(app_state);
 
-    // run our app with hyper, listening globally on port 3000
-    let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
+    // Listen on every interface
+    let listener = tokio::net::TcpListener::bind(("0.0.0.0", port))
+        .await
+        .unwrap_or_else(|e| panic!("Can't listen on port {port}: {e}"));
     axum::serve(listener, app).await.unwrap();
 }

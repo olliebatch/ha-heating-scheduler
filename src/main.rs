@@ -5,6 +5,7 @@ use ha_heating_scheduler::climate::DefaultClimate;
 #[cfg(debug_assertions)]
 use ha_heating_scheduler::climate::MockClimate;
 use ha_heating_scheduler::config;
+use ha_heating_scheduler::dry_run::{self, DryRun};
 #[cfg(debug_assertions)]
 use ha_heating_scheduler::schedule::HeatingState;
 use ha_heating_scheduler::schedule::persistence;
@@ -26,11 +27,25 @@ use std::sync::{Arc, RwLock};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Refuse a mistyped argument (e.g. --dryrun) before anything else, .env included
+    dry_run::enabled(std::env::args(), None).map_err(|e| anyhow::anyhow!(e))?;
+
     // Load config with persisted entities
     let config = config::Config::from_env_with_persisted_entities()?;
+    let port = config::port(std::env::var("PORT").ok())?;
+
+    // Dry run: read Home Assistant, but record the calls that would change it instead of sending them
+    let dry_run = dry_run::enabled(std::env::args(), std::env::var("DRY_RUN").ok())
+        .map_err(|e| anyhow::anyhow!(e))?
+        .then(|| Arc::new(DryRun::default()));
+    if dry_run.is_some() {
+        println!("\n=== DRY RUN: NOT CONTROLLING THE HEATING ===");
+        println!("Reading Home Assistant only; would-be commands are logged at GET /dry_run\n");
+    }
     let api_client = api_client::ApiClient::new(
         reqwest::Url::parse(&config.ha_url)?,
         config.ha_token.clone(),
+        dry_run.clone(),
     );
 
     let data_dir = Path::new(&config.data_path);
@@ -102,6 +117,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 api_client: api_client::ApiClient::new(
                     reqwest::Url::parse(&config.ha_url)?,
                     config.ha_token.clone(),
+                    dry_run.clone(),
                 ),
             })
         }
@@ -158,6 +174,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             api_client: api_client::ApiClient::new(
                 reqwest::Url::parse(&config.ha_url)?,
                 config.ha_token.clone(),
+                dry_run.clone(),
             ),
         }) as Arc<dyn WeatherSource>,
         None,
@@ -165,18 +182,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (weather_source, mock_weather) = mock_weather;
 
     let schedule: ScheduleState = Arc::new(RwLock::new(schedule_sets));
-    let api_task = tokio::spawn(start_server(AppState {
-        schedule: Arc::clone(&schedule),
-        schedule_sets_file_path: schedule_sets_file_path.to_string_lossy().to_string(),
-        climate_entities: Arc::clone(&climate_entities),
-        entities_file_path: entities_file_path.to_string_lossy().to_string(),
-        zones: Arc::clone(&zones),
-        zones_file_path: zones_file_path.to_string_lossy().to_string(),
-        area_source,
-        weather: Arc::clone(&weather),
-        weather_file_path: weather_file_path.to_string_lossy().to_string(),
-        mock_weather,
-    }));
+    let api_task = tokio::spawn(start_server(
+        AppState {
+            schedule: Arc::clone(&schedule),
+            schedule_sets_file_path: schedule_sets_file_path.to_string_lossy().to_string(),
+            climate_entities: Arc::clone(&climate_entities),
+            entities_file_path: entities_file_path.to_string_lossy().to_string(),
+            zones: Arc::clone(&zones),
+            zones_file_path: zones_file_path.to_string_lossy().to_string(),
+            area_source,
+            weather: Arc::clone(&weather),
+            weather_file_path: weather_file_path.to_string_lossy().to_string(),
+            mock_weather,
+            dry_run,
+        },
+        port,
+    ));
 
     let scheduler_task = tokio::spawn(run_scheduler(SchedulerState {
         api_client,
