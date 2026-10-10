@@ -11,7 +11,7 @@ Runs the debug backend (mock climates, areas and weather) on :3000 and the panel
 throwaway git worktrees of each ref. Ctrl-C stops both and removes the worktrees.
 
   backend-ref  Default: this clone's current branch (or commit, if detached).
-  panel-ref    Default: the panel branch with the same name as backend-ref (local, else origin/),
+  panel-ref    Default: the panel branch with the same name as backend-ref (origin/, else local),
                else origin/main (else main). So running it from a PR branch demos that PR and its
                panel PR. Refs are used as already fetched; run git fetch in both clones for the latest.
 
@@ -56,10 +56,11 @@ backend_ref=${1:-$(git -C "$backend_dir" symbolic-ref --quiet --short HEAD || gi
 git -C "$backend_dir" rev-parse --verify --quiet "$backend_ref^{commit}" >/dev/null || die "unknown backend ref: $backend_ref"
 if [ $# -ge 2 ]; then
   panel_ref=$2
-elif git -C "$panel_dir" rev-parse --verify --quiet "refs/heads/$backend_ref" >/dev/null; then
-  panel_ref=$backend_ref
+# origin/ first: local branches, main especially, are often behind
 elif git -C "$panel_dir" rev-parse --verify --quiet "refs/remotes/origin/$backend_ref" >/dev/null; then
   panel_ref=origin/$backend_ref
+elif git -C "$panel_dir" rev-parse --verify --quiet "refs/heads/$backend_ref" >/dev/null; then
+  panel_ref=$backend_ref
 elif git -C "$panel_dir" rev-parse --verify --quiet refs/remotes/origin/main >/dev/null; then
   panel_ref=origin/main
 else
