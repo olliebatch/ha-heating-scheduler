@@ -504,6 +504,30 @@ pub fn call_context(zone: Option<&str>, status: &ZoneStatus, boosted: bool) -> S
     format!("{zone}: {why}")
 }
 
+/// Bring a tick's results into the live entity list: each entity's fetched state, and the end of
+/// any boost the tick found expired. Entities added or removed during the tick stay that way, and a
+/// boost set during the tick (the live boost no longer matches the one the tick started with) is
+/// kept. `processed` and `boosts_at_start` are in the same order, as the tick copied them.
+pub fn merge_tick_results<T: ClimateEntity>(
+    live: &mut [T],
+    processed: &[T],
+    boosts_at_start: &[Option<BoostInfo>],
+) {
+    for (done, started_with) in processed.iter().zip(boosts_at_start) {
+        let Some(entity) = live
+            .iter_mut()
+            .find(|e| e.get_entity_id() == done.get_entity_id())
+        else {
+            continue; // removed during the tick
+        };
+        entity.update_cached_state(done.get_cached_state().clone());
+        if done.get_boosted_status() != started_with && entity.get_boosted_status() == started_with
+        {
+            entity.set_boost(done.get_boosted_status().clone());
+        }
+    }
+}
+
 /// Main scheduler loop that runs periodically and applies schedule
 pub async fn run_scheduler<T: ClimateEntity + Clone>(state: SchedulerState<T>) {
     let mut interval = interval(Duration::from_secs(15));
@@ -523,6 +547,11 @@ pub async fn run_scheduler<T: ClimateEntity + Clone>(state: SchedulerState<T>) {
             let climates = state.climate_entities.read().unwrap();
             climates.clone()
         };
+        // Each entity's boost as the tick starts, to tell a boost this tick ended from one set meanwhile
+        let boosts_at_start: Vec<Option<BoostInfo>> = entities_clone
+            .iter()
+            .map(|e| e.get_boosted_status().clone())
+            .collect();
 
         // Read the weather once per tick; without it, targets aren't adjusted
         let weather = read_weather(&state.weather, state.weather_source.as_ref(), now).await;
@@ -577,9 +606,10 @@ pub async fn run_scheduler<T: ClimateEntity + Clone>(state: SchedulerState<T>) {
                 .await;
         }
 
-        // Update the shared state with processed entities
+        // Merge what this tick learned into the live list, rather than writing the copy back over
+        // entities added, removed or boosted while it was talking to Home Assistant
         if let Ok(mut climates) = state.climate_entities.write() {
-            *climates = entities_clone;
+            merge_tick_results(&mut climates, &entities_clone, &boosts_at_start);
         }
     }
 }
@@ -1638,5 +1668,99 @@ mod tests {
             &today_at(12, 0),
         );
         assert_eq!(status.state, HeatingState::Off);
+    }
+
+    fn boost(minutes: i64) -> BoostInfo {
+        let start = chrono::NaiveTime::from_hms_opt(12, 0, 0).unwrap();
+        BoostInfo {
+            boost_start: start,
+            boost_end: start + chrono::Duration::minutes(minutes),
+        }
+    }
+
+    fn named(id: &str) -> crate::climate::MockClimate {
+        crate::climate::MockClimate::new(id.to_string(), HeatingState::Off)
+    }
+
+    /// What an entity's cached state says: (state, target)
+    fn seen(entity: &crate::climate::MockClimate) -> Option<(HeatingState, Option<f64>)> {
+        entity
+            .get_cached_state()
+            .as_ref()
+            .map(|c| (c.state.clone(), c.target_temp))
+    }
+
+    #[test]
+    fn test_entity_added_mid_tick_is_kept() {
+        let mut live = vec![named("climate.a"), named("climate.b")];
+        // The tick copies the list and fetches each entity's state from HA ...
+        let mut processed = live.clone();
+        let boosts: Vec<_> = processed
+            .iter()
+            .map(|e| e.get_boosted_status().clone())
+            .collect();
+        for entity in processed.iter_mut() {
+            let mut fetched = entity.get_cached_state().clone().unwrap();
+            fetched.state = HeatingState::On;
+            fetched.target_temp = Some(21.5);
+            entity.update_cached_state(Some(fetched));
+        }
+        // ... while someone adds an entity
+        live.push(named("climate.c"));
+
+        merge_tick_results(&mut live, &processed, &boosts);
+        let ids: Vec<_> = live.iter().map(|e| e.get_entity_id()).collect();
+        assert_eq!(ids, vec!["climate.a", "climate.b", "climate.c"]);
+        // The processed entities have what the tick fetched; the new one is untouched
+        let on = Some((HeatingState::On, Some(21.5)));
+        assert_eq!(seen(&live[0]), on);
+        assert_eq!(seen(&live[1]), on);
+        assert_eq!(seen(&live[2]), Some((HeatingState::Off, None)));
+    }
+
+    #[test]
+    fn test_entity_removed_mid_tick_stays_removed() {
+        let mut live = vec![named("climate.a"), named("climate.b")];
+        let processed = live.clone();
+        let boosts = vec![None, None];
+        live.retain(|e| e.get_entity_id() != "climate.a");
+
+        merge_tick_results(&mut live, &processed, &boosts);
+        let ids: Vec<_> = live.iter().map(|e| e.get_entity_id()).collect();
+        assert_eq!(ids, vec!["climate.b"]);
+    }
+
+    #[test]
+    fn test_boosts_set_mid_tick_are_kept_and_expired_ones_end() {
+        // a: boosted when the tick started, and the tick found it expired
+        // b: boosted by the user while the tick ran
+        // c: its boost was replaced by a new one while the tick ended the old one
+        let mut a = named("climate.a");
+        a.set_boost(Some(boost(30)));
+        let mut c = named("climate.c");
+        c.set_boost(Some(boost(30)));
+        let mut live = vec![a, named("climate.b"), c];
+        let mut processed = live.clone();
+        let boosts: Vec<_> = processed
+            .iter()
+            .map(|e| e.get_boosted_status().clone())
+            .collect();
+        processed[0].set_boost(None);
+        processed[2].set_boost(None);
+        live[1].set_boost(Some(boost(45)));
+        live[2].set_boost(Some(boost(60)));
+
+        merge_tick_results(&mut live, &processed, &boosts);
+        assert_eq!(live[0].get_boosted_status(), &None, "expired boost ended");
+        assert_eq!(
+            live[1].get_boosted_status(),
+            &Some(boost(45)),
+            "new boost kept"
+        );
+        assert_eq!(
+            live[2].get_boosted_status(),
+            &Some(boost(60)),
+            "replacing boost kept"
+        );
     }
 }
