@@ -46,11 +46,15 @@ pub struct Zone {
     /// Start On periods up to this many minutes early when it's cold or windy (0 disables)
     #[serde(default = "default_max_early_start")]
     pub max_early_start_minutes: u32,
+    /// Keep On periods going up to this many minutes past their end when it's cold or windy
+    /// (0, the default, disables)
+    #[serde(default)]
+    pub max_late_finish_minutes: u32,
 }
 
 /// Default for [`Zone::max_early_start_minutes`]
 pub const DEFAULT_MAX_EARLY_START: u32 = 30;
-/// Largest allowed [`Zone::max_early_start_minutes`]
+/// Largest allowed [`Zone::max_early_start_minutes`] and [`Zone::max_late_finish_minutes`]
 pub const MAX_EARLY_START_LIMIT: u32 = 180;
 
 fn default_max_early_start() -> u32 {
@@ -70,6 +74,7 @@ impl Zone {
             wind_exposure: WindExposure::default(),
             weather_adjust: false,
             max_early_start_minutes: DEFAULT_MAX_EARLY_START,
+            max_late_finish_minutes: 0,
         }
     }
 
@@ -299,12 +304,18 @@ impl Zones {
         wind_exposure: Option<WindExposure>,
         weather_adjust: Option<bool>,
         max_early_start_minutes: Option<u32>,
+        max_late_finish_minutes: Option<u32>,
     ) -> Result<(), ZoneError> {
-        if max_early_start_minutes.is_some_and(|m| m > MAX_EARLY_START_LIMIT) {
-            return Err(ZoneError::Invalid(format!(
-                "max_early_start_minutes must be 0-{}",
-                MAX_EARLY_START_LIMIT
-            )));
+        for (field, minutes) in [
+            ("max_early_start_minutes", max_early_start_minutes),
+            ("max_late_finish_minutes", max_late_finish_minutes),
+        ] {
+            if minutes.is_some_and(|m| m > MAX_EARLY_START_LIMIT) {
+                return Err(ZoneError::Invalid(format!(
+                    "{} must be 0-{}",
+                    field, MAX_EARLY_START_LIMIT
+                )));
+            }
         }
         if let Some(windows) = &sun_windows {
             if windows.iter().any(|w| w.start == w.end && !w.is_full_day()) {
@@ -329,6 +340,9 @@ impl Zones {
         }
         if let Some(minutes) = max_early_start_minutes {
             zone.max_early_start_minutes = minutes;
+        }
+        if let Some(minutes) = max_late_finish_minutes {
+            zone.max_late_finish_minutes = minutes;
         }
         Ok(())
     }
@@ -672,10 +686,12 @@ mod tests {
         let id = zones.zones[0].id;
         assert_eq!(zones.zones[0].max_early_start_minutes, 30);
 
-        zones.set_profile(id, None, None, None, Some(0)).unwrap();
+        zones
+            .set_profile(id, None, None, None, Some(0), None)
+            .unwrap();
         assert_eq!(zones.get(id).unwrap().max_early_start_minutes, 0);
         assert!(matches!(
-            zones.set_profile(id, None, None, Some(true), Some(181)),
+            zones.set_profile(id, None, None, Some(true), Some(181), None),
             Err(ZoneError::Invalid(_))
         ));
         assert!(!zones.get(id).unwrap().weather_adjust, "nothing changed");
@@ -685,5 +701,26 @@ mod tests {
                        "kind": "manual", "entity_ids": []}"#;
         let zone: Zone = serde_json::from_str(json).unwrap();
         assert_eq!(zone.max_early_start_minutes, 30);
+        assert_eq!(zone.max_late_finish_minutes, 0);
+    }
+
+    #[test]
+    fn test_max_late_finish_bounds() {
+        let mut zones = Zones::default();
+        zones.reconcile(Some(areas()), &all_managed());
+        let id = zones.zones[0].id;
+        assert_eq!(zones.zones[0].max_late_finish_minutes, 0);
+
+        zones
+            .set_profile(id, None, None, None, None, Some(45))
+            .unwrap();
+        assert_eq!(zones.get(id).unwrap().max_late_finish_minutes, 45);
+        let err = zones.set_profile(id, None, None, Some(true), None, Some(181));
+        assert!(
+            matches!(&err, Err(ZoneError::Invalid(text)) if text == "max_late_finish_minutes must be 0-180"),
+            "{err:?}"
+        );
+        assert!(!zones.get(id).unwrap().weather_adjust, "nothing changed");
+        assert_eq!(zones.get(id).unwrap().max_late_finish_minutes, 45);
     }
 }
