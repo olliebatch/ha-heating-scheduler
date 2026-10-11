@@ -10,7 +10,6 @@ use std::sync::{Arc, RwLock};
 
 pub mod adjust;
 pub mod early;
-pub mod late;
 
 /// Outside conditions, in °C, km/h and percent. Any of them can be missing.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -119,16 +118,9 @@ pub struct WeatherStatus {
     /// The adjusted target each zone is held at, by zone id (see `scheduler::zone_status`)
     #[serde(skip)]
     pub held: HashMap<uuid::Uuid, Held>,
-    /// Early starts and late finishes in progress, by zone id, kept until they're over
+    /// Early starts in progress, by zone id, kept until their period starts
     #[serde(skip)]
-    pub begun: HashMap<uuid::Uuid, Begun>,
-}
-
-/// What a zone has begun and carries on with between ticks, whatever the weather does
-#[derive(Debug, Clone, Default, PartialEq)]
-pub struct Begun {
-    pub early_start: Option<early::EarlyStart>,
-    pub late_finish: Option<late::LateFinish>,
+    pub early_starts: HashMap<uuid::Uuid, early::EarlyStart>,
 }
 
 /// A zone's adjusted target, held until the weather moves it clearly
