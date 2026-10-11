@@ -1,5 +1,6 @@
 use crate::api_client::ApiClient;
 use crate::climate::{BoostInfo, ClimateEntity};
+use crate::dry_run::CALL_CONTEXT;
 use crate::schedule::HeatingState;
 use crate::schedule::TARGET_TEMP_RANGE;
 use crate::schedule::sets::ScheduleSets;
@@ -385,6 +386,36 @@ pub async fn read_weather(
     }
 }
 
+/// Why an entity is being set the way it is, e.g. "Lounge: 20 °C scheduled, +1.5 cold = 21.5 °C"
+pub fn call_context(zone: Option<&str>, status: &ZoneStatus, boosted: bool) -> String {
+    let zone = zone.unwrap_or("no zone");
+    let mut why = match (&status.state, status.scheduled_target, status.target) {
+        (HeatingState::On, Some(scheduled), Some(target)) => {
+            let mut why = format!("{scheduled} °C scheduled");
+            for reason in &status.reasons {
+                let sign = if reason.delta > 0.0 { "+" } else { "-" };
+                why += &format!(", {sign}{} {:?}", reason.delta.abs(), reason.cause).to_lowercase();
+            }
+            if target != scheduled || !status.reasons.is_empty() {
+                why += &format!(" = {target} °C");
+            }
+            if status.held {
+                why += " (kept: small change)";
+            }
+            why
+        }
+        (HeatingState::On, _, _) => "On".to_string(),
+        (HeatingState::Off, _, _) => "Off".to_string(),
+    };
+    if let Some(early) = &status.early_start {
+        why += &format!(", early start for {}", early.period_start.format("%H:%M"));
+    }
+    if boosted {
+        why += ", boost";
+    }
+    format!("{zone}: {why}")
+}
+
 /// Main scheduler loop that runs periodically and applies schedule
 pub async fn run_scheduler<T: ClimateEntity + Clone>(state: SchedulerState<T>) {
     let mut interval = interval(Duration::from_secs(15));
@@ -408,8 +439,8 @@ pub async fn run_scheduler<T: ClimateEntity + Clone>(state: SchedulerState<T>) {
         // Read the weather once per tick; without it, targets aren't adjusted
         let weather = read_weather(&state.weather, state.weather_source.as_ref(), now).await;
 
-        // What each entity's zone schedule asks for right now
-        let (scheduled, default_target_temp): (Vec<Scheduled>, f64) = {
+        // What each entity's zone schedule asks for right now, and why (for the dry-run log)
+        let (scheduled, contexts, default_target_temp): (Vec<Scheduled>, Vec<String>, f64) = {
             let sets = state.schedule.read().unwrap();
             let zones = state.zones.read().unwrap();
             let mut weather_status = state.weather.write().unwrap();
@@ -418,35 +449,46 @@ pub async fn run_scheduler<T: ClimateEntity + Clone>(state: SchedulerState<T>) {
             } = &mut *weather_status;
             let statuses = zone_statuses(&zones, &sets, weather.as_ref(), held, early_starts, &now);
             let no_zone = zone_status(None, &sets, weather.as_ref(), None, None, &now);
-            let scheduled = entities_clone
+            let (scheduled, contexts) = entities_clone
                 .iter()
                 .map(|e| {
-                    let status = zones
-                        .zone_for(e.get_entity_id())
-                        .and_then(|z| statuses.get(&z.id))
-                        .unwrap_or(&no_zone);
-                    Scheduled {
+                    let zone = zones.zone_for(e.get_entity_id());
+                    let status = zone.and_then(|z| statuses.get(&z.id)).unwrap_or(&no_zone);
+                    let boosted = calculate_desired_heating_state_for_boost(e.get_boosted_status())
+                        .0
+                        == HeatingState::On;
+                    let scheduled = Scheduled {
                         state: status.state.clone(),
                         target_temp: status.target,
-                    }
+                    };
+                    (
+                        scheduled,
+                        call_context(zone.map(|z| z.name.as_str()), status, boosted),
+                    )
                 })
-                .collect();
-            (scheduled, sets.default_target_temp)
+                .unzip();
+            (scheduled, contexts, sets.default_target_temp)
         };
 
         // Process entities outside the lock
-        for (entity, scheduled) in entities_clone.iter_mut().zip(&scheduled) {
+        for ((entity, scheduled), context) in
+            entities_clone.iter_mut().zip(&scheduled).zip(contexts)
+        {
             let last_sent = last_sent_targets
                 .entry(entity.get_entity_id().to_string())
                 .or_default();
-            apply_schedule_to_entity(
-                entity,
-                scheduled,
-                default_target_temp,
-                &state.api_client,
-                last_sent,
-            )
-            .await;
+            CALL_CONTEXT
+                .scope(
+                    context,
+                    apply_schedule_to_entity(
+                        entity,
+                        scheduled,
+                        default_target_temp,
+                        &state.api_client,
+                        last_sent,
+                    ),
+                )
+                .await;
         }
 
         // Update the shared state with processed entities
@@ -459,6 +501,44 @@ pub async fn run_scheduler<T: ClimateEntity + Clone>(state: SchedulerState<T>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_call_context() {
+        use crate::weather::adjust::{Cause, Reason};
+        let on = ZoneStatus {
+            state: HeatingState::On,
+            scheduled_target: Some(20.0),
+            target: Some(21.5),
+            reasons: vec![Reason {
+                cause: Cause::Cold,
+                delta: 1.5,
+            }],
+            raw_target: Some(21.5),
+            held: false,
+            early_start: None,
+        };
+        assert_eq!(
+            call_context(Some("Lounge"), &on, false),
+            "Lounge: 20 °C scheduled, +1.5 cold = 21.5 °C"
+        );
+        let plain = ZoneStatus {
+            target: Some(20.0),
+            reasons: vec![],
+            raw_target: None,
+            ..on.clone()
+        };
+        assert_eq!(
+            call_context(Some("Study"), &plain, false),
+            "Study: 20 °C scheduled"
+        );
+        let off = ZoneStatus {
+            state: HeatingState::Off,
+            scheduled_target: None,
+            target: None,
+            ..plain
+        };
+        assert_eq!(call_context(None, &off, true), "no zone: Off, boost");
+    }
 
     #[test]
     fn test_calculate_heating_action_no_change() {
@@ -526,6 +606,7 @@ mod tests {
         ApiClient::new(
             reqwest::Url::parse("http://fake").unwrap(),
             "fake_token".to_string(),
+            None,
         )
     }
 
