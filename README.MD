@@ -88,19 +88,31 @@ Late finish: with weather adjust on and `max_late_finish_minutes` set (default 0
 that many minutes past its end on cold or windy days, on the same scale as early start, at the ended period's
 (adjusted) target. It's decided when the period ends and then carries on for those minutes whatever the weather does,
 and the heating turns off once, when it's over. It only extends into the Off that follows; if it meets the next
-period's early start, the early start takes over with no gap. Start times never move, and nothing else turns heating
-on during an Off period.
+period's early start, the early start takes over with no gap. Start times never move.
+
+Cold-day warm-ups: a zone can opt in (`cold_warmups`) to short warm-ups partway through a long Off gap when it's very
+cold, so the house doesn't get too cold while nobody's heating it. In an Off gap longer than `min_gap_minutes`, a
+warm-up of `burst_minutes` falls `every_minutes` after the gap starts, and again every `every_minutes`, whenever it's
+colder than `below_c` outside at that moment. The weather is checked once, as each warm-up starts, and the warm-up
+then runs its full length. It heats to the schedule's `default_target_temp`, not adjusted for the weather. A warm-up
+that could overlap the zone's late finish after the previous On period, or its early start before the next one, is
+skipped, and with no weather reading there's none. Zones that don't opt in stay off for the whole Off gap; nothing
+else turns heating on during an Off period.
 
 - `GET /weather` - The configured weather entity, the last reading and any error
 - `PUT /weather` - Choose the weather entity: `{"entity_id": "weather.home"}` (`null` to stop); stored in `data/weather.json`
 - `POST /weather/mock` - Debug builds only: set the mock weather, e.g. `{"temperature": -2, "wind_speed": 40, "cloud_coverage": 10}`
 - `PATCH /zones/{id}` also takes `sun_windows` (`[{"start": "08:00", "end": "11:00"}]`), `wind_exposure`
   (`low`/`medium`/`high`), `weather_adjust` (`true`/`false`), `max_early_start_minutes` and
-  `max_late_finish_minutes` (both 0-180)
+  `max_late_finish_minutes` (both 0-180), and `cold_warmups`: `{"enabled": true, "below_c": 0, "min_gap_minutes": 240,
+  "burst_minutes": 20, "every_minutes": 180}` (the defaults, apart from `enabled`, which is false; fields left out get
+  them). The gap and interval must be 1-1440 minutes, the burst 1-180 and shorter than the interval, and `below_c`
+  -30 to 20 °C
 - `GET /zones` includes each zone's `status`: `state`, `scheduled_target`, adjusted `target`, `reasons`,
   `raw_target` (before clamping, rounding and holding), `held` and `early_start` (`period_start`, `lead_minutes`
   allowed by the weather, `minutes_early` it actually started, and `causes`) while a period is being started early, and
-  `late_finish` (`period_end`, `extra_minutes`, `causes`) while one is kept going past its end
+  `late_finish` (`period_end`, `extra_minutes`, `causes`) while one is kept going past its end, and `warm_up`
+  (`started_at`, `until`, `outside_c`) during a cold-day warm-up
 
 ### Schedule (active set)
 - `GET /schedule` - Get the active schedule
