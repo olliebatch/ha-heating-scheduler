@@ -21,7 +21,7 @@ pub struct ClimateInfo {
     pub max_temp: Option<f64>,
 }
 
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default, Clone, PartialEq)]
 pub struct BoostInfo {
     pub boost_start: NaiveTime,
     pub boost_end: NaiveTime,
