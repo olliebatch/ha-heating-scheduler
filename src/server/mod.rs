@@ -36,6 +36,8 @@ pub struct AppState<T: ClimateEntity + Clone> {
     pub mock_weather: Option<Arc<RwLock<Weather>>>,
     /// Set in a dry run: the calls the HA client would have made
     pub dry_run: Option<Arc<DryRun>>,
+    /// Shared with the scheduler; adding or removing an entity forgets its entry
+    pub last_sent_targets: crate::scheduler::LastSentTargets,
 }
 
 pub async fn start_server(app_state: AppState<ClimateEntityWrapper>, port: u16) {

@@ -507,6 +507,7 @@ pub async fn add_entities(
     State(state): State<AppState<ClimateEntityWrapper>>,
     Json(payload): Json<AddEntitiesRequest>,
 ) -> Result<Json<Vec<String>>, (StatusCode, String)> {
+    let payload_ids = payload.entity_ids.clone();
     // Check for existing entities under the same lock as the add, so two requests can't both add one
     let (added, all_entity_ids) = update_entities(&state, |climates| {
         let mut added = 0;
@@ -525,6 +526,12 @@ pub async fn add_entities(
         }
         added
     })?;
+    // A re-added entity has its target sent again
+    let mut last_sent = state.last_sent_targets.lock().unwrap();
+    for id in &payload_ids {
+        last_sent.remove(id);
+    }
+    drop(last_sent);
 
     if added > 0 {
         crate::server::zones::reconcile_zones(&state)?;
@@ -541,6 +548,11 @@ pub async fn remove_entity(
     let ((), all_entity_ids) = update_entities(&state, |climates| {
         climates.retain(|e| e.get_entity_id() != payload.entity_id);
     })?;
+    state
+        .last_sent_targets
+        .lock()
+        .unwrap()
+        .remove(&payload.entity_id);
 
     crate::server::zones::reconcile_zones(&state)?;
     println!("Removed entity: {}", payload.entity_id);
@@ -582,6 +594,7 @@ mod tests {
                 .to_string(),
             mock_weather: None,
             dry_run: None,
+            last_sent_targets: Default::default(),
         };
         (state, dir)
     }
@@ -1132,8 +1145,62 @@ mod tests {
             weather_file_path: state.weather_file_path,
             mock_weather: None,
             dry_run: None,
+            last_sent_targets: state.last_sent_targets,
         };
         (state, dir)
+    }
+
+    #[tokio::test]
+    async fn test_adding_or_removing_an_entity_forgets_its_last_target() {
+        let (state, _dir) = wrapper_state();
+        let lounge = "climate.lounge_trv".to_string();
+        let remembered = |state: &AppState<ClimateEntityWrapper>| {
+            state
+                .last_sent_targets
+                .lock()
+                .unwrap()
+                .contains_key(&lounge)
+        };
+        let _ = add_entities(
+            State(state.clone()),
+            Json(AddEntitiesRequest {
+                entity_ids: vec![lounge.clone()],
+            }),
+        )
+        .await
+        .unwrap();
+
+        // The scheduler sent it 21 °C; removing it forgets that
+        state
+            .last_sent_targets
+            .lock()
+            .unwrap()
+            .insert(lounge.clone(), Some(21.0));
+        let _ = remove_entity(
+            State(state.clone()),
+            Json(RemoveEntityRequest {
+                entity_id: lounge.clone(),
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(!remembered(&state));
+
+        // And so does adding it, in case the scheduler wrote it back meanwhile
+        state
+            .last_sent_targets
+            .lock()
+            .unwrap()
+            .insert(lounge.clone(), Some(21.0));
+        let _ = add_entities(
+            State(state.clone()),
+            Json(AddEntitiesRequest {
+                entity_ids: vec![lounge.clone()],
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(!remembered(&state));
     }
 
     fn ids(state: &AppState<ClimateEntityWrapper>) -> Vec<String> {

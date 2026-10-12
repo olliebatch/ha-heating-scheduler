@@ -9,7 +9,7 @@ use ha_heating_scheduler::dry_run::{self, DryRun};
 #[cfg(debug_assertions)]
 use ha_heating_scheduler::schedule::HeatingState;
 use ha_heating_scheduler::schedule::persistence;
-use ha_heating_scheduler::scheduler::{SchedulerState, run_scheduler};
+use ha_heating_scheduler::scheduler::{LastSentTargets, SchedulerState, run_scheduler};
 use ha_heating_scheduler::server::{AppState, start_server};
 #[cfg(not(debug_assertions))]
 use ha_heating_scheduler::weather::HomeAssistantWeather;
@@ -182,6 +182,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (weather_source, mock_weather) = mock_weather;
 
     let schedule: ScheduleState = Arc::new(RwLock::new(schedule_sets));
+    let last_sent_targets: LastSentTargets = Default::default();
     let api_task = tokio::spawn(start_server(
         AppState {
             schedule: Arc::clone(&schedule),
@@ -195,6 +196,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             weather_file_path: weather_file_path.to_string_lossy().to_string(),
             mock_weather,
             dry_run,
+            last_sent_targets: Arc::clone(&last_sent_targets),
         },
         port,
     ));
@@ -206,6 +208,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         weather,
         weather_source,
         climate_entities: Arc::clone(&climate_entities),
+        last_sent_targets,
     }));
 
     tokio::try_join!(api_task, scheduler_task).unwrap();

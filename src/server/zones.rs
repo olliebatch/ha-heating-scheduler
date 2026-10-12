@@ -311,6 +311,7 @@ mod tests {
             weather_file_path: path("weather.json"),
             mock_weather: None,
             dry_run: None,
+            last_sent_targets: Default::default(),
         };
         (state, dir)
     }
