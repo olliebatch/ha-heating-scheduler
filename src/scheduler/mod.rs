@@ -20,6 +20,11 @@ use std::time::Duration;
 use tokio::time::interval;
 use uuid::Uuid;
 
+/// The last target sent to each entity, so an unchanged one isn't sent every tick. Shared with
+/// the API, which forgets an entity's entry when it's added or removed, so a re-added entity
+/// gets its target sent again.
+pub type LastSentTargets = Arc<std::sync::Mutex<HashMap<String, Option<f64>>>>;
+
 pub struct SchedulerState<T: ClimateEntity + Clone> {
     pub api_client: ApiClient,
     pub schedule: ScheduleState,
@@ -27,6 +32,7 @@ pub struct SchedulerState<T: ClimateEntity + Clone> {
     pub weather: WeatherState,
     pub weather_source: Arc<dyn WeatherSource>,
     pub climate_entities: Arc<RwLock<Vec<T>>>,
+    pub last_sent_targets: LastSentTargets,
 }
 
 /// Represents an action to be taken on a climate entity
@@ -379,6 +385,7 @@ pub async fn apply_schedule_to_entity<T: ClimateEntity>(
     default_target_temp: f64,
     api_client: &ApiClient,
     last_sent: &mut Option<f64>,
+    still_managed: &(dyn Fn() -> bool + Sync),
 ) {
     let now = Local::now();
     if let Err(e) = entity.fetch_and_update_state(api_client).await {
@@ -388,6 +395,10 @@ pub async fn apply_schedule_to_entity<T: ClimateEntity>(
             entity.get_entity_id(),
             e
         );
+        return;
+    }
+    // Removed while its state was read: it's no longer controlled, so send it nothing
+    if !still_managed() {
         return;
     }
     let (boosted_state, should_update) =
@@ -426,6 +437,9 @@ pub async fn apply_schedule_to_entity<T: ClimateEntity>(
     let target = target
         .max(cached.min_temp.unwrap_or(f64::MIN))
         .min(cached.max_temp.unwrap_or(f64::MAX));
+    if !still_managed() {
+        return;
+    }
     if action == HeatingAction::TurnOn || *last_sent != Some(target) {
         match entity.set_temperature(api_client, target).await {
             Ok(()) => *last_sent = Some(target),
@@ -529,14 +543,19 @@ pub fn merge_tick_results<T: ClimateEntity>(
     }
 }
 
+/// Whether `entity_id` is still in the live list of managed entities
+fn is_managed<T: ClimateEntity>(live: &RwLock<Vec<T>>, entity_id: &str) -> bool {
+    live.read()
+        .unwrap()
+        .iter()
+        .any(|e| e.get_entity_id() == entity_id)
+}
+
 /// Main scheduler loop that runs periodically and applies schedule
 pub async fn run_scheduler<T: ClimateEntity + Clone>(state: SchedulerState<T>) {
     let mut interval = interval(Duration::from_secs(15));
 
     println!("\n=== Heating Scheduler Started ===");
-
-    // Last target temperature sent to each entity, by entity id
-    let mut last_sent_targets: HashMap<String, Option<f64>> = HashMap::new();
 
     loop {
         interval.tick().await;
@@ -590,9 +609,20 @@ pub async fn run_scheduler<T: ClimateEntity + Clone>(state: SchedulerState<T>) {
         for ((entity, scheduled), context) in
             entities_clone.iter_mut().zip(&scheduled).zip(contexts)
         {
-            let last_sent = last_sent_targets
-                .entry(entity.get_entity_id().to_string())
-                .or_default();
+            // Removed while this tick ran: it's no longer controlled, so send it nothing. Checked
+            // again after its state is read, just before anything is sent.
+            let id = entity.get_entity_id().to_string();
+            let still_managed = || is_managed(&state.climate_entities, &id);
+            if !still_managed() {
+                continue;
+            }
+            let mut last_sent = state
+                .last_sent_targets
+                .lock()
+                .unwrap()
+                .get(&id)
+                .copied()
+                .flatten();
             CALL_CONTEXT
                 .scope(
                     context,
@@ -601,10 +631,18 @@ pub async fn run_scheduler<T: ClimateEntity + Clone>(state: SchedulerState<T>) {
                         scheduled,
                         default_target_temp,
                         &state.api_client,
-                        last_sent,
+                        &mut last_sent,
+                        &still_managed,
                     ),
                 )
                 .await;
+            if still_managed() {
+                state
+                    .last_sent_targets
+                    .lock()
+                    .unwrap()
+                    .insert(id, last_sent);
+            }
         }
 
         // Merge what this tick learned into the live list, rather than writing the copy back over
@@ -739,7 +777,8 @@ mod tests {
         scheduled: &Scheduled,
         last_sent: &mut Option<f64>,
     ) {
-        apply_schedule_to_entity(entity, scheduled, 20.0, &fake_client(), last_sent).await;
+        apply_schedule_to_entity(entity, scheduled, 20.0, &fake_client(), last_sent, &|| true)
+            .await;
     }
 
     fn sent(entity: &crate::climate::MockClimate) -> Vec<f64> {
@@ -1779,6 +1818,18 @@ mod tests {
         merge_tick_results(&mut live, &processed, &boosts);
         let ids: Vec<_> = live.iter().map(|e| e.get_entity_id()).collect();
         assert_eq!(ids, vec!["climate.b"]);
+    }
+
+    #[test]
+    fn test_an_entity_removed_mid_tick_is_not_managed() {
+        let live = RwLock::new(vec![named("climate.a"), named("climate.b")]);
+        assert!(is_managed(&live, "climate.a"));
+        // Removed while the tick works through its copy
+        live.write()
+            .unwrap()
+            .retain(|e| e.get_entity_id() != "climate.a");
+        assert!(!is_managed(&live, "climate.a"));
+        assert!(is_managed(&live, "climate.b"));
     }
 
     #[test]

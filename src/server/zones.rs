@@ -311,6 +311,7 @@ mod tests {
             weather_file_path: path("weather.json"),
             mock_weather: None,
             dry_run: None,
+            last_sent_targets: Default::default(),
         };
         (state, dir)
     }
@@ -347,6 +348,9 @@ mod tests {
     #[async_trait::async_trait]
     impl AreaSource for FailingAreas {
         async fn fetch_areas(&self) -> anyhow::Result<Vec<crate::zones::areas::Area>> {
+            Err(anyhow::anyhow!("unreachable"))
+        }
+        async fn fetch_climates(&self) -> anyhow::Result<Vec<crate::zones::areas::Climate>> {
             Err(anyhow::anyhow!("unreachable"))
         }
     }
