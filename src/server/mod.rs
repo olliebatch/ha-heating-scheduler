@@ -4,6 +4,7 @@ use crate::server::handlers::{
     activate_schedule_set, add_entities, add_schedule_entry, add_set_entry, boost, boost_all,
     create_schedule_set, delete_schedule_entry, delete_schedule_set, delete_set_entry, get_dry_run,
     get_entities, get_schedule, get_schedule_sets, remove_entity, rename_schedule_set,
+    update_set_entry,
 };
 use crate::server::zones::{
     create_zone, delete_zone, get_zones, merge_zones, refresh_zones, update_zone,
@@ -11,7 +12,7 @@ use crate::server::zones::{
 use crate::weather::Weather;
 use crate::zones::areas::AreaSource;
 use crate::{ScheduleState, WeatherState, ZonesState};
-use axum::routing::{delete, patch, post};
+use axum::routing::{delete, patch, post, put};
 use axum::{Router, routing::get};
 use std::sync::{Arc, RwLock};
 use tower_http::cors::CorsLayer;
@@ -69,7 +70,8 @@ pub async fn start_server(app_state: AppState<ClimateEntityWrapper>, port: u16) 
         )
         .route(
             "/schedule_sets/{id}/entries/{entry_id}",
-            delete(delete_set_entry::<ClimateEntityWrapper>),
+            put(update_set_entry::<ClimateEntityWrapper>)
+                .delete(delete_set_entry::<ClimateEntityWrapper>),
         )
         .route(
             "/zones",

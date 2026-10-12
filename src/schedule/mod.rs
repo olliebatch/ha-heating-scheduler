@@ -215,6 +215,47 @@ impl Schedule {
         Ok(())
     }
 
+    /// Replace an entry's times, state and target, keeping its id. The time it gives up goes to
+    /// its neighbours: the entry before takes the old period, as on delete, and the entry after
+    /// takes whatever an earlier end frees. The edited entry then goes on top, like an added one.
+    /// Untouched entries keep their ids and names unless the edit merges them with it.
+    pub fn update_entry(&mut self, entry_id: Uuid, entry: ScheduleEntry) -> Result<(), String> {
+        let Some(i) = self.entries.iter().position(|e| e.id == entry_id) else {
+            return Err(format!("Entry with ID {} not found", entry_id));
+        };
+        let old = self.entries.remove(i).time_period;
+        let new_end = entry.time_period.end;
+
+        // The entries cover the day once, so the neighbours meet the old period exactly
+        if self.entries.len() == 1 {
+            self.entries[0].time_period = TimePeriod::new(0, 0, 0, 0);
+        } else if !self.entries.is_empty() {
+            if let Some(before) = self
+                .entries
+                .iter_mut()
+                .find(|e| e.time_period.end == old.start)
+            {
+                before.time_period.end = old.end;
+            }
+            let after = self
+                .entries
+                .iter()
+                .position(|e| e.time_period.start == old.end);
+            if let Some(n) = after.filter(|_| old.contains(new_end) && new_end != old.start) {
+                // Later in the list, so it wins over the entry before where they now overlap
+                let mut after = self.entries.remove(n);
+                after.time_period.start = new_end;
+                self.entries.push(after);
+            }
+        }
+        self.entries.push(ScheduleEntry {
+            id: entry_id,
+            ..entry
+        });
+        self.normalise();
+        Ok(())
+    }
+
     /// Rebuild the entries into the smallest set that covers the day exactly once, with no two
     /// neighbouring entries (including across midnight) sharing a heating state and target.
     ///
@@ -318,6 +359,7 @@ impl Schedule {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
 
     #[test]
     fn test_time_period_contains() {
@@ -503,6 +545,222 @@ mod tests {
 
         let has_large = schedule.entries.iter().any(|e| e.name == "Large");
         assert!(has_large, "Large entry should exist");
+    }
+
+    /// Off all day, with Morning 06:00-09:00 and Evening 17:00-22:00 On at 20 °C
+    fn day() -> Schedule {
+        let mut schedule = Schedule::new("Day");
+        schedule.add_entry(
+            ScheduleEntry::new("Morning", TimePeriod::new(6, 0, 9, 0), HeatingState::On)
+                .with_target(20.0),
+        );
+        schedule.add_entry(
+            ScheduleEntry::new("Evening", TimePeriod::new(17, 0, 22, 0), HeatingState::On)
+                .with_target(20.0),
+        );
+        schedule
+    }
+
+    fn periods(schedule: &Schedule) -> Vec<(String, TimePeriod, HeatingState, Option<f64>)> {
+        let mut periods: Vec<_> = schedule
+            .entries
+            .iter()
+            .map(|e| {
+                (
+                    e.name.clone(),
+                    e.time_period,
+                    e.heating_state.clone(),
+                    e.target_temp,
+                )
+            })
+            .collect();
+        periods.sort_by_key(|p| p.1.start);
+        periods
+    }
+
+    #[test]
+    fn test_update_entry_changes_times_and_target_in_place() {
+        let mut schedule = day();
+        let morning = schedule
+            .entries
+            .iter()
+            .find(|e| e.name == "Morning")
+            .unwrap()
+            .id;
+
+        // Later and warmer: 07:00-10:00 at 21 °C; 06:00-07:00 goes back to the Off before it
+        schedule
+            .update_entry(
+                morning,
+                ScheduleEntry::new("Morning", TimePeriod::new(7, 0, 10, 0), HeatingState::On)
+                    .with_target(21.0),
+            )
+            .unwrap();
+
+        let edited = schedule.entries.iter().find(|e| e.id == morning).unwrap();
+        assert_eq!(
+            edited.time_period,
+            TimePeriod::new(7, 0, 10, 0),
+            "keeps its id"
+        );
+        let off = HeatingState::Off;
+        let on = HeatingState::On;
+        assert_eq!(
+            periods(&schedule)
+                .into_iter()
+                .map(|(_, p, s, t)| (p, s, t))
+                .collect::<Vec<_>>(),
+            vec![
+                (TimePeriod::new(7, 0, 10, 0), on.clone(), Some(21.0)),
+                (TimePeriod::new(10, 0, 17, 0), off.clone(), None),
+                (TimePeriod::new(17, 0, 22, 0), on, Some(20.0)),
+                // Off either side of midnight is one period
+                (TimePeriod::new(22, 0, 7, 0), off, None),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_update_entry_can_end_a_period_earlier() {
+        for (start, end) in [(6, 8), (5, 8), (4, 7)] {
+            let mut schedule = day();
+            let morning = schedule
+                .entries
+                .iter()
+                .find(|e| e.name == "Morning")
+                .unwrap()
+                .id;
+            schedule
+                .update_entry(
+                    morning,
+                    ScheduleEntry::new(
+                        "Morning",
+                        TimePeriod::new(start, 0, end, 0),
+                        HeatingState::On,
+                    )
+                    .with_target(20.0),
+                )
+                .unwrap();
+
+            let edited = schedule.entries.iter().find(|e| e.id == morning).unwrap();
+            assert_eq!(edited.time_period, TimePeriod::new(start, 0, end, 0));
+            // The time it gave up is Off again
+            let after = NaiveTime::from_hms_opt(end, 30, 0).unwrap();
+            let at = schedule
+                .entries
+                .iter()
+                .find(|e| e.time_period.contains(after))
+                .unwrap();
+            assert_eq!(at.heating_state, HeatingState::Off, "{start}-{end}");
+        }
+    }
+
+    /// Untouched periods keep their ids and names, whichever way the edit moves
+    #[test]
+    fn test_update_entry_keeps_the_other_periods() {
+        let ids = |s: &Schedule| -> HashMap<String, (Uuid, TimePeriod)> {
+            s.entries
+                .iter()
+                .map(|e| (e.name.clone(), (e.id, e.time_period)))
+                .collect()
+        };
+        // Off 22-06 ("default") | Morning 06-09 | Off 09-17 (renamed "Gap") | Evening 17-22
+        let base = || {
+            let mut schedule = day();
+            let gap = schedule
+                .entries
+                .iter_mut()
+                .find(|e| e.time_period == TimePeriod::new(9, 0, 17, 0))
+                .unwrap();
+            gap.name = "Gap".to_string();
+            schedule
+        };
+        let edit = |name: &str, start: u32, end: u32, on: Option<f64>| {
+            let mut schedule = base();
+            let before = ids(&schedule);
+            let id = before[name].0;
+            let entry = match on {
+                Some(t) => {
+                    ScheduleEntry::new(name, TimePeriod::new(start, 0, end, 0), HeatingState::On)
+                        .with_target(t)
+                }
+                None => {
+                    ScheduleEntry::new(name, TimePeriod::new(start, 0, end, 0), HeatingState::Off)
+                }
+            };
+            schedule.update_entry(id, entry).unwrap();
+            (before, ids(&schedule))
+        };
+
+        // QA's case: the Off gap becomes a cooler On period, between two On periods at 20 °C
+        let (before, after) = edit("Gap", 9, 17, Some(17.0));
+        for name in ["Morning", "Gap", "Evening", "default"] {
+            assert_eq!(after[name], before[name], "{name}");
+        }
+        let (before, after) = edit("Gap", 10, 17, Some(17.0));
+        assert_eq!(
+            after["Morning"],
+            (before["Morning"].0, TimePeriod::new(6, 0, 10, 0))
+        );
+        assert_eq!(after["Evening"], before["Evening"]);
+
+        // An earlier end: the freed hour joins the Off after it, and the Off before keeps its id
+        let (before, after) = edit("Morning", 6, 8, Some(20.0));
+        assert_eq!(
+            after["Gap"],
+            (before["Gap"].0, TimePeriod::new(8, 0, 17, 0))
+        );
+        assert_eq!(after["default"], before["default"]);
+        assert_eq!(after["Evening"], before["Evening"]);
+
+        // Moved somewhere else entirely: its old time goes to the period before, as on delete,
+        // which then runs on into the Off after it; the rest of that Off keeps its id
+        let (before, after) = edit("Morning", 12, 14, Some(20.0));
+        assert_eq!(
+            after["default"],
+            (before["default"].0, TimePeriod::new(22, 0, 12, 0))
+        );
+        assert_eq!(
+            after["Gap"],
+            (before["Gap"].0, TimePeriod::new(14, 0, 17, 0))
+        );
+        assert_eq!(after["Evening"], before["Evening"]);
+    }
+
+    #[test]
+    fn test_update_entry_can_turn_a_period_off_and_merge() {
+        let mut schedule = day();
+        let evening = schedule
+            .entries
+            .iter()
+            .find(|e| e.name == "Evening")
+            .unwrap()
+            .id;
+
+        schedule
+            .update_entry(
+                evening,
+                ScheduleEntry::new("Evening", TimePeriod::new(17, 0, 22, 0), HeatingState::Off),
+            )
+            .unwrap();
+
+        // Off from 09:00 round to 06:00 is now one period
+        assert_eq!(schedule.entries.len(), 2);
+        assert!(
+            schedule
+                .entries
+                .iter()
+                .all(|e| e.time_period != TimePeriod::new(17, 0, 22, 0))
+        );
+    }
+
+    #[test]
+    fn test_update_missing_entry_is_refused_and_changes_nothing() {
+        let mut schedule = day();
+        let before = periods(&schedule);
+        let err = schedule.update_entry(Uuid::new_v4(), ScheduleEntry::default());
+        assert!(err.is_err());
+        assert_eq!(periods(&schedule), before);
     }
 
     #[test]

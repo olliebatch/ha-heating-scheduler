@@ -191,12 +191,8 @@ pub async fn activate_schedule_set<T: ClimateEntity + Clone>(
     Ok(Json(sets))
 }
 
-/// Add an entry to any set; a zero-length period is refused with 400
-pub async fn add_set_entry<T: ClimateEntity + Clone>(
-    State(state): State<AppState<T>>,
-    Path(set_id): Path<Uuid>,
-    Json(payload): Json<ScheduleEntryRequest>,
-) -> Result<Json<Schedule>, ApiError> {
+/// The checks an added or edited entry must pass: its target, and no zero-length period (400)
+fn check_set_entry(payload: &ScheduleEntryRequest) -> Result<(), ApiError> {
     payload
         .validate()
         .map_err(|msg| (StatusCode::BAD_REQUEST, msg))?;
@@ -207,6 +203,16 @@ pub async fn add_set_entry<T: ClimateEntity + Clone>(
             "Start and end must differ (use 00:00 - 00:00 for the whole day)".to_string(),
         ));
     }
+    Ok(())
+}
+
+/// Add an entry to any set; a zero-length period is refused with 400
+pub async fn add_set_entry<T: ClimateEntity + Clone>(
+    State(state): State<AppState<T>>,
+    Path(set_id): Path<Uuid>,
+    Json(payload): Json<ScheduleEntryRequest>,
+) -> Result<Json<Schedule>, ApiError> {
+    check_set_entry(&payload)?;
     let entry: ScheduleEntry = payload.into();
 
     let updated = update_sets(&state, |sets| {
@@ -229,6 +235,36 @@ pub async fn delete_set_entry<T: ClimateEntity + Clone>(
             .get_mut(set_id)
             .ok_or_else(|| set_error(SetError::NotFound))?;
         delete_entry_checked(schedule, entry_id)?;
+        Ok(schedule.clone())
+    })?;
+    Ok(Json(updated))
+}
+
+/// Change an entry's times, state and target with the same checks as add: 404 if the set or
+/// entry isn't there, and 409 for new times on a set's only entry, which must cover the day
+pub async fn update_set_entry<T: ClimateEntity + Clone>(
+    State(state): State<AppState<T>>,
+    Path((set_id, entry_id)): Path<(Uuid, Uuid)>,
+    Json(payload): Json<ScheduleEntryRequest>,
+) -> Result<Json<Schedule>, ApiError> {
+    check_set_entry(&payload)?;
+    let updated = update_sets(&state, |sets| {
+        let schedule = sets
+            .get_mut(set_id)
+            .ok_or_else(|| set_error(SetError::NotFound))?;
+        if !schedule.entries.iter().any(|e| e.id == entry_id) {
+            return Err((StatusCode::NOT_FOUND, "Entry not found".to_string()));
+        }
+        if schedule.entries.len() == 1 && !payload.time_period.is_full_day() {
+            return Err((
+                StatusCode::CONFLICT,
+                "The only period covers the whole day; add another period to change its times"
+                    .to_string(),
+            ));
+        }
+        schedule
+            .update_entry(entry_id, payload.into())
+            .map_err(|e| (StatusCode::NOT_FOUND, e))?;
         Ok(schedule.clone())
     })?;
     Ok(Json(updated))
@@ -580,6 +616,152 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err.0, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_update_set_entry_changes_it_in_place_and_persists() {
+        let (state, _dir) = test_state();
+        let set_id = state.schedule.read().unwrap().active_id;
+        let added = add_set_entry(State(state.clone()), Path(set_id), Json(on(8, 17)))
+            .await
+            .unwrap()
+            .0;
+        let id = added.entries.iter().find(|e| e.name == "On").unwrap().id;
+
+        let updated = update_set_entry(
+            State(state.clone()),
+            Path((set_id, id)),
+            Json(ScheduleEntryRequest {
+                target_temp: Some(19.5),
+                ..on(9, 18)
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+
+        let edited = updated.entries.iter().find(|e| e.id == id).unwrap();
+        assert_eq!(edited.time_period, TimePeriod::new(9, 0, 18, 0));
+        assert_eq!(edited.target_temp, Some(19.5));
+        let saved = persistence::load_sets(&state.schedule_sets_file_path).unwrap();
+        let saved = saved
+            .get(set_id)
+            .unwrap()
+            .entries
+            .iter()
+            .find(|e| e.id == id)
+            .cloned();
+        assert_eq!(saved.unwrap().time_period, TimePeriod::new(9, 0, 18, 0));
+    }
+
+    #[tokio::test]
+    async fn test_refused_set_entry_updates_change_nothing() {
+        let (state, _dir) = test_state();
+        let set_id = state.schedule.read().unwrap().active_id;
+        let added = add_set_entry(State(state.clone()), Path(set_id), Json(on(8, 17)))
+            .await
+            .unwrap()
+            .0;
+        let id = added.entries.iter().find(|e| e.name == "On").unwrap().id;
+        let read = |state: &AppState<MockClimate>| {
+            serde_json::to_string(&*state.schedule.read().unwrap()).unwrap()
+        };
+        let before = read(&state);
+        let on_disk = std::fs::read_to_string(&state.schedule_sets_file_path).unwrap();
+
+        let refusals = [
+            (
+                set_id,
+                id,
+                on(10, 10),
+                StatusCode::BAD_REQUEST,
+                "Start and end must differ",
+            ),
+            (
+                set_id,
+                id,
+                ScheduleEntryRequest {
+                    target_temp: None,
+                    ..on(8, 17)
+                },
+                StatusCode::BAD_REQUEST,
+                "need a target_temp",
+            ),
+            (
+                set_id,
+                id,
+                ScheduleEntryRequest {
+                    target_temp: Some(31.0),
+                    ..on(8, 17)
+                },
+                StatusCode::BAD_REQUEST,
+                "between 5 and 30",
+            ),
+            (
+                set_id,
+                id,
+                ScheduleEntryRequest {
+                    heating_state: HeatingState::Off,
+                    ..on(8, 17)
+                },
+                StatusCode::BAD_REQUEST,
+                "can't have a target_temp",
+            ),
+            (
+                set_id,
+                Uuid::new_v4(),
+                on(8, 17),
+                StatusCode::NOT_FOUND,
+                "Entry not found",
+            ),
+            (
+                Uuid::new_v4(),
+                id,
+                on(8, 17),
+                StatusCode::NOT_FOUND,
+                "Schedule set not found",
+            ),
+        ];
+        for (set, entry, request, status, message) in refusals {
+            let err = update_set_entry(State(state.clone()), Path((set, entry)), Json(request))
+                .await
+                .unwrap_err();
+            assert_eq!(err.0, status, "{}", err.1);
+            assert!(err.1.contains(message), "{}", err.1);
+        }
+
+        assert_eq!(read(&state), before, "nothing changed in memory");
+        assert_eq!(
+            std::fs::read_to_string(&state.schedule_sets_file_path).unwrap(),
+            on_disk,
+            "nothing changed on disk"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_only_entry_keeps_the_whole_day() {
+        let (state, _dir) = test_state();
+        let set = state.schedule.read().unwrap().active().clone();
+        let only = set.entries[0].id;
+
+        // New times on the only entry would leave the rest of the day uncovered
+        let err = update_set_entry(State(state.clone()), Path((set.id, only)), Json(on(8, 17)))
+            .await
+            .unwrap_err();
+        assert_eq!(err.0, StatusCode::CONFLICT);
+        assert_eq!(
+            state.schedule.read().unwrap().active().entries[0].heating_state,
+            HeatingState::Off
+        );
+
+        // Its state and target can still change, all day
+        let updated = update_set_entry(State(state.clone()), Path((set.id, only)), Json(on(0, 0)))
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(updated.entries.len(), 1);
+        assert_eq!(updated.entries[0].id, only);
+        assert_eq!(updated.entries[0].heating_state, HeatingState::On);
     }
 
     #[tokio::test]
