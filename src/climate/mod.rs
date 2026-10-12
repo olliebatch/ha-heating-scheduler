@@ -27,6 +27,18 @@ pub struct BoostInfo {
     pub boost_end: NaiveTime,
 }
 
+impl BoostInfo {
+    /// Whether the boost covers `now`; an end before the start means it runs past midnight
+    /// (a boost is at most 255 minutes, so it never covers a whole day)
+    pub fn is_active(&self, now: NaiveTime) -> bool {
+        if self.boost_start <= self.boost_end {
+            self.boost_start <= now && now <= self.boost_end
+        } else {
+            now >= self.boost_start || now <= self.boost_end
+        }
+    }
+}
+
 /// Wrapper enum to allow using either Mock or Real climate entities
 #[derive(Debug, Clone)]
 pub enum ClimateEntityWrapper {

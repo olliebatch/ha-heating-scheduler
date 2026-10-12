@@ -12,7 +12,7 @@ use crate::weather::warmup::{WarmUp, continue_warm_up, warm_up};
 use crate::weather::{Held, KEEP_READING_FOR, Weather, WeatherSource, WeatherStatus};
 use crate::zones::{Zone, Zones};
 use crate::{ScheduleState, WeatherState, ZonesState};
-use chrono::Local;
+use chrono::{Local, NaiveTime};
 use serde::Serialize;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
@@ -58,11 +58,12 @@ pub fn calculate_heating_action_for_schedule(
 pub fn calculate_desired_heating_state_for_boost(
     boost_info: &Option<BoostInfo>,
 ) -> (HeatingState, bool) {
+    boost_state_at(boost_info, Local::now().time())
+}
+
+fn boost_state_at(boost_info: &Option<BoostInfo>, now: NaiveTime) -> (HeatingState, bool) {
     if let Some(boosted) = boost_info {
-        // Validate that current time is inside the boosted time period
-        let now = Local::now().time();
-        // Check if current time is within boost period
-        if now >= boosted.boost_start && now <= boosted.boost_end {
+        if boosted.is_active(now) {
             return (HeatingState::On, false);
         }
         (HeatingState::Off, true)
@@ -848,13 +849,9 @@ mod tests {
     async fn test_boost_during_off_uses_default_target() {
         let mut entity = mock(HeatingState::Off);
         let now = Local::now().time();
-        let boost_end = now + chrono::Duration::minutes(1);
-        if boost_end < now {
-            return; // boost windows don't wrap midnight; skip in the last minute of the day
-        }
         entity.set_boost(Some(BoostInfo {
             boost_start: now,
-            boost_end,
+            boost_end: now + chrono::Duration::minutes(1),
         }));
         let mut last = None;
 
@@ -1676,6 +1673,60 @@ mod tests {
             boost_start: start,
             boost_end: start + chrono::Duration::minutes(minutes),
         }
+    }
+
+    fn at(h: u32, m: u32) -> NaiveTime {
+        NaiveTime::from_hms_opt(h, m, 0).unwrap()
+    }
+
+    fn boost_from(h: u32, m: u32, minutes: i64) -> Option<BoostInfo> {
+        Some(BoostInfo {
+            boost_start: at(h, m),
+            boost_end: at(h, m) + chrono::Duration::minutes(minutes),
+        })
+    }
+
+    const HEATS: (HeatingState, bool) = (HeatingState::On, false);
+    const ENDS: (HeatingState, bool) = (HeatingState::Off, true);
+
+    #[test]
+    fn test_boost_heats_until_its_end_the_same_day() {
+        let b = boost_from(12, 0, 60);
+        assert_eq!(boost_state_at(&b, at(12, 0)), HEATS);
+        assert_eq!(boost_state_at(&b, at(12, 59)), HEATS);
+        assert_eq!(
+            boost_state_at(&b, at(13, 1)),
+            ENDS,
+            "expired boost is cleared"
+        );
+        assert_eq!(
+            boost_state_at(&None, at(12, 30)),
+            (HeatingState::Off, false)
+        );
+    }
+
+    #[test]
+    fn test_boost_past_midnight_heats_until_its_real_end() {
+        // 23:30 to 01:30
+        let b = boost_from(23, 30, 120);
+        assert_eq!(boost_state_at(&b, at(23, 30)), HEATS, "first tick");
+        assert_eq!(boost_state_at(&b, at(23, 59)), HEATS);
+        assert_eq!(
+            boost_state_at(&b, at(0, 0)),
+            HEATS,
+            "tick right after midnight"
+        );
+        assert_eq!(boost_state_at(&b, at(1, 29)), HEATS);
+        assert_eq!(boost_state_at(&b, at(1, 31)), ENDS, "cleared after its end");
+    }
+
+    #[test]
+    fn test_boost_started_just_before_midnight() {
+        // 23:59 for 30 minutes, so it ends at 00:29
+        let b = boost_from(23, 59, 30);
+        assert_eq!(boost_state_at(&b, at(23, 59)), HEATS);
+        assert_eq!(boost_state_at(&b, at(0, 1)), HEATS);
+        assert_eq!(boost_state_at(&b, at(0, 30)), ENDS);
     }
 
     fn named(id: &str) -> crate::climate::MockClimate {
