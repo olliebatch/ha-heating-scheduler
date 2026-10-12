@@ -221,7 +221,10 @@ impl Schedule {
         if !self.entries.iter().any(|e| e.id == entry_id) {
             return Err(format!("Entry with ID {} not found", entry_id));
         }
+        // Hand its old time to the entry before first, as on delete; normalising once at the
+        // end would fill the freed time from the edited entry itself, so a shorter end wouldn't stick
         self.entries.retain(|e| e.id != entry_id);
+        self.normalise();
         self.entries.push(ScheduleEntry {
             id: entry_id,
             ..entry
@@ -591,6 +594,41 @@ mod tests {
                 (TimePeriod::new(22, 0, 7, 0), off, None),
             ]
         );
+    }
+
+    #[test]
+    fn test_update_entry_can_end_a_period_earlier() {
+        for (start, end) in [(6, 8), (5, 8), (4, 7)] {
+            let mut schedule = day();
+            let morning = schedule
+                .entries
+                .iter()
+                .find(|e| e.name == "Morning")
+                .unwrap()
+                .id;
+            schedule
+                .update_entry(
+                    morning,
+                    ScheduleEntry::new(
+                        "Morning",
+                        TimePeriod::new(start, 0, end, 0),
+                        HeatingState::On,
+                    )
+                    .with_target(20.0),
+                )
+                .unwrap();
+
+            let edited = schedule.entries.iter().find(|e| e.id == morning).unwrap();
+            assert_eq!(edited.time_period, TimePeriod::new(start, 0, end, 0));
+            // The time it gave up is Off again
+            let after = NaiveTime::from_hms_opt(end, 30, 0).unwrap();
+            let at = schedule
+                .entries
+                .iter()
+                .find(|e| e.time_period.contains(after))
+                .unwrap();
+            assert_eq!(at.heating_state, HeatingState::Off, "{start}-{end}");
+        }
     }
 
     #[test]
