@@ -42,6 +42,7 @@ On first run, an existing `data/schedule.json` becomes the only (active) set and
 - `POST /schedule_sets/{id}/entries` - Add an entry to a set (400 if start equals end, except 00:00 - 00:00). Returns the set.
   On entries need a `target_temp` between 5 and 30 °C; Off entries have none, e.g.
   `{"name": "Morning", "time_period": {"start": "06:00", "end": "09:00"}, "heating_state": "ON", "target_temp": 21}`
+- `PUT /schedule_sets/{id}/entries/{entry_id}` - Change an entry's times, state and target, with the same checks as adding one (409 for new times on the only entry). Returns the set
 - `DELETE /schedule_sets/{id}/entries/{entry_id}` - Delete an entry (409 for the only entry). Returns the set
 
 While an On entry is active, the scheduler sets its `target_temp` on each climate (after turning it on).

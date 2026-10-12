@@ -215,6 +215,21 @@ impl Schedule {
         Ok(())
     }
 
+    /// Replace an entry's times, state and target, keeping its id. The edited entry goes on top,
+    /// like an added one, and any time it no longer covers goes to the entry before, as on delete.
+    pub fn update_entry(&mut self, entry_id: Uuid, entry: ScheduleEntry) -> Result<(), String> {
+        if !self.entries.iter().any(|e| e.id == entry_id) {
+            return Err(format!("Entry with ID {} not found", entry_id));
+        }
+        self.entries.retain(|e| e.id != entry_id);
+        self.entries.push(ScheduleEntry {
+            id: entry_id,
+            ..entry
+        });
+        self.normalise();
+        Ok(())
+    }
+
     /// Rebuild the entries into the smallest set that covers the day exactly once, with no two
     /// neighbouring entries (including across midnight) sharing a heating state and target.
     ///
@@ -503,6 +518,115 @@ mod tests {
 
         let has_large = schedule.entries.iter().any(|e| e.name == "Large");
         assert!(has_large, "Large entry should exist");
+    }
+
+    /// Off all day, with Morning 06:00-09:00 and Evening 17:00-22:00 On at 20 °C
+    fn day() -> Schedule {
+        let mut schedule = Schedule::new("Day");
+        schedule.add_entry(
+            ScheduleEntry::new("Morning", TimePeriod::new(6, 0, 9, 0), HeatingState::On)
+                .with_target(20.0),
+        );
+        schedule.add_entry(
+            ScheduleEntry::new("Evening", TimePeriod::new(17, 0, 22, 0), HeatingState::On)
+                .with_target(20.0),
+        );
+        schedule
+    }
+
+    fn periods(schedule: &Schedule) -> Vec<(String, TimePeriod, HeatingState, Option<f64>)> {
+        let mut periods: Vec<_> = schedule
+            .entries
+            .iter()
+            .map(|e| {
+                (
+                    e.name.clone(),
+                    e.time_period,
+                    e.heating_state.clone(),
+                    e.target_temp,
+                )
+            })
+            .collect();
+        periods.sort_by_key(|p| p.1.start);
+        periods
+    }
+
+    #[test]
+    fn test_update_entry_changes_times_and_target_in_place() {
+        let mut schedule = day();
+        let morning = schedule
+            .entries
+            .iter()
+            .find(|e| e.name == "Morning")
+            .unwrap()
+            .id;
+
+        // Later and warmer: 07:00-10:00 at 21 °C; 06:00-07:00 goes back to the Off before it
+        schedule
+            .update_entry(
+                morning,
+                ScheduleEntry::new("Morning", TimePeriod::new(7, 0, 10, 0), HeatingState::On)
+                    .with_target(21.0),
+            )
+            .unwrap();
+
+        let edited = schedule.entries.iter().find(|e| e.id == morning).unwrap();
+        assert_eq!(
+            edited.time_period,
+            TimePeriod::new(7, 0, 10, 0),
+            "keeps its id"
+        );
+        let off = HeatingState::Off;
+        let on = HeatingState::On;
+        assert_eq!(
+            periods(&schedule)
+                .into_iter()
+                .map(|(_, p, s, t)| (p, s, t))
+                .collect::<Vec<_>>(),
+            vec![
+                (TimePeriod::new(7, 0, 10, 0), on.clone(), Some(21.0)),
+                (TimePeriod::new(10, 0, 17, 0), off.clone(), None),
+                (TimePeriod::new(17, 0, 22, 0), on, Some(20.0)),
+                // Off either side of midnight is one period
+                (TimePeriod::new(22, 0, 7, 0), off, None),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_update_entry_can_turn_a_period_off_and_merge() {
+        let mut schedule = day();
+        let evening = schedule
+            .entries
+            .iter()
+            .find(|e| e.name == "Evening")
+            .unwrap()
+            .id;
+
+        schedule
+            .update_entry(
+                evening,
+                ScheduleEntry::new("Evening", TimePeriod::new(17, 0, 22, 0), HeatingState::Off),
+            )
+            .unwrap();
+
+        // Off from 09:00 round to 06:00 is now one period
+        assert_eq!(schedule.entries.len(), 2);
+        assert!(
+            schedule
+                .entries
+                .iter()
+                .all(|e| e.time_period != TimePeriod::new(17, 0, 22, 0))
+        );
+    }
+
+    #[test]
+    fn test_update_missing_entry_is_refused_and_changes_nothing() {
+        let mut schedule = day();
+        let before = periods(&schedule);
+        let err = schedule.update_entry(Uuid::new_v4(), ScheduleEntry::default());
+        assert!(err.is_err());
+        assert_eq!(periods(&schedule), before);
     }
 
     #[test]
