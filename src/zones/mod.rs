@@ -139,6 +139,18 @@ impl Zones {
             .find(|z| z.entity_ids.iter().any(|e| e == entity_id))
     }
 
+    /// The name of the zone `entity_id` is in, or would land in if it were managed too, with
+    /// `areas` as Home Assistant has them now. Works on a copy, so nothing changes.
+    pub fn zone_with(&self, areas: &[Area], managed: &[String], entity_id: &str) -> Option<String> {
+        let mut managed = managed.to_vec();
+        if !managed.iter().any(|e| e == entity_id) {
+            managed.push(entity_id.to_string());
+        }
+        let mut zones = self.clone();
+        zones.reconcile(Some(areas.to_vec()), &managed);
+        zones.zone_for(entity_id).map(|z| z.name.clone())
+    }
+
     /// Zones following the given schedule set
     pub fn using_set(&self, set_id: Uuid) -> Vec<&Zone> {
         self.zones

@@ -382,6 +382,87 @@ pub async fn get_entities<T: ClimateEntity + Clone>(
     ))
 }
 
+/// A climate entity Home Assistant has, or one this scheduler manages that Home Assistant
+/// doesn't list (`name` and `state` are then None)
+#[derive(Debug, Serialize, Deserialize)]
+pub struct AvailableEntity {
+    pub entity_id: String,
+    pub name: Option<String>,
+    /// Home Assistant's state, e.g. "heat", "off" or "unavailable"
+    pub state: Option<String>,
+    /// Its Home Assistant Area, if it has one
+    pub area: Option<AreaName>,
+    pub managed: bool,
+    /// The zone it's in, or would land in if added
+    pub zone: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct AreaName {
+    pub id: String,
+    pub name: String,
+}
+
+/// Every climate entity Home Assistant has, whether it's managed, its area and its zone. Only
+/// reads Home Assistant; 502 if it can't be reached.
+pub async fn get_available_entities<T: ClimateEntity + Clone>(
+    State(state): State<AppState<T>>,
+) -> Result<Json<Vec<AvailableEntity>>, ApiError> {
+    use crate::zones::areas::{DISCOVERY_TIMEOUT, fetch_areas_with_timeout};
+    let unreachable = |e: anyhow::Error| {
+        (
+            StatusCode::BAD_GATEWAY,
+            format!("Failed to read climate entities from Home Assistant: {}", e),
+        )
+    };
+    let areas = fetch_areas_with_timeout(state.area_source.as_ref(), DISCOVERY_TIMEOUT)
+        .await
+        .map_err(unreachable)?;
+    let climates = tokio::time::timeout(DISCOVERY_TIMEOUT, state.area_source.fetch_climates())
+        .await
+        .map_err(|_| anyhow::anyhow!("timed out after {} s", DISCOVERY_TIMEOUT.as_secs()))
+        .and_then(|r| r)
+        .map_err(unreachable)?;
+
+    let managed: Vec<String> = state
+        .climate_entities
+        .read()
+        .unwrap()
+        .iter()
+        .map(|e| e.get_entity_id().to_string())
+        .collect();
+    let zones = state.zones.read().unwrap();
+    let entry = |entity_id: String, name: Option<String>, state: Option<String>| {
+        let area = areas
+            .iter()
+            .find(|a| a.entities.contains(&entity_id))
+            .map(|a| AreaName {
+                id: a.id.clone(),
+                name: a.name.clone(),
+            });
+        AvailableEntity {
+            zone: zones.zone_with(&areas, &managed, &entity_id),
+            managed: managed.contains(&entity_id),
+            entity_id,
+            name,
+            state,
+            area,
+        }
+    };
+    let mut entities: Vec<AvailableEntity> = climates
+        .into_iter()
+        .map(|c| entry(c.entity_id, Some(c.name), Some(c.state)))
+        .collect();
+    // Managed entities Home Assistant no longer lists, so they can be seen and removed
+    for id in &managed {
+        if !entities.iter().any(|e| &e.entity_id == id) {
+            entities.push(entry(id.clone(), None, None));
+        }
+    }
+    entities.sort_by(|a, b| a.entity_id.cmp(&b.entity_id));
+    Ok(Json(entities))
+}
+
 /// Request body for adding entities
 #[derive(Serialize, Deserialize)]
 pub struct AddEntitiesRequest {
@@ -762,6 +843,78 @@ mod tests {
         assert_eq!(updated.entries.len(), 1);
         assert_eq!(updated.entries[0].id, only);
         assert_eq!(updated.entries[0].heating_state, HeatingState::On);
+    }
+
+    #[tokio::test]
+    async fn test_available_entities_list_every_climate_and_where_it_goes() {
+        let (mut state, _dir) = test_state();
+        state.climate_entities = Arc::new(RwLock::new(
+            ["climate.lounge_trv", "climate.qa_mock", "climate.gone"]
+                .map(|id| MockClimate::new(id.to_string(), HeatingState::Off))
+                .to_vec(),
+        ));
+        let zones_before = serde_json::to_string(&*state.zones.read().unwrap()).unwrap();
+
+        let listed = get_available_entities(State(state.clone()))
+            .await
+            .unwrap()
+            .0;
+        let find = |id: &str| listed.iter().find(|e| e.entity_id == id).unwrap();
+
+        // Every climate HA has, plus the managed one it no longer lists
+        assert_eq!(listed.len(), 8);
+        let lounge = find("climate.lounge_trv");
+        assert!(lounge.managed);
+        assert_eq!(lounge.area.as_ref().unwrap().name, "Lounge");
+        assert_eq!(lounge.zone.as_deref(), Some("Lounge"));
+        assert_eq!(find("climate.qa_mock").zone.as_deref(), Some("Whole house"));
+        // Not managed: where each would land
+        let bedroom = find("climate.bedroom_trv");
+        assert!(!bedroom.managed);
+        assert_eq!(bedroom.name.as_deref(), Some("Bedroom TRV"));
+        assert_eq!(
+            bedroom.zone.as_deref(),
+            Some("Bedroom"),
+            "a new zone for its area"
+        );
+        let landing = find("climate.landing_trv");
+        assert!(landing.area.is_none());
+        assert_eq!(landing.zone.as_deref(), Some("Whole house"), "no area");
+        assert_eq!(
+            find("climate.garage_trv").state.as_deref(),
+            Some("unavailable")
+        );
+        // Managed but gone from Home Assistant
+        let gone = find("climate.gone");
+        assert!(gone.managed);
+        assert_eq!((gone.name.as_ref(), gone.state.as_ref()), (None, None));
+
+        // Listing changes nothing
+        assert_eq!(
+            serde_json::to_string(&*state.zones.read().unwrap()).unwrap(),
+            zones_before
+        );
+        assert_eq!(state.climate_entities.read().unwrap().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn test_available_entities_without_home_assistant_is_502() {
+        struct Unreachable;
+        #[async_trait::async_trait]
+        impl crate::zones::areas::AreaSource for Unreachable {
+            async fn fetch_areas(&self) -> anyhow::Result<Vec<crate::zones::areas::Area>> {
+                Ok(vec![])
+            }
+            async fn fetch_climates(&self) -> anyhow::Result<Vec<crate::zones::areas::Climate>> {
+                Err(anyhow::anyhow!("connection refused"))
+            }
+        }
+        let (mut state, _dir) = test_state();
+        state.area_source = Arc::new(Unreachable);
+
+        let err = get_available_entities(State(state)).await.unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_GATEWAY);
+        assert!(err.1.contains("connection refused"), "{}", err.1);
     }
 
     #[tokio::test]

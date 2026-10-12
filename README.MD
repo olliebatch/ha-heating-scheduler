@@ -123,7 +123,8 @@ else turns heating on during an Off period.
 ### Entities
 - `GET /entities` - List all entities with status
 - `POST /entities` - Add entities: `{"entity_ids": ["climate.living_room"]}`
-- `DELETE /entities` - Remove entity: `{"entity_id": "climate.living_room"}`
+- `DELETE /entities` - Remove entity: `{"entity_id": "climate.living_room"}`. It stops being controlled and is left as it is
+- `GET /entities/available` - Every climate entity Home Assistant has (read-only, also in dry run): its name, state, Area, whether it's managed, and the zone it's in or would land in. Managed entities Home Assistant no longer lists are included without a name or state. 502 if Home Assistant can't be reached
 
 ### Dry run
 - `GET /dry_run` - `{"dry_run": true|false, "calls": [...]}`: the calls a dry run would have made, newest first. Each

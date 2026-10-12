@@ -349,6 +349,9 @@ mod tests {
         async fn fetch_areas(&self) -> anyhow::Result<Vec<crate::zones::areas::Area>> {
             Err(anyhow::anyhow!("unreachable"))
         }
+        async fn fetch_climates(&self) -> anyhow::Result<Vec<crate::zones::areas::Climate>> {
+            Err(anyhow::anyhow!("unreachable"))
+        }
     }
 
     #[tokio::test]

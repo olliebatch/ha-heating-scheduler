@@ -2,9 +2,9 @@ use crate::climate::{ClimateEntity, ClimateEntityWrapper};
 use crate::dry_run::DryRun;
 use crate::server::handlers::{
     activate_schedule_set, add_entities, add_schedule_entry, add_set_entry, boost, boost_all,
-    create_schedule_set, delete_schedule_entry, delete_schedule_set, delete_set_entry, get_dry_run,
-    get_entities, get_schedule, get_schedule_sets, remove_entity, rename_schedule_set,
-    update_set_entry,
+    create_schedule_set, delete_schedule_entry, delete_schedule_set, delete_set_entry,
+    get_available_entities, get_dry_run, get_entities, get_schedule, get_schedule_sets,
+    remove_entity, rename_schedule_set, update_set_entry,
 };
 use crate::server::zones::{
     create_zone, delete_zone, get_zones, merge_zones, refresh_zones, update_zone,
@@ -94,6 +94,10 @@ pub async fn start_server(app_state: AppState<ClimateEntityWrapper>, port: u16) 
         .route("/entities", get(get_entities::<ClimateEntityWrapper>))
         .route("/entities", post(add_entities))
         .route("/entities", delete(remove_entity))
+        .route(
+            "/entities/available",
+            get(get_available_entities::<ClimateEntityWrapper>),
+        )
         .route("/boost_all", post(boost_all::<ClimateEntityWrapper>))
         .route("/boost", post(boost::<ClimateEntityWrapper>))
         .route("/dry_run", get(get_dry_run::<ClimateEntityWrapper>));

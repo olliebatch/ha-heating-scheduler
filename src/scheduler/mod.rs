@@ -529,6 +529,14 @@ pub fn merge_tick_results<T: ClimateEntity>(
     }
 }
 
+/// Whether `entity_id` is still in the live list of managed entities
+fn is_managed<T: ClimateEntity>(live: &RwLock<Vec<T>>, entity_id: &str) -> bool {
+    live.read()
+        .unwrap()
+        .iter()
+        .any(|e| e.get_entity_id() == entity_id)
+}
+
 /// Main scheduler loop that runs periodically and applies schedule
 pub async fn run_scheduler<T: ClimateEntity + Clone>(state: SchedulerState<T>) {
     let mut interval = interval(Duration::from_secs(15));
@@ -586,10 +594,17 @@ pub async fn run_scheduler<T: ClimateEntity + Clone>(state: SchedulerState<T>) {
             (scheduled, contexts, sets.default_target_temp)
         };
 
+        // A removed entity's last target is forgotten, so re-adding it sends its target again
+        last_sent_targets.retain(|id, _| entities_clone.iter().any(|e| e.get_entity_id() == id));
+
         // Process entities outside the lock
         for ((entity, scheduled), context) in
             entities_clone.iter_mut().zip(&scheduled).zip(contexts)
         {
+            // Removed while this tick ran: it's no longer controlled, so send it nothing
+            if !is_managed(&state.climate_entities, entity.get_entity_id()) {
+                continue;
+            }
             let last_sent = last_sent_targets
                 .entry(entity.get_entity_id().to_string())
                 .or_default();
@@ -1779,6 +1794,18 @@ mod tests {
         merge_tick_results(&mut live, &processed, &boosts);
         let ids: Vec<_> = live.iter().map(|e| e.get_entity_id()).collect();
         assert_eq!(ids, vec!["climate.b"]);
+    }
+
+    #[test]
+    fn test_an_entity_removed_mid_tick_is_not_managed() {
+        let live = RwLock::new(vec![named("climate.a"), named("climate.b")]);
+        assert!(is_managed(&live, "climate.a"));
+        // Removed while the tick works through its copy
+        live.write()
+            .unwrap()
+            .retain(|e| e.get_entity_id() != "climate.a");
+        assert!(!is_managed(&live, "climate.a"));
+        assert!(is_managed(&live, "climate.b"));
     }
 
     #[test]
