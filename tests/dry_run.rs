@@ -150,8 +150,8 @@ async fn test_dry_run_sends_no_service_calls_but_still_reads() {
     assert_eq!(count(&ha, "POST /api/services/weather/get_forecasts"), 1);
     assert_eq!(forecast[0].weather.temperature, Some(2.0));
     assert_eq!(
-        count(&ha, "POST /api/services/climate"),
-        0,
+        count(&ha, "POST /api/services"),
+        1,
         "{:?}",
         ha.requests.lock().unwrap()
     );
