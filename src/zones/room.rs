@@ -28,7 +28,7 @@ pub enum Facing {
 /// What the smart decisions know about a room. The defaults behave close to today. Wind
 /// exposure is the zone's existing `wind_exposure`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct Room {
     /// The sides the room faces; none means wind and sun direction are ignored
     pub faces: Vec<Facing>,
@@ -155,5 +155,11 @@ mod tests {
             assert!(error.starts_with(field), "{error}");
         }
         assert!(serde_json::from_value::<Room>(json!({"faces": ["NE"]})).is_err());
+        // A misspelt field is refused, rather than resetting the room to its defaults
+        let typo = serde_json::from_value::<Room>(json!({"setback": 12})).unwrap_err();
+        assert!(
+            typo.to_string().contains("unknown field `setback`"),
+            "{typo}"
+        );
     }
 }
