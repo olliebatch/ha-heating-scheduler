@@ -545,6 +545,7 @@ mod tests {
         state.weather.write().unwrap().weather = Some(crate::weather::Weather {
             temperature: Some(-5.0),
             wind_speed: Some(50.0),
+            wind_bearing: None,
             cloud_coverage: Some(100.0),
         });
         let views = get_zones(State(state.clone())).await.0;

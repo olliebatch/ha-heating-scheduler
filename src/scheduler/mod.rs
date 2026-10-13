@@ -9,7 +9,9 @@ use crate::weather::adjust::{Reason, adjust_target};
 use crate::weather::early::{EarlyStart, continue_early_start, early_start};
 use crate::weather::late::{LateFinish, continue_late_finish, late_finish};
 use crate::weather::warmup::{WarmUp, continue_warm_up, warm_up};
-use crate::weather::{Held, KEEP_READING_FOR, Weather, WeatherSource, WeatherStatus};
+use crate::weather::{
+    FORECAST_EVERY, Held, KEEP_READING_FOR, Weather, WeatherSource, WeatherStatus,
+};
 use crate::zones::{Zone, Zones};
 use crate::{ScheduleState, WeatherState, ZonesState};
 use chrono::{Local, NaiveTime};
@@ -520,6 +522,45 @@ pub async fn read_weather(
     }
 }
 
+/// Read the hourly forecast into `status` when the last attempt is [`FORECAST_EVERY`] old (or
+/// there hasn't been one), so Home Assistant is asked at most twice an hour. A failed read keeps
+/// the last forecast, minus the hours that have passed.
+pub async fn read_forecast(
+    status: &WeatherState,
+    source: &dyn WeatherSource,
+    now: chrono::DateTime<Local>,
+) {
+    let entity_id = {
+        let status = status.read().unwrap();
+        let due = status
+            .forecast_tried_at
+            .is_none_or(|at| now - at >= FORECAST_EVERY);
+        match &status.entity_id {
+            Some(id) if due => id.clone(),
+            _ => return,
+        }
+    };
+    let result = source.fetch_forecast(&entity_id).await;
+    let mut status = status.write().unwrap();
+    // The entity was changed while the forecast was read: it's for the old one
+    if status.entity_id.as_deref() != Some(entity_id.as_str()) {
+        return;
+    }
+    status.forecast_tried_at = Some(now);
+    match result {
+        Ok(forecast) => {
+            status.forecast = forecast;
+            status.forecast_error = None;
+        }
+        Err(e) => {
+            eprintln!("Failed to read the forecast, keeping the last one: {}", e);
+            status.forecast_error = Some(e.to_string());
+            let this_hour = now.to_utc() - chrono::TimeDelta::hours(1);
+            status.forecast.retain(|h| h.at > this_hour);
+        }
+    }
+}
+
 /// Why an entity is being set the way it is, e.g. "Lounge: 20 °C scheduled, +1.5 cold = 21.5 °C"
 pub fn call_context(zone: Option<&str>, status: &ZoneStatus, boosted: bool) -> String {
     let zone = zone.unwrap_or("no zone");
@@ -612,6 +653,7 @@ pub async fn run_scheduler<T: ClimateEntity + Clone>(state: SchedulerState<T>) {
 
         // Read the weather once per tick; without it, targets aren't adjusted
         let weather = read_weather(&state.weather, state.weather_source.as_ref(), now).await;
+        read_forecast(&state.weather, state.weather_source.as_ref(), now).await;
 
         // What each entity's zone schedule asks for right now, and why (for the dry-run log)
         let (scheduled, contexts, default_target_temp): (Vec<Scheduled>, Vec<String>, f64) = {
@@ -1063,6 +1105,7 @@ mod tests {
         Weather {
             temperature: Some(-5.0),
             wind_speed: Some(50.0),
+            wind_bearing: None,
             cloud_coverage: Some(100.0),
         }
     }
@@ -1148,6 +1191,49 @@ mod tests {
         async fn fetch(&self, _entity_id: Option<&str>) -> anyhow::Result<Option<Weather>> {
             Err(anyhow::anyhow!("HA unreachable"))
         }
+        async fn fetch_forecast(
+            &self,
+            _entity_id: &str,
+        ) -> anyhow::Result<Vec<crate::weather::ForecastHour>> {
+            Err(anyhow::anyhow!("HA unreachable"))
+        }
+    }
+
+    #[tokio::test]
+    async fn test_forecast_is_read_twice_an_hour_and_kept_while_reads_fail() {
+        let status: WeatherState = Default::default();
+        let mock = crate::weather::MockWeather::default();
+        *mock.weather.write().unwrap() = cold_and_windy();
+        let start = Local::now();
+        let at = |minutes| start + chrono::TimeDelta::minutes(minutes);
+        let forecast = |status: &WeatherState| status.read().unwrap().forecast.clone();
+
+        // No weather entity: nothing is asked
+        read_forecast(&status, &mock, at(0)).await;
+        assert!(forecast(&status).is_empty());
+        assert_eq!(status.read().unwrap().forecast_tried_at, None);
+
+        status.write().unwrap().entity_id = Some("weather.example".to_string());
+        read_forecast(&status, &mock, at(0)).await;
+        let first = forecast(&status);
+        assert_eq!(first.len(), 24);
+        assert_eq!(first[1].weather.temperature, Some(-5.5));
+
+        // Not due again for 30 minutes, even if it would fail
+        read_forecast(&status, &FailingWeather, at(29)).await;
+        assert_eq!(forecast(&status), first);
+        assert_eq!(status.read().unwrap().forecast_error, None);
+
+        // Due and failing: the hours still to come are kept, with the error
+        read_forecast(&status, &FailingWeather, at(150)).await;
+        let kept = forecast(&status);
+        assert!(kept.len() >= 21 && kept.len() < 24, "{}", kept.len());
+        assert_eq!(kept.last(), first.last());
+        assert!(status.read().unwrap().forecast_error.is_some());
+
+        read_forecast(&status, &mock, at(180)).await;
+        assert_eq!(forecast(&status).len(), 24);
+        assert_eq!(status.read().unwrap().forecast_error, None);
     }
 
     #[tokio::test]
@@ -1357,6 +1443,7 @@ mod tests {
         Weather {
             temperature: Some(-2.0),
             wind_speed: Some(0.0),
+            wind_bearing: None,
             cloud_coverage: Some(100.0),
         }
     }

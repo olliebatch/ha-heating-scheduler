@@ -1,6 +1,6 @@
 use crate::api_client::ApiClient;
 use anyhow::{Context, Result, anyhow};
-use chrono::{DateTime, Local};
+use chrono::{DateTime, Local, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
@@ -13,20 +13,40 @@ pub mod early;
 pub mod late;
 pub mod warmup;
 
-/// Outside conditions, in °C, km/h and percent. Any of them can be missing.
+/// Outside conditions, in °C, km/h, degrees and percent. Any of them can be missing.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Weather {
     pub temperature: Option<f64>,
     pub wind_speed: Option<f64>,
+    /// The direction the wind blows from, in degrees clockwise from north (0 is a north wind)
+    #[serde(default)]
+    pub wind_bearing: Option<f64>,
     pub cloud_coverage: Option<f64>,
 }
+
+/// The weather forecast for the hour starting at `at`
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ForecastHour {
+    pub at: DateTime<Utc>,
+    #[serde(flatten)]
+    pub weather: Weather,
+}
+
+/// How long an hourly forecast is used before it's read again
+pub const FORECAST_EVERY: chrono::TimeDelta = chrono::TimeDelta::minutes(30);
 
 /// Where the scheduler reads the weather from
 #[async_trait::async_trait]
 pub trait WeatherSource: Send + Sync {
     /// The current weather, or None when no weather entity is configured
     async fn fetch(&self, entity_id: Option<&str>) -> Result<Option<Weather>>;
+    /// The hourly forecast, soonest first
+    async fn fetch_forecast(&self, entity_id: &str) -> Result<Vec<ForecastHour>>;
 }
+
+/// The service call that returns a weather entity's forecast. It changes nothing, so a dry run
+/// still makes it (see `dry_run::is_read`).
+pub const FORECAST_ENDPOINT: &str = "/api/services/weather/get_forecasts?return_response";
 
 /// Reads a Home Assistant weather entity (`GET /api/states/<entity>`)
 pub struct HomeAssistantWeather {
@@ -48,6 +68,58 @@ impl WeatherSource for HomeAssistantWeather {
             .await?;
         parse_weather_state(&state).map(Some)
     }
+
+    async fn fetch_forecast(&self, entity_id: &str) -> Result<Vec<ForecastHour>> {
+        // The forecast is in the entity's units, which only its state gives
+        let state: Value = self
+            .api_client
+            .get(&format!("/api/states/{}", entity_id))
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        let response: Value = self
+            .api_client
+            .post(
+                FORECAST_ENDPOINT,
+                &serde_json::json!({ "entity_id": entity_id, "type": "hourly" }),
+            )
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        parse_forecast(&response, entity_id, &state)
+    }
+}
+
+/// Read the hourly forecast from a `weather.get_forecasts` response, in the units `state` (the
+/// entity's state) gives. Hours without a readable time are skipped.
+pub fn parse_forecast(
+    response: &Value,
+    entity_id: &str,
+    state: &Value,
+) -> Result<Vec<ForecastHour>> {
+    let units = state
+        .get("attributes")
+        .ok_or_else(|| anyhow!("Weather state has no attributes"))?;
+    let hours = response
+        .pointer(&format!("/service_response/{entity_id}/forecast"))
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow!("No hourly forecast for {entity_id}"))?;
+    let mut forecast: Vec<ForecastHour> = hours
+        .iter()
+        .filter_map(|hour| {
+            let at = hour.get("datetime")?.as_str()?;
+            let at = DateTime::parse_from_rfc3339(at).ok()?.with_timezone(&Utc);
+            let condition = hour.get("condition").and_then(Value::as_str);
+            Some(ForecastHour {
+                at,
+                weather: read_conditions(hour, units, condition),
+            })
+        })
+        .collect();
+    forecast.sort_by_key(|h| h.at);
+    Ok(forecast)
 }
 
 /// Read a weather entity's state. Uses the standard attributes `temperature`, `wind_speed`
@@ -58,8 +130,15 @@ pub fn parse_weather_state(state: &Value) -> Result<Weather> {
     let attributes = state
         .get("attributes")
         .ok_or_else(|| anyhow!("Weather state has no attributes"))?;
-    let number = |key: &str| attributes.get(key).and_then(Value::as_f64);
-    let unit = |key: &str| attributes.get(key).and_then(Value::as_str).unwrap_or("");
+    let condition = state.get("state").and_then(Value::as_str);
+    Ok(read_conditions(attributes, attributes, condition))
+}
+
+/// The conditions in `values` (a state's attributes or one forecast hour), converted from the
+/// units in `units` (the state's attributes). `wind_bearing` is degrees or a compass point.
+fn read_conditions(values: &Value, units: &Value, condition: Option<&str>) -> Weather {
+    let number = |key: &str| values.get(key).and_then(Value::as_f64);
+    let unit = |key: &str| units.get(key).and_then(Value::as_str).unwrap_or("");
 
     let temperature = number("temperature").map(|t| match unit("temperature_unit") {
         "°F" => (t - 32.0) * 5.0 / 9.0,
@@ -71,20 +150,34 @@ pub fn parse_weather_state(state: &Value) -> Result<Weather> {
         "kn" => w * 1.852,
         _ => w,
     });
-    let cloud_coverage =
-        number("cloud_coverage").or_else(|| match state.get("state").and_then(Value::as_str)? {
-            "sunny" | "clear-night" => Some(0.0),
-            "partlycloudy" => Some(50.0),
-            "cloudy" | "fog" | "rainy" | "pouring" | "snowy" | "snowy-rainy" | "hail"
-            | "lightning" | "lightning-rainy" => Some(100.0),
-            _ => None,
-        });
+    let wind_bearing = number("wind_bearing")
+        .or_else(|| compass_degrees(values.get("wind_bearing")?.as_str()?))
+        .map(|b| b.rem_euclid(360.0));
+    let cloud_coverage = number("cloud_coverage").or_else(|| match condition? {
+        "sunny" | "clear-night" => Some(0.0),
+        "partlycloudy" => Some(50.0),
+        "cloudy" | "fog" | "rainy" | "pouring" | "snowy" | "snowy-rainy" | "hail" | "lightning"
+        | "lightning-rainy" => Some(100.0),
+        _ => None,
+    });
 
-    Ok(Weather {
+    Weather {
         temperature,
         wind_speed,
+        wind_bearing,
         cloud_coverage,
-    })
+    }
+}
+
+/// A compass point ("N", "ENE", "sw", ...) in degrees
+fn compass_degrees(point: &str) -> Option<f64> {
+    const POINTS: [&str; 16] = [
+        "N", "NNE", "NE", "ENE", "E", "ESE", "SE", "SSE", "S", "SSW", "SW", "WSW", "W", "WNW",
+        "NW", "NNW",
+    ];
+    let point = point.trim().to_uppercase();
+    let i = POINTS.iter().position(|p| *p == point)?;
+    Some(i as f64 * 22.5)
 }
 
 /// Weather set by hand, for tests and debug mode (ignores the entity id)
@@ -97,6 +190,22 @@ pub struct MockWeather {
 impl WeatherSource for MockWeather {
     async fn fetch(&self, _entity_id: Option<&str>) -> Result<Option<Weather>> {
         Ok(Some(self.weather.read().unwrap().clone()))
+    }
+
+    /// The next 24 hours, starting this hour: the mock weather, 0.5 °C colder each hour
+    async fn fetch_forecast(&self, _entity_id: &str) -> Result<Vec<ForecastHour>> {
+        let now = Utc::now();
+        let hour = now - chrono::TimeDelta::seconds(now.timestamp().rem_euclid(3600));
+        let weather = self.weather.read().unwrap().clone();
+        Ok((0..24)
+            .map(|h| ForecastHour {
+                at: hour + chrono::TimeDelta::hours(h),
+                weather: Weather {
+                    temperature: weather.temperature.map(|t| t - 0.5 * h as f64),
+                    ..weather.clone()
+                },
+            })
+            .collect())
     }
 }
 
@@ -117,6 +226,12 @@ pub struct WeatherStatus {
     pub read_at: Option<DateTime<Local>>,
     /// Why the last read failed, if it did
     pub error: Option<String>,
+    /// The hourly forecast, soonest first; the last one read is kept while reads fail
+    pub forecast: Vec<ForecastHour>,
+    /// When the forecast was last asked for, read or not
+    pub forecast_tried_at: Option<DateTime<Local>>,
+    /// Why the last forecast read failed, if it did
+    pub forecast_error: Option<String>,
     /// The adjusted target each zone is held at, by zone id (see `scheduler::zone_status`)
     #[serde(skip)]
     pub held: HashMap<uuid::Uuid, Held>,
@@ -186,6 +301,7 @@ mod tests {
             Weather {
                 temperature: Some(3.5),
                 wind_speed: Some(30.0),
+                wind_bearing: None,
                 cloud_coverage: Some(40.0),
             }
         );
@@ -214,6 +330,52 @@ mod tests {
         assert_eq!(parse_weather_state(&state).unwrap(), Weather::default());
 
         assert!(parse_weather_state(&json!({"state": "sunny"})).is_err());
+    }
+
+    #[test]
+    fn test_parse_wind_bearing() {
+        let bearing = |b: Value| {
+            parse_weather_state(&json!({"state": "sunny", "attributes": {"wind_bearing": b}}))
+                .unwrap()
+                .wind_bearing
+        };
+        assert_eq!(bearing(json!(225.0)), Some(225.0));
+        assert_eq!(bearing(json!(360)), Some(0.0));
+        assert_eq!(bearing(json!("NE")), Some(45.0));
+        assert_eq!(bearing(json!("wsw")), Some(247.5));
+        assert_eq!(bearing(json!("somewhere")), None);
+    }
+
+    #[test]
+    fn test_parse_forecast_in_the_entitys_units() {
+        let state = json!({
+            "state": "cloudy",
+            "attributes": {"temperature_unit": "°F", "wind_speed_unit": "mph"}
+        });
+        let response = json!({
+            "changed_states": [],
+            "service_response": {"weather.example": {"forecast": [
+                {"datetime": "2026-10-13T16:00:00+00:00", "temperature": 41.0, "wind_speed": 10.0,
+                 "wind_bearing": "N", "condition": "sunny"},
+                {"datetime": "not a time", "temperature": 50.0},
+                {"datetime": "2026-10-13T16:00:00+01:00", "temperature": 32.0, "cloud_coverage": 20}
+            ]}}
+        });
+
+        let forecast = parse_forecast(&response, "weather.example", &state).unwrap();
+
+        // Soonest first, the unreadable hour skipped
+        assert_eq!(forecast.len(), 2);
+        assert_eq!(forecast[0].at.to_rfc3339(), "2026-10-13T15:00:00+00:00");
+        assert_eq!(forecast[0].weather.temperature, Some(0.0));
+        assert_eq!(forecast[0].weather.cloud_coverage, Some(20.0));
+        let later = &forecast[1].weather;
+        assert!((later.temperature.unwrap() - 5.0).abs() < 1e-9);
+        assert!((later.wind_speed.unwrap() - 16.09344).abs() < 1e-9);
+        assert_eq!(later.wind_bearing, Some(0.0));
+        assert_eq!(later.cloud_coverage, Some(0.0), "from the condition");
+
+        assert!(parse_forecast(&response, "weather.other", &state).is_err());
     }
 
     #[test]

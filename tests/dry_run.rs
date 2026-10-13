@@ -45,6 +45,12 @@ async fn answer(State(ha): State<FakeHa>, method: Method, uri: Uri, _body: Bytes
         return json!({"state": "cloudy", "attributes": {"temperature": 4.0, "temperature_unit": "°C"}})
             .to_string();
     }
+    if path == "/api/services/weather/get_forecasts" && uri.query() == Some("return_response") {
+        return json!({"service_response": {"weather.home": {"forecast": [
+            {"datetime": "2026-10-13T16:00:00+00:00", "temperature": 2.0}
+        ]}}})
+        .to_string();
+    }
     "[]".to_string()
 }
 
@@ -133,16 +139,25 @@ async fn test_dry_run_sends_no_service_calls_but_still_reads() {
     .fetch(Some("weather.home"))
     .await
     .unwrap();
+    let forecast = HomeAssistantWeather {
+        api_client: client(),
+    }
+    .fetch_forecast("weather.home")
+    .await
+    .unwrap();
 
+    // The forecast is a service call, but only a read, so it's the one that's made
+    assert_eq!(count(&ha, "POST /api/services/weather/get_forecasts"), 1);
+    assert_eq!(forecast[0].weather.temperature, Some(2.0));
     assert_eq!(
-        count(&ha, "POST /api/services"),
+        count(&ha, "POST /api/services/climate"),
         0,
         "{:?}",
         ha.requests.lock().unwrap()
     );
     assert_eq!(count(&ha, "GET /api/states/climate.lounge_trv"), 5);
     assert_eq!(count(&ha, "POST /api/template"), 1);
-    assert_eq!(count(&ha, "GET /api/states/weather.home"), 1);
+    assert_eq!(count(&ha, "GET /api/states/weather.home"), 2);
     assert_eq!(weather.unwrap().temperature, Some(4.0));
 
     // One entry per change, newest first, however many ticks asked for it
