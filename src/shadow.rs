@@ -77,13 +77,13 @@ pub fn zone_tick(
     })
 }
 
-/// Whether every one of the zone's entities has been read, so its room temperature is known (it
-/// isn't on the first tick after a start)
+/// Whether any of the zone's entities has been read, so its room temperature is known (it isn't
+/// on the first tick after a start). One that never reads doesn't hold the zone up.
 pub fn zone_read<T: ClimateEntity>(zone: &Zone, entities: &[T]) -> bool {
     entities
         .iter()
         .filter(|e| zone.entity_ids.iter().any(|id| id == e.get_entity_id()))
-        .all(|e| e.get_cached_state().is_some())
+        .any(|e| e.get_cached_state().is_some())
 }
 
 /// The room temperature: the zone's sensor reading when there is one, else the average of its
@@ -630,6 +630,8 @@ mod tests {
         assert!(zone_read(&zone, &trvs));
         let mut unread = trv("climate.a", 18.0);
         unread.info = None;
-        assert!(!zone_read(&zone, &[unread]));
+        assert!(!zone_read(&zone, std::slice::from_ref(&unread)));
+        // One radiator that never reads doesn't hold the zone up
+        assert!(zone_read(&zone, &[unread, trv("climate.b", 19.0)]));
     }
 }

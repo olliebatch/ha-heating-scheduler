@@ -631,11 +631,12 @@ pub fn call_context(zone: Option<&str>, status: &ZoneStatus, boosted: bool) -> S
     format!("{zone}: {why}")
 }
 
-/// A smart zone that can't decide yet because its radiators haven't been read (the first tick
-/// after a start). Its entities are only read that tick: falling back to the schedule could turn
-/// off a warm-up that's under way.
-pub fn smart_waiting<T: ClimateEntity>(zone: &Zone, entities: &[T]) -> bool {
-    zone.mode == crate::zones::room::ZoneMode::Smart && !crate::shadow::zone_read(zone, entities)
+/// A smart zone on the first tick after a start, when it can't decide yet because nothing has
+/// been read. Its entities are only read that tick: falling back to the schedule could turn off a
+/// warm-up that's under way. From the next tick it decides, or (with no room temperature at all)
+/// follows its schedule, so a radiator that never reads can't stop the zone being heated.
+pub fn smart_waiting(zone: &Zone, first_tick: bool) -> bool {
+    first_tick && zone.mode == crate::zones::room::ZoneMode::Smart
 }
 
 /// The decisions that heat their zones: smart zones' only, never shadow zones'
@@ -734,6 +735,7 @@ pub async fn run_scheduler<T: ClimateEntity + Clone>(state: SchedulerState<T>) {
 
     println!("\n=== Heating Scheduler Started ===");
 
+    let mut first_tick = true;
     loop {
         interval.tick().await;
 
@@ -810,7 +812,7 @@ pub async fn run_scheduler<T: ClimateEntity + Clone>(state: SchedulerState<T>) {
                             smart_context(name, decision, boosted),
                         );
                     }
-                    if zone.is_some_and(|z| smart_waiting(z, &entities_clone)) {
+                    if zone.is_some_and(|z| smart_waiting(z, first_tick)) {
                         return (
                             None,
                             format!("{}: smart, reading the room", name.unwrap_or("no zone")),
@@ -877,6 +879,7 @@ pub async fn run_scheduler<T: ClimateEntity + Clone>(state: SchedulerState<T>) {
         if let Ok(mut climates) = state.climate_entities.write() {
             merge_tick_results(&mut climates, &entities_clone, &boosts_at_start);
         }
+        first_tick = false;
     }
 }
 
@@ -1249,22 +1252,21 @@ mod tests {
     }
 
     #[test]
-    fn test_a_smart_zone_waits_for_its_radiators_to_be_read() {
+    fn test_a_smart_zone_waits_only_on_the_first_tick() {
         use crate::zones::room::ZoneMode;
         let mut zones = Zones::default();
         zones.reconcile(None, &["climate.test".to_string()]);
         let mut zone = zones.zones[0].clone();
-        let mut unread = mock(HeatingState::On);
-        unread.info = None;
-        let read = mock(HeatingState::On);
-
         zone.mode = ZoneMode::Smart;
-        assert!(smart_waiting(&zone, std::slice::from_ref(&unread)));
-        assert!(!smart_waiting(&zone, std::slice::from_ref(&read)));
+        assert!(smart_waiting(&zone, true));
+        assert!(
+            !smart_waiting(&zone, false),
+            "after that, never: a dead TRV can't stop it"
+        );
         // Schedule and shadow zones follow the schedule from the first tick
         for mode in [ZoneMode::Schedule, ZoneMode::Shadow] {
             zone.mode = mode;
-            assert!(!smart_waiting(&zone, std::slice::from_ref(&unread)));
+            assert!(!smart_waiting(&zone, true));
         }
     }
 

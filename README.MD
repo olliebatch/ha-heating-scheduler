@@ -145,7 +145,7 @@ no setting. A boost or an On period takes precedence.
   didn't reach the target before the comfort time ended) and `at`. Stored in `data/decisions.jsonl`, the last 2000
   entries
 
-Shadow mode: a zone in `shadow` (or `smart`) mode gets the smart decision every tick, once its TRVs have been read
+Shadow mode: a zone in `shadow` (or `smart`) mode gets the smart decision every tick, once any of its TRVs has been read
 (not on the first tick after a start). In `shadow` nothing is sent from it: the schedule still drives the TRVs. A comfort time is one of the zone's schedule's On periods. The decision looks at
 the room temperature (the zone's sensor, or the average of its TRVs), the forecast for the comfort time's start, wind
 on the sides the room faces, sun while the sun is up (sunrise and sunset from `sun.sun`, read with the forecast) and
@@ -157,7 +157,7 @@ a restart, say) has none.
 Smart mode: a zone in `smart` mode is heated by its decision instead of its schedule: On at the decision's target to
 heat (the comfort time's target, or the setback between comfort times), Off otherwise. Its early start, late finish
 and cold-day warm-ups don't apply; the decision's lead replaces them. A boost still wins, and the frost floor still
-heats a room Smart leaves off below 7 °C. Without a room temperature or a weather reading, it heats during comfort times
+heats a room Smart leaves off below 7 °C. On the first tick after a start, before anything has been read, a smart zone's TRVs are only read, so a warm-up under way isn't turned off; from then on a zone with no room temperature at all follows its schedule. Without a room temperature or a weather reading, it heats during comfort times
 and is off (or at the setback) between them, as the schedule would without weather adjust. A smart zone's `status`
 in `GET /zones` is still what its schedule would do; `decision` is what it does. A zone whose schedule has no On period
 stays off Debug builds' mock TRVs warm while On and cool while Off, so decisions change
