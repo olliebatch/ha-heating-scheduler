@@ -631,6 +631,22 @@ pub fn call_context(zone: Option<&str>, status: &ZoneStatus, boosted: bool) -> S
     format!("{zone}: {why}")
 }
 
+/// The decisions that heat their zones: smart zones' only, never shadow zones'
+pub fn acting_decisions(
+    zones: &Zones,
+    ticks: &HashMap<Uuid, crate::shadow::Tick>,
+) -> HashMap<Uuid, crate::smart::Decision> {
+    ticks
+        .iter()
+        .filter(|(id, _)| {
+            zones
+                .get(**id)
+                .is_some_and(|z| z.mode == crate::zones::room::ZoneMode::Smart)
+        })
+        .map(|(id, t)| (*id, t.decision.decision.clone()))
+        .collect()
+}
+
 /// What a smart zone's decision asks of its entities: On at the decision's target to heat, else Off
 pub fn smart_scheduled(decision: &crate::smart::Decision) -> Scheduled {
     match (decision.action, decision.target) {
@@ -764,15 +780,7 @@ pub async fn run_scheduler<T: ClimateEntity + Clone>(state: SchedulerState<T>) {
                 })
                 .collect::<HashMap<Uuid, crate::shadow::Tick>>();
             // Smart zones are heated by their decision; shadow zones only log theirs
-            let acting: HashMap<Uuid, crate::smart::Decision> = ticks
-                .iter()
-                .filter(|(id, _)| {
-                    zones
-                        .get(**id)
-                        .is_some_and(|z| z.mode == crate::zones::room::ZoneMode::Smart)
-                })
-                .map(|(id, t)| (*id, t.decision.decision.clone()))
-                .collect();
+            let acting = acting_decisions(&zones, &ticks);
             shadow.record(ticks);
             drop(shadow);
             let no_zone = zone_status(None, &sets, weather.as_ref(), None, None, &now);
@@ -1166,6 +1174,57 @@ mod tests {
         .await;
         assert_eq!(*entity.mode.lock().unwrap(), Some(HeatingState::On));
         assert_eq!(sent(&entity).last(), Some(&FROST_TARGET_C));
+    }
+
+    #[tokio::test]
+    async fn test_only_smart_zones_act_on_their_decisions() {
+        use crate::zones::room::ZoneMode;
+        let mut zones = Zones::default();
+        zones.reconcile(None, &["climate.a".to_string()]);
+        zones
+            .create_manual(
+                "Loft",
+                &["climate.a".to_string()],
+                &["climate.a".to_string()],
+            )
+            .unwrap();
+        let ids: Vec<Uuid> = zones.zones.iter().map(|z| z.id).collect();
+        let zone_tick = || crate::shadow::Tick {
+            decision: crate::shadow::ZoneDecision {
+                at: Local::now(),
+                room_c: Some(18.0),
+                schedule_start: NaiveTime::from_hms_opt(17, 0, 0).unwrap(),
+                decision: smart_decision(crate::smart::Action::Heat),
+            },
+            inside: false,
+            schedule_heating: false,
+        };
+        let ticks: HashMap<Uuid, crate::shadow::Tick> =
+            ids.iter().map(|id| (*id, zone_tick())).collect();
+        let (shadow, smart) = (ids[0], ids[1]);
+        zones.zones[0].mode = ZoneMode::Shadow;
+        zones.zones[1].mode = ZoneMode::Smart;
+
+        let acting = acting_decisions(&zones, &ticks);
+        assert!(
+            !acting.contains_key(&shadow),
+            "a shadow zone never heats from its decision"
+        );
+        assert!(acting.contains_key(&smart));
+
+        // A tick for each zone's TRV, the schedule Off: the shadow zone's sends nothing, though
+        // its decision is Heat; the smart zone's heats
+        let schedule_off = scheduled(HeatingState::Off, None);
+        for (zone, heats) in [(shadow, false), (smart, true)] {
+            let mut trv = mock(HeatingState::Off);
+            let mut last = None;
+            let wanted = acting
+                .get(&zone)
+                .map_or(schedule_off.clone(), smart_scheduled);
+            tick(&mut trv, &wanted, &mut last).await;
+            assert_eq!(!sent(&trv).is_empty(), heats);
+            assert_eq!(*trv.mode.lock().unwrap() == Some(HeatingState::On), heats);
+        }
     }
 
     #[test]
