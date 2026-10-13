@@ -1,16 +1,17 @@
 //! The smart decision: when to start heating for a zone's next comfort time (one of its schedule's
 //! On periods), whether it needs heating at all, and every number that went into it. A pure
-//! function of its inputs; nothing calls it yet.
+//! function of its inputs; shadow and smart zones get one each tick (see `shadow`), and nothing is
+//! sent from it yet.
 
 use crate::schedule::{HeatingState, Schedule, TimePeriod};
 use crate::weather::adjust::WindExposure;
 use crate::weather::{ForecastHour, Weather};
 use crate::zones::room::{Facing, Room};
 use chrono::{DateTime, Local, NaiveTime, TimeDelta, Timelike};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 /// One of the schedule's On periods: the room should be at `target` from `start` to `end`
-#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct ComfortTime {
     pub start: NaiveTime,
     pub end: NaiveTime,
@@ -72,9 +73,13 @@ pub struct Inputs<'a> {
     pub daylight: Option<TimePeriod>,
     /// The most minutes heating may start before a comfort time
     pub max_early_minutes: u32,
+    /// The zone's decision on the last tick, if there was one, so a decision isn't undone by a
+    /// small change: heating that has begun for a comfort time keeps going until it starts, and
+    /// once heating isn't needed it stays so until the room is [`HYSTERESIS_C`] below the target
+    pub previous: Option<&'a Decision>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Action {
     /// Heat to the decision's target
@@ -86,7 +91,7 @@ pub enum Action {
 }
 
 /// One number that went into a decision, for the "why"
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Factor {
     /// The outside temperature at the comfort time's start: from the forecast, or else now
@@ -118,7 +123,7 @@ pub enum Factor {
     NoRoomTemperature,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Decision {
     pub action: Action,
     /// The temperature to heat to (Heat only)
@@ -129,6 +134,10 @@ pub struct Decision {
     pub reasons: Vec<Factor>,
 }
 
+/// The most minutes a smart decision may start heating before a comfort time
+pub const SMART_MAX_EARLY_MINUTES: u32 = 120;
+/// How far (°C) below the target a room that didn't need heating may drop before it does
+pub const HYSTERESIS_C: f64 = 0.5;
 /// Minutes added to every lead, so the room is there by the start rather than just reaching it
 pub const MARGIN_MINUTES: u32 = 10;
 /// °C taken off per km/h of wind square onto the room
@@ -304,8 +313,19 @@ pub fn decide(inputs: &Inputs) -> Decision {
     reasons.push(Factor::FeelsLike { c: feels_like });
     reasons.push(Factor::Indoors { c: room_c });
 
-    // Warm and mild enough to stay warm: no need to heat for this comfort time yet
-    let warm = room_c >= comfort.target && feels_like >= comfort.target - MILD_WITHIN_C;
+    // Warm and mild enough to stay warm: no need to heat for this comfort time yet. Once that's
+    // decided it holds until the room is clearly below the target, so it doesn't flip each tick.
+    let same = |action| {
+        inputs
+            .previous
+            .is_some_and(|p| p.action == action && p.comfort == comfort)
+    };
+    let warm_from = if same(Action::NotNeeded) {
+        comfort.target - HYSTERESIS_C
+    } else {
+        comfort.target
+    };
+    let warm = room_c >= warm_from && feels_like >= comfort.target - MILD_WITHIN_C;
 
     if inputs.inside {
         return scheduled(
@@ -335,8 +355,25 @@ pub fn decide(inputs: &Inputs) -> Decision {
     });
     let start_at = comfort.start - TimeDelta::minutes(i64::from(lead));
 
+    // Heating that has begun for this comfort time keeps going, from when it began, even though
+    // the lead shrinks as the room warms
+    let begun = inputs.previous.filter(|p| {
+        same(Action::Heat)
+            && !p
+                .reasons
+                .iter()
+                .any(|r| matches!(r, Factor::Setback { .. }))
+    });
     // (A warm room needs no lead, so it waits for the comfort time to start)
-    if lead > 0 && until_start <= i64::from(lead) * 60 {
+    if let Some(begun) = begun {
+        Decision {
+            action: Action::Heat,
+            target: Some(comfort.target),
+            start_at: begun.start_at,
+            comfort,
+            reasons,
+        }
+    } else if lead > 0 && until_start <= i64::from(lead) * 60 {
         Decision {
             action: Action::Heat,
             target: Some(comfort.target),
@@ -384,6 +421,7 @@ mod tests {
         room: Room,
         exposure: WindExposure,
         daylight: Option<TimePeriod>,
+        previous: Option<Decision>,
     }
 
     impl Case {
@@ -398,6 +436,7 @@ mod tests {
                 exposure: WindExposure::Medium,
                 // A January day
                 daylight: Some(TimePeriod::new(8, 0, 16, 0)),
+                previous: None,
             }
         }
         fn decide(&self, comfort: ComfortTime) -> Decision {
@@ -413,6 +452,7 @@ mod tests {
                 sun_windows: &[],
                 daylight: self.daylight,
                 max_early_minutes: 120,
+                previous: self.previous.as_ref(),
             })
         }
         fn evening(&self) -> Decision {
@@ -573,6 +613,7 @@ mod tests {
                 sun_windows: &window,
                 daylight,
                 max_early_minutes: 120,
+                previous: None,
             })
             .action
         };
@@ -672,6 +713,44 @@ mod tests {
         let d = case.evening();
         assert_eq!((d.action, d.target), (Action::Heat, Some(15.0)));
         assert_eq!(d.reasons.last(), Some(&Setback { c: 15.0 }));
+    }
+
+    #[test]
+    fn test_not_needed_holds_until_the_room_is_clearly_below_the_target() {
+        let mut case = Case::new(at(18, 0), 20.0, weather(16.0, 0.0, None, 100.0));
+        case.inside = true;
+        let not_needed = case.evening();
+        assert_eq!(not_needed.action, Action::NotNeeded);
+
+        case.room_c = Some(19.7);
+        assert_eq!(case.evening().action, Action::Heat);
+        case.previous = Some(not_needed);
+        assert_eq!(case.evening().action, Action::NotNeeded);
+        case.room_c = Some(19.4);
+        assert_eq!(case.evening().action, Action::Heat);
+    }
+
+    #[test]
+    fn test_heating_that_has_begun_keeps_going_until_the_start() {
+        // 16:00, 2 °C outside, room 17 °C: heating begins
+        let mut case = Case::new(at(16, 0), 17.0, weather(2.0, 0.0, None, 100.0));
+        let begun = case.evening();
+        assert_eq!(begun.action, Action::Heat);
+
+        // 16:40 and nearly there: a fresh decision would wait, but heating carries on from when
+        // it began
+        case.now = at(16, 40);
+        case.room_c = Some(19.9);
+        assert_eq!(case.evening().action, Action::Off);
+        case.previous = Some(begun.clone());
+        let d = case.evening();
+        assert_eq!((d.action, d.start_at), (Action::Heat, begun.start_at));
+
+        // Not for a different comfort time, or a setback
+        let mut setback = begun.clone();
+        setback.reasons.push(Setback { c: 15.0 });
+        case.previous = Some(setback);
+        assert_eq!(case.evening().action, Action::Off);
     }
 
     #[test]

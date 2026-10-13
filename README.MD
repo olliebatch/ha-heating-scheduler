@@ -122,13 +122,33 @@ no setting. A boost or an On period takes precedence.
   "sun_gain": 0.5, "heat_loss": 0.5, "warm_rate_c_per_hour": 1.5, "setback_c": null, "sensor_entity_id": null}` (the
   defaults; fields left out get them). `faces` is any of N/E/S/W, `sun_gain` (none to lots) and `heat_loss` (well
   insulated to draughty) are 0-1, `warm_rate_c_per_hour` 0.5-4, `setback_c` null or 10-18 °C, and
-  `sensor_entity_id` null (use the TRVs) or a `sensor.*` entity. Anything else is a 400 naming the field. Nothing
-  reads `mode` or `room` yet: every zone is still heated by its schedule
+  `sensor_entity_id` null (use the TRVs) or a `sensor.*` entity. Anything else is a 400 naming the field. Every zone
+  is still heated by its schedule; shadow and smart zones get a smart decision alongside (below)
 - `GET /zones` includes each zone's `status`: `state`, `scheduled_target`, adjusted `target`, `reasons`,
   `raw_target` (before clamping, rounding and holding), `held` and `early_start` (`period_start`, `lead_minutes`
   allowed by the weather, `minutes_early` it actually started, and `causes`) while a period is being started early, and
   `late_finish` (`period_end`, `extra_minutes`, `causes`) while one is kept going past its end, and `warm_up`
   (`started_at`, `until`, `outside_c`) during a cold-day warm-up
+- `GET /zones` also includes each shadow or smart zone's `decision` from the latest tick (null for Schedule zones):
+  `at`, the `room_c` it used, `schedule_start` (when the schedule starts heating for the same comfort time, its early
+  start included once begun) and `decision`: `action` (`heat`, `off` or `not_needed`), `target`, `start_at`,
+  `comfort` (`start`, `end`, `target`) and `reasons`, each tagged by `kind` (`outside`, `wind`, `sun`, `feels_like`,
+  `indoors`, `warm_rate`, `lead`, `setback`, `no_weather`, `no_room_temperature`)
+- `GET /decisions?zone=<id>&since=<RFC 3339 time>` - The decisions log, oldest first (both filters optional): a
+  `{"kind": "decision", "zone_id", "decision"}` each time a zone's action, target, start or comfort time changes, and
+  a `{"kind": "outcome", "zone_id", "outcome"}` for each comfort time: `smart_start` (null when Smart found heating
+  wasn't needed), `schedule_start`, `room_c_at_heating_start`, `room_c_at_start`, `reached_at` (null if the room
+  didn't reach the target before the comfort time ended) and `at`. Stored in `data/decisions.jsonl`, the last 2000
+  entries
+
+Shadow mode: a zone in `shadow` (or `smart`) mode gets the smart decision every tick, but nothing is sent from it yet:
+the schedule still drives the TRVs. A comfort time is one of the zone's schedule's On periods. The decision looks at
+the room temperature (the zone's sensor, or the average of its TRVs), the forecast for the comfort time's start, wind
+on the sides the room faces, sun while the sun is up (sunrise and sunset from `sun.sun`, read with the forecast) and
+the room's warm rate, and starts heating up to 120 minutes early. Heating that has begun for a comfort time keeps going
+until it starts, and once heating isn't needed it stays so until the room is 0.5 °C below the target. The outcome
+of a comfort time is recorded once the room reaches the target, or when it ends; one first seen while under way (after
+a restart, say) has none. Debug builds' mock TRVs warm while On and cool while Off, so decisions change
 
 ### Schedule (active set)
 - `GET /schedule` - Get the active schedule

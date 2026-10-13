@@ -11,6 +11,7 @@ use ha_heating_scheduler::schedule::HeatingState;
 use ha_heating_scheduler::schedule::persistence;
 use ha_heating_scheduler::scheduler::{LastSentTargets, SchedulerState, run_scheduler};
 use ha_heating_scheduler::server::{AppState, start_server};
+use ha_heating_scheduler::shadow::Shadow;
 #[cfg(not(debug_assertions))]
 use ha_heating_scheduler::weather::HomeAssistantWeather;
 #[cfg(debug_assertions)]
@@ -21,7 +22,9 @@ use ha_heating_scheduler::zones::areas::HomeAssistantAreas;
 #[cfg(debug_assertions)]
 use ha_heating_scheduler::zones::areas::MockAreas;
 use ha_heating_scheduler::zones::areas::{AreaSource, DISCOVERY_TIMEOUT, fetch_areas_with_timeout};
-use ha_heating_scheduler::{ScheduleState, WeatherState, ZonesState, api_client, weather, zones};
+use ha_heating_scheduler::{
+    ScheduleState, ShadowState, WeatherState, ZonesState, api_client, weather, zones,
+};
 use std::path::Path;
 use std::sync::{Arc, RwLock};
 
@@ -56,6 +59,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let entities_file_path = data_dir.join("entities.json");
     let zones_file_path = data_dir.join("zones.json");
     let weather_file_path = data_dir.join("weather.json");
+    let decisions_file_path = data_dir.join("decisions.jsonl");
 
     let schedule_sets =
         persistence::load_or_migrate(&schedule_sets_file_path, &schedule_file_path)?;
@@ -69,7 +73,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .climate_entities
                     .into_iter()
                     .map(|entity_id| {
-                        ClimateEntityWrapper::Mock(MockClimate::new(entity_id, HeatingState::Off))
+                        ClimateEntityWrapper::Mock(MockClimate {
+                            warms: true,
+                            ..MockClimate::new(entity_id, HeatingState::Off)
+                        })
                     })
                     .collect(),
             ))
@@ -183,6 +190,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let schedule: ScheduleState = Arc::new(RwLock::new(schedule_sets));
     let last_sent_targets: LastSentTargets = Default::default();
+    let shadow: ShadowState = Arc::new(RwLock::new(Shadow::load(decisions_file_path)));
     let api_task = tokio::spawn(start_server(
         AppState {
             schedule: Arc::clone(&schedule),
@@ -197,6 +205,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             mock_weather,
             dry_run,
             last_sent_targets: Arc::clone(&last_sent_targets),
+            shadow: Arc::clone(&shadow),
         },
         port,
     ));
@@ -209,6 +218,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         weather_source,
         climate_entities: Arc::clone(&climate_entities),
         last_sent_targets,
+        shadow,
     }));
 
     tokio::try_join!(api_task, scheduler_task).unwrap();

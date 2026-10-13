@@ -595,6 +595,7 @@ mod tests {
             mock_weather: None,
             dry_run: None,
             last_sent_targets: Default::default(),
+            shadow: Default::default(),
         };
         (state, dir)
     }
@@ -1146,6 +1147,7 @@ mod tests {
             mock_weather: None,
             dry_run: None,
             last_sent_targets: state.last_sent_targets,
+            shadow: state.shadow,
         };
         (state, dir)
     }

@@ -38,6 +38,8 @@ pub struct AppState<T: ClimateEntity + Clone> {
     pub dry_run: Option<Arc<DryRun>>,
     /// Shared with the scheduler; adding or removing an entity forgets its entry
     pub last_sent_targets: crate::scheduler::LastSentTargets,
+    /// Shadow and smart zones' decisions and their log, kept by the scheduler
+    pub shadow: crate::ShadowState,
 }
 
 pub async fn start_server(app_state: AppState<ClimateEntityWrapper>, port: u16) {
@@ -102,7 +104,11 @@ pub async fn start_server(app_state: AppState<ClimateEntityWrapper>, port: u16) 
         )
         .route("/boost_all", post(boost_all::<ClimateEntityWrapper>))
         .route("/boost", post(boost::<ClimateEntityWrapper>))
-        .route("/dry_run", get(get_dry_run::<ClimateEntityWrapper>));
+        .route("/dry_run", get(get_dry_run::<ClimateEntityWrapper>))
+        .route(
+            "/decisions",
+            get(zones::get_decisions::<ClimateEntityWrapper>),
+        );
 
     // Set the mock weather by hand (debug builds only)
     #[cfg(debug_assertions)]

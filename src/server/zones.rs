@@ -2,14 +2,15 @@ use crate::climate::ClimateEntity;
 use crate::schedule::TimePeriod;
 use crate::scheduler::{ZoneStatus, zone_status};
 use crate::server::AppState;
+use crate::shadow::{Logged, ZoneDecision};
 use crate::weather::adjust::WindExposure;
 use crate::zones::areas::{DISCOVERY_TIMEOUT, fetch_areas_with_timeout};
 use crate::zones::{Zone, ZoneError, Zones, save_zones};
 use axum::Json;
 use axum::extract::rejection::JsonRejection;
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
-use chrono::Local;
+use chrono::{DateTime, Local};
 use serde::{Deserialize, Deserializer, Serialize};
 use uuid::Uuid;
 
@@ -68,6 +69,9 @@ pub struct ZoneView {
     #[serde(flatten)]
     pub zone: Zone,
     pub status: ZoneStatus,
+    /// What Smart would do (shadow) or is doing (smart) on the scheduler's latest tick; None for
+    /// a Schedule zone, or before the first tick
+    pub decision: Option<ZoneDecision>,
 }
 
 /// All zones, each with its current state, scheduled and adjusted target, and the reasons,
@@ -85,6 +89,7 @@ pub async fn get_zones<T: ClimateEntity + Clone>(
             status.begun.clone(),
         )
     };
+    let mut decisions = state.shadow.read().unwrap().decisions.clone();
     // Lock order everywhere: schedule sets, then zones
     let sets = state.schedule.read().unwrap();
     let zones = state.zones.read().unwrap();
@@ -102,9 +107,27 @@ pub async fn get_zones<T: ClimateEntity + Clone>(
                     begun.get(&zone.id),
                     &now,
                 ),
+                decision: decisions.remove(&zone.id),
             })
             .collect(),
     )
+}
+
+#[derive(Deserialize)]
+pub struct DecisionsQuery {
+    /// One zone's entries; leave out for every zone's
+    pub zone: Option<Uuid>,
+    /// Entries from this time on (RFC 3339)
+    pub since: Option<DateTime<Local>>,
+}
+
+/// The log of shadow and smart zones' decisions (each change) and comfort times' outcomes,
+/// oldest first, from decisions.jsonl (the last [`crate::shadow::LOG_CAP`] entries)
+pub async fn get_decisions<T: ClimateEntity + Clone>(
+    State(state): State<AppState<T>>,
+    Query(query): Query<DecisionsQuery>,
+) -> Json<Vec<Logged>> {
+    Json(state.shadow.read().unwrap().log(query.zone, query.since))
 }
 
 /// Ask Home Assistant for its areas again and rebuild the zones
@@ -325,6 +348,7 @@ mod tests {
             mock_weather: None,
             dry_run: None,
             last_sent_targets: Default::default(),
+            shadow: Default::default(),
         };
         (state, dir)
     }
@@ -647,6 +671,83 @@ mod tests {
         let json = serde_json::to_value(study_view).unwrap();
         assert_eq!(json["name"], "Study", "zone fields are flattened");
         assert_eq!(json["status"]["reasons"][0]["cause"], "cold");
+    }
+
+    #[tokio::test]
+    async fn test_decisions_on_zones_and_in_the_log() {
+        use crate::shadow::{Logged, Tick, ZoneDecision};
+        use crate::smart::{Action, ComfortTime, Decision};
+        let (state, _dir) = test_state();
+        let zones = refresh_zones(State(state.clone())).await.unwrap().0;
+        let study = zone_named(&zones, "Study").id;
+        let five = chrono::NaiveTime::from_hms_opt(17, 0, 0).unwrap();
+        let decision = ZoneDecision {
+            at: Local::now(),
+            room_c: Some(18.0),
+            schedule_start: five,
+            decision: Decision {
+                action: Action::Off,
+                target: None,
+                start_at: five,
+                comfort: ComfortTime {
+                    start: five,
+                    end: five,
+                    target: 20.0,
+                },
+                reasons: Vec::new(),
+            },
+        };
+        state
+            .shadow
+            .write()
+            .unwrap()
+            .record(std::collections::HashMap::from([(
+                study,
+                Tick {
+                    decision: decision.clone(),
+                    inside: false,
+                    schedule_heating: false,
+                },
+            )]));
+
+        let views = get_zones(State(state.clone())).await.0;
+        let json = serde_json::to_value(&views).unwrap();
+        let view = |name: &str| {
+            json.as_array()
+                .unwrap()
+                .iter()
+                .find(|v| v["name"] == name)
+                .unwrap()
+                .clone()
+        };
+        assert_eq!(view("Study")["decision"]["decision"]["action"], "off");
+        assert_eq!(view("Study")["decision"]["schedule_start"], "17:00:00");
+        assert!(view("Lounge")["decision"].is_null());
+
+        let query = |zone, since| Query(DecisionsQuery { zone, since });
+        let log = get_decisions(State(state.clone()), query(Some(study), None))
+            .await
+            .0;
+        assert_eq!(
+            log,
+            vec![Logged::Decision {
+                zone_id: study,
+                decision: decision.clone()
+            }]
+        );
+        let later = decision.at + chrono::TimeDelta::seconds(1);
+        assert!(
+            get_decisions(State(state.clone()), query(None, Some(later)))
+                .await
+                .0
+                .is_empty()
+        );
+        assert!(
+            get_decisions(State(state), query(Some(Uuid::new_v4()), None))
+                .await
+                .0
+                .is_empty()
+        );
     }
 
     #[tokio::test]

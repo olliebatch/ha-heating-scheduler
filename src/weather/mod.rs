@@ -1,6 +1,7 @@
 use crate::api_client::ApiClient;
+use crate::schedule::TimePeriod;
 use anyhow::{Context, Result, anyhow};
-use chrono::{DateTime, Local, Utc};
+use chrono::{DateTime, Local, Timelike, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
@@ -42,6 +43,14 @@ pub trait WeatherSource: Send + Sync {
     async fn fetch(&self, entity_id: Option<&str>) -> Result<Option<Weather>>;
     /// The hourly forecast, soonest first
     async fn fetch_forecast(&self, entity_id: &str) -> Result<Vec<ForecastHour>>;
+    /// Sunrise to sunset, from Home Assistant's `sun.sun` (see [`parse_daylight`])
+    async fn fetch_daylight(&self) -> Result<Option<TimePeriod>> {
+        Ok(None)
+    }
+    /// A temperature sensor's reading in °C, or None while it has none
+    async fn fetch_temperature(&self, _entity_id: &str) -> Result<Option<f64>> {
+        Ok(None)
+    }
 }
 
 /// The service call that returns a weather entity's forecast. It changes nothing, so a dry run
@@ -90,6 +99,54 @@ impl WeatherSource for HomeAssistantWeather {
             .await?;
         parse_forecast(&response, entity_id, &state)
     }
+
+    async fn fetch_daylight(&self) -> Result<Option<TimePeriod>> {
+        let state: Value = self
+            .api_client
+            .get("/api/states/sun.sun")
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        Ok(parse_daylight(&state))
+    }
+
+    async fn fetch_temperature(&self, entity_id: &str) -> Result<Option<f64>> {
+        let state: Value = self
+            .api_client
+            .get(&format!("/api/states/{}", entity_id))
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        Ok(parse_temperature(&state))
+    }
+}
+
+/// Sunrise to sunset as local times of day, from `sun.sun`'s `next_rising` and `next_setting`.
+/// Those are the next ones, so after sunset both are tomorrow's, and only their times of day are
+/// used: a day later they're within a minute or two of today's.
+pub fn parse_daylight(state: &Value) -> Option<TimePeriod> {
+    let time = |key: &str| {
+        let at = state.pointer(&format!("/attributes/{key}"))?.as_str()?;
+        let local = DateTime::parse_from_rfc3339(at).ok()?.with_timezone(&Local);
+        local.time().with_second(0)?.with_nanosecond(0)
+    };
+    Some(TimePeriod {
+        start: time("next_rising")?,
+        end: time("next_setting")?,
+    })
+}
+
+/// A temperature sensor's state in °C (from °F when its `unit_of_measurement` says so), or None
+/// when it's `unavailable`, `unknown` or not a number
+pub fn parse_temperature(state: &Value) -> Option<f64> {
+    let c = state.get("state")?.as_str()?.parse::<f64>().ok()?;
+    let unit = state.pointer("/attributes/unit_of_measurement");
+    Some(match unit.and_then(Value::as_str) {
+        Some("°F") => (c - 32.0) * 5.0 / 9.0,
+        _ => c,
+    })
 }
 
 /// Read the hourly forecast from a `weather.get_forecasts` response, in the units `state` (the
@@ -207,6 +264,11 @@ impl WeatherSource for MockWeather {
             })
             .collect())
     }
+
+    /// 07:00 to 19:00
+    async fn fetch_daylight(&self) -> Result<Option<TimePeriod>> {
+        Ok(Some(TimePeriod::new(7, 0, 19, 0)))
+    }
 }
 
 /// The weather entity to read, persisted to weather.json
@@ -232,6 +294,9 @@ pub struct WeatherStatus {
     pub forecast_tried_at: Option<DateTime<Local>>,
     /// Why the last forecast read failed, if it did
     pub forecast_error: Option<String>,
+    /// Sunrise to sunset, read with the forecast; the last one read is kept while reads fail
+    #[serde(default)]
+    pub daylight: Option<TimePeriod>,
     /// The adjusted target each zone is held at, by zone id (see `scheduler::zone_status`)
     #[serde(skip)]
     pub held: HashMap<uuid::Uuid, Held>,
@@ -281,7 +346,54 @@ pub fn save_weather_config<P: AsRef<Path>>(config: &WeatherConfig, path: P) -> R
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::TimeZone;
     use serde_json::json;
+
+    /// `sun.sun` as Home Assistant gives it, with the next sunrise and sunset at these local times
+    fn sun(rising: (u32, u32, u32), setting: (u32, u32, u32)) -> Value {
+        let utc = |(day, h, m): (u32, u32, u32)| {
+            Local
+                .with_ymd_and_hms(2026, 1, day, h, m, 30)
+                .unwrap()
+                .with_timezone(&Utc)
+                .to_rfc3339()
+        };
+        json!({
+            "state": "below_horizon",
+            "attributes": { "next_rising": utc(rising), "next_setting": utc(setting) }
+        })
+    }
+
+    #[test]
+    fn test_daylight_is_todays_sunrise_to_sunset_whatever_the_time() {
+        // 12:00 on the 15th: the next sunrise is tomorrow's, the next sunset today's
+        let noon = parse_daylight(&sun((16, 7, 58), (15, 16, 5)));
+        assert_eq!(noon, Some(TimePeriod::new(7, 58, 16, 5)));
+        assert!(noon.unwrap().contains(hm(12, 0)));
+        // 22:00: both are tomorrow's, a minute or two on
+        let night = parse_daylight(&sun((16, 7, 58), (16, 16, 7)));
+        assert_eq!(night, Some(TimePeriod::new(7, 58, 16, 7)));
+        assert!(!night.unwrap().contains(hm(22, 0)));
+        // Without the attributes, there's no daylight
+        assert_eq!(parse_daylight(&json!({ "state": "above_horizon" })), None);
+    }
+
+    fn hm(h: u32, m: u32) -> chrono::NaiveTime {
+        chrono::NaiveTime::from_hms_opt(h, m, 0).unwrap()
+    }
+
+    #[test]
+    fn test_parse_temperature() {
+        let reading = |state: &str, unit: &str| {
+            parse_temperature(&json!({
+                "state": state, "attributes": { "unit_of_measurement": unit }
+            }))
+        };
+        assert_eq!(reading("19.5", "°C"), Some(19.5));
+        assert_eq!(reading("68", "°F"), Some(20.0));
+        assert_eq!(reading("unavailable", "°C"), None);
+        assert_eq!(reading("unknown", "°C"), None);
+    }
 
     #[test]
     fn test_parse_metric_weather() {
