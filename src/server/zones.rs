@@ -146,6 +146,10 @@ pub struct UpdateZoneRequest {
     pub max_late_finish_minutes: Option<u32>,
     /// The whole block; fields left out get their defaults
     pub cold_warmups: Option<crate::weather::warmup::ColdWarmups>,
+    pub mode: Option<crate::zones::room::ZoneMode>,
+    /// The whole block; fields left out get their defaults, and an unknown one is a 400
+    #[serde(default, deserialize_with = "crate::zones::room::strict_room")]
+    pub room: Option<crate::zones::room::Room>,
 }
 
 /// A request body that couldn't be read, as a 400 saying which field and why, e.g.
@@ -193,6 +197,12 @@ pub async fn update_zone<T: ClimateEntity + Clone>(
                 .validate()
                 .map_err(|e| zone_error(ZoneError::Invalid(e)))?;
         }
+        // Check the room before changing anything
+        if let Some(room) = &payload.room {
+            room.clone()
+                .validated()
+                .map_err(|e| zone_error(ZoneError::Invalid(e)))?;
+        }
         // set_profile checks the sun windows before changing anything
         zones
             .set_profile(
@@ -209,6 +219,9 @@ pub async fn update_zone<T: ClimateEntity + Clone>(
                 .set_cold_warmups(zone_id, warmups)
                 .map_err(zone_error)?;
         }
+        zones
+            .set_smart(zone_id, payload.mode, payload.room.clone())
+            .map_err(zone_error)?;
         if let Some(name) = &payload.name {
             zones.rename(zone_id, name).map_err(zone_error)?;
         }
@@ -489,6 +502,78 @@ mod tests {
                 zone_ids: vec![lounge, whole],
                 name: None,
             }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_mode_and_room_update() {
+        use crate::zones::room::{Facing, ZoneMode};
+        let (state, _dir) = test_state();
+        let zones = refresh_zones(State(state.clone())).await.unwrap().0;
+        let study = zone_named(&zones, "Study").id;
+        let request = |json: &str| Json::<UpdateZoneRequest>::from_bytes(json.as_bytes());
+        assert_eq!(zone_named(&zones, "Study").mode, ZoneMode::Schedule);
+
+        let zone = update_zone(
+            State(state.clone()),
+            Path(study),
+            request(r#"{"mode": "shadow", "room": {"faces": ["N"], "setback_c": 15}}"#),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(zone.mode, ZoneMode::Shadow);
+        assert_eq!(zone.room.faces, vec![Facing::N]);
+        assert_eq!(zone.room.setback_c, Some(15.0));
+        assert_eq!(zone.room.warm_rate_c_per_hour, 1.5, "left out: the default");
+
+        // A bad room is a 400 naming the field, and changes nothing else in the request
+        let err = update_zone(
+            State(state.clone()),
+            Path(study),
+            request(r#"{"mode": "smart", "name": "Office", "room": {"heat_loss": 2}}"#),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert!(err.1.contains("heat_loss"), "{}", err.1);
+        let zone = state.zones.read().unwrap().get(study).unwrap().clone();
+        assert_eq!((zone.mode, zone.name.as_str()), (ZoneMode::Shadow, "Study"));
+
+        // A misspelt room field is a 400 too, rather than resetting the room to its defaults
+        let err = update_zone(
+            State(state.clone()),
+            Path(study),
+            request(r#"{"mode": "smart", "room": {"setback": 12}}"#),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert!(err.1.contains("unknown field `setback`"), "{}", err.1);
+        let zone = state.zones.read().unwrap().get(study).unwrap().clone();
+        assert_eq!(
+            (zone.mode, zone.room.setback_c),
+            (ZoneMode::Shadow, Some(15.0))
+        );
+
+        // A null room leaves it as it is
+        let zone = update_zone(
+            State(state.clone()),
+            Path(study),
+            request(r#"{"room": null}"#),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(zone.room.setback_c, Some(15.0));
+
+        let err = update_zone(
+            State(state.clone()),
+            Path(study),
+            request(r#"{"mode": "auto"}"#),
         )
         .await
         .unwrap_err();

@@ -118,6 +118,12 @@ no setting. A boost or an On period takes precedence.
   "burst_minutes": 20, "every_minutes": 180}` (the defaults, apart from `enabled`, which is false; fields left out get
   them). The gap and interval must be 1-1440 minutes, the burst 1-180 and shorter than the interval, and `below_c`
   -30 to 20 °C. A value that isn't a whole number of minutes (a negative one, say) gets a 400 naming the field
+- `PATCH /zones/{id}` also takes `mode` (`schedule`, the default; `shadow`; `smart`) and `room`: `{"faces": ["N", "E"],
+  "sun_gain": 0.5, "heat_loss": 0.5, "warm_rate_c_per_hour": 1.5, "setback_c": null, "sensor_entity_id": null}` (the
+  defaults; fields left out get them). `faces` is any of N/E/S/W, `sun_gain` (none to lots) and `heat_loss` (well
+  insulated to draughty) are 0-1, `warm_rate_c_per_hour` 0.5-4, `setback_c` null or 10-18 °C, and
+  `sensor_entity_id` null (use the TRVs) or a `sensor.*` entity. Anything else is a 400 naming the field. Nothing
+  reads `mode` or `room` yet: every zone is still heated by its schedule
 - `GET /zones` includes each zone's `status`: `state`, `scheduled_target`, adjusted `target`, `reasons`,
   `raw_target` (before clamping, rounding and holding), `held` and `early_start` (`period_start`, `lead_minutes`
   allowed by the weather, `minutes_early` it actually started, and `causes`) while a period is being started early, and
