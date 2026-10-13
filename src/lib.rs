@@ -6,6 +6,7 @@ pub mod config;
 pub mod dry_run;
 pub mod schedule;
 pub mod server;
+pub mod smart;
 pub mod weather;
 pub mod zones;
 
