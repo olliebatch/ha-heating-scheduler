@@ -357,8 +357,11 @@ pub fn decide(inputs: &Inputs) -> Decision {
 
     // Heating that has begun for this comfort time keeps going, from when it began, even though
     // the lead shrinks as the room warms
+    // (Only a Heat decided before the start counts: one with a lead, and not the setback. The
+    // comfort time's own Heat, once it's over, must not carry on to the next one.)
     let begun = inputs.previous.filter(|p| {
         same(Action::Heat)
+            && p.reasons.iter().any(|r| matches!(r, Factor::Lead { .. }))
             && !p
                 .reasons
                 .iter()
@@ -745,6 +748,16 @@ mod tests {
         case.previous = Some(begun.clone());
         let d = case.evening();
         assert_eq!((d.action, d.start_at), (Action::Heat, begun.start_at));
+
+        // Not after the comfort time: its own Heat stops at its end
+        let mut evening = Case::new(at(21, 59), 20.0, weather(2.0, 0.0, None, 100.0));
+        evening.inside = true;
+        let during = evening.evening();
+        assert_eq!(during.action, Action::Heat);
+        evening.now = at(22, 0);
+        evening.inside = false;
+        evening.previous = Some(during);
+        assert_eq!(evening.evening().action, Action::Off);
 
         // Not for a different comfort time, or a setback
         let mut setback = begun.clone();
