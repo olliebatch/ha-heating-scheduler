@@ -10,8 +10,10 @@ use crate::weather::adjust::WindExposure;
 use crate::weather::warmup::ColdWarmups;
 
 pub mod areas;
+pub mod room;
 
 use areas::Area;
+use room::{Room, ZoneMode};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -54,6 +56,12 @@ pub struct Zone {
     /// Short warm-ups in long Off gaps on very cold days (off by default)
     #[serde(default)]
     pub cold_warmups: ColdWarmups,
+    /// Heated by its schedule (the default), or by the smart decisions
+    #[serde(default)]
+    pub mode: ZoneMode,
+    /// What the smart decisions know about the room
+    #[serde(default)]
+    pub room: Room,
 }
 
 /// Default for [`Zone::max_early_start_minutes`]
@@ -102,6 +110,8 @@ impl Zone {
             max_early_start_minutes: DEFAULT_MAX_EARLY_START,
             max_late_finish_minutes: 0,
             cold_warmups: ColdWarmups::default(),
+            mode: ZoneMode::default(),
+            room: Room::default(),
         }
     }
 
@@ -395,6 +405,31 @@ impl Zones {
             .find(|z| z.id == id)
             .ok_or(ZoneError::NotFound)?;
         zone.cold_warmups = warmups;
+        Ok(())
+    }
+
+    /// Set how the zone is heated and/or what's known about its room, if the room is valid
+    pub fn set_smart(
+        &mut self,
+        id: Uuid,
+        mode: Option<ZoneMode>,
+        room: Option<Room>,
+    ) -> Result<(), ZoneError> {
+        let room = room
+            .map(Room::validated)
+            .transpose()
+            .map_err(ZoneError::Invalid)?;
+        let zone = self
+            .zones
+            .iter_mut()
+            .find(|z| z.id == id)
+            .ok_or(ZoneError::NotFound)?;
+        if let Some(mode) = mode {
+            zone.mode = mode;
+        }
+        if let Some(room) = room {
+            zone.room = room;
+        }
         Ok(())
     }
 
@@ -714,6 +749,22 @@ mod tests {
                 .zones
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn test_a_zones_file_from_before_smart_mode_loads_with_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("zones.json");
+        let old = r#"{"zones": [{"id": "6f1c1d2e-0000-4000-8000-000000000001", "name": "Lounge",
+            "kind": "area", "area_ids": ["lounge"], "entity_ids": ["climate.lounge_trv"],
+            "wind_exposure": "high", "weather_adjust": true}]}"#;
+        std::fs::write(&path, old).unwrap();
+
+        let zone = load_zones(&path).unwrap().zones.remove(0);
+
+        assert_eq!(zone.mode, room::ZoneMode::Schedule);
+        assert_eq!(zone.room, Room::default());
+        assert!(zone.weather_adjust);
     }
 
     #[test]
