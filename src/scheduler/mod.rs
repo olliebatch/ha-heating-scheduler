@@ -631,6 +631,13 @@ pub fn call_context(zone: Option<&str>, status: &ZoneStatus, boosted: bool) -> S
     format!("{zone}: {why}")
 }
 
+/// A smart zone that can't decide yet because its radiators haven't been read (the first tick
+/// after a start). Its entities are only read that tick: falling back to the schedule could turn
+/// off a warm-up that's under way.
+pub fn smart_waiting<T: ClimateEntity>(zone: &Zone, entities: &[T]) -> bool {
+    zone.mode == crate::zones::room::ZoneMode::Smart && !crate::shadow::zone_read(zone, entities)
+}
+
 /// The decisions that heat their zones: smart zones' only, never shadow zones'
 pub fn acting_decisions(
     zones: &Zones,
@@ -749,7 +756,9 @@ pub async fn run_scheduler<T: ClimateEntity + Clone>(state: SchedulerState<T>) {
         let sensors = read_room_sensors(&state.zones, state.weather_source.as_ref()).await;
 
         // What each entity's zone schedule asks for right now, and why (for the dry-run log)
-        let (scheduled, contexts, default_target_temp): (Vec<Scheduled>, Vec<String>, f64) = {
+        // None for an entity of a smart zone whose radiators haven't been read yet (the first tick
+        // after a start): it's only read, so a warm-up under way isn't turned off for one tick
+        let (scheduled, contexts, default_target_temp): (Vec<Option<Scheduled>>, Vec<String>, f64) = {
             let sets = state.schedule.read().unwrap();
             let zones = state.zones.read().unwrap();
             let mut weather_status = state.weather.write().unwrap();
@@ -797,15 +806,21 @@ pub async fn run_scheduler<T: ClimateEntity + Clone>(state: SchedulerState<T>) {
                     // still applies when Smart leaves a room off
                     if let Some(decision) = zone.and_then(|z| acting.get(&z.id)) {
                         return (
-                            smart_scheduled(decision),
+                            Some(smart_scheduled(decision)),
                             smart_context(name, decision, boosted),
+                        );
+                    }
+                    if zone.is_some_and(|z| smart_waiting(z, &entities_clone)) {
+                        return (
+                            None,
+                            format!("{}: smart, reading the room", name.unwrap_or("no zone")),
                         );
                     }
                     let scheduled = Scheduled {
                         state: status.state.clone(),
                         target_temp: status.target,
                     };
-                    (scheduled, call_context(name, status, boosted))
+                    (Some(scheduled), call_context(name, status, boosted))
                 })
                 .unzip();
             (scheduled, contexts, sets.default_target_temp)
@@ -822,6 +837,12 @@ pub async fn run_scheduler<T: ClimateEntity + Clone>(state: SchedulerState<T>) {
             if !still_managed() {
                 continue;
             }
+            let Some(scheduled) = scheduled else {
+                if let Err(e) = entity.fetch_and_update_state(&state.api_client).await {
+                    eprintln!("Error fetching state for {}: {}", id, e);
+                }
+                continue;
+            };
             let mut last_sent = state
                 .last_sent_targets
                 .lock()
@@ -1224,6 +1245,26 @@ mod tests {
             tick(&mut trv, &wanted, &mut last).await;
             assert_eq!(!sent(&trv).is_empty(), heats);
             assert_eq!(*trv.mode.lock().unwrap() == Some(HeatingState::On), heats);
+        }
+    }
+
+    #[test]
+    fn test_a_smart_zone_waits_for_its_radiators_to_be_read() {
+        use crate::zones::room::ZoneMode;
+        let mut zones = Zones::default();
+        zones.reconcile(None, &["climate.test".to_string()]);
+        let mut zone = zones.zones[0].clone();
+        let mut unread = mock(HeatingState::On);
+        unread.info = None;
+        let read = mock(HeatingState::On);
+
+        zone.mode = ZoneMode::Smart;
+        assert!(smart_waiting(&zone, std::slice::from_ref(&unread)));
+        assert!(!smart_waiting(&zone, std::slice::from_ref(&read)));
+        // Schedule and shadow zones follow the schedule from the first tick
+        for mode in [ZoneMode::Schedule, ZoneMode::Shadow] {
+            zone.mode = mode;
+            assert!(!smart_waiting(&zone, std::slice::from_ref(&unread)));
         }
     }
 
