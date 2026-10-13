@@ -28,7 +28,7 @@ pub enum Facing {
 /// What the smart decisions know about a room. The defaults behave close to today. Wind
 /// exposure is the zone's existing `wind_exposure`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default)]
 pub struct Room {
     /// The sides the room faces; none means wind and sun direction are ignored
     pub faces: Vec<Facing>,
@@ -61,6 +61,38 @@ impl Default for Room {
 pub const WARM_RATE_RANGE: std::ops::RangeInclusive<f64> = 0.5..=4.0;
 /// Allowed `setback_c`
 pub const SETBACK_RANGE: std::ops::RangeInclusive<f64> = 10.0..=18.0;
+
+/// A room in a request: like [`Room`], but a field it doesn't know is an error, so a misspelt
+/// one can't reset the room to its defaults. (A saved room stays lenient, so a file from a later
+/// version still loads.) Null or left out is None.
+pub fn strict_room<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<Room>, D::Error> {
+    use serde::de::Error;
+    let Some(value) = Option::<serde_json::Value>::deserialize(d)? else {
+        return Ok(None);
+    };
+    let known = serde_json::to_value(Room::default()).map_err(D::Error::custom)?;
+    let known: Vec<&String> = known
+        .as_object()
+        .into_iter()
+        .flat_map(|o| o.keys())
+        .collect();
+    if let Some(unknown) = value
+        .as_object()
+        .and_then(|o| o.keys().find(|k| !known.contains(k)))
+    {
+        return Err(D::Error::custom(format!(
+            "unknown field `{unknown}`, expected one of {}",
+            known
+                .iter()
+                .map(|k| format!("`{k}`"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )));
+    }
+    serde_json::from_value(value)
+        .map(Some)
+        .map_err(D::Error::custom)
+}
 
 impl Room {
     /// The room with its sensor id trimmed (blank meaning none), or why it isn't valid
@@ -155,11 +187,8 @@ mod tests {
             assert!(error.starts_with(field), "{error}");
         }
         assert!(serde_json::from_value::<Room>(json!({"faces": ["NE"]})).is_err());
-        // A misspelt field is refused, rather than resetting the room to its defaults
-        let typo = serde_json::from_value::<Room>(json!({"setback": 12})).unwrap_err();
-        assert!(
-            typo.to_string().contains("unknown field `setback`"),
-            "{typo}"
-        );
+        // A saved room with a field this version doesn't know still loads
+        let later: Room = serde_json::from_value(json!({"faces": ["N"], "comfort_c": 20})).unwrap();
+        assert_eq!(later.faces, vec![Facing::N]);
     }
 }

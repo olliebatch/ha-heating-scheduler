@@ -147,7 +147,8 @@ pub struct UpdateZoneRequest {
     /// The whole block; fields left out get their defaults
     pub cold_warmups: Option<crate::weather::warmup::ColdWarmups>,
     pub mode: Option<crate::zones::room::ZoneMode>,
-    /// The whole block; fields left out get their defaults
+    /// The whole block; fields left out get their defaults, and an unknown one is a 400
+    #[serde(default, deserialize_with = "crate::zones::room::strict_room")]
     pub room: Option<crate::zones::room::Room>,
 }
 
@@ -541,6 +542,33 @@ mod tests {
         assert!(err.1.contains("heat_loss"), "{}", err.1);
         let zone = state.zones.read().unwrap().get(study).unwrap().clone();
         assert_eq!((zone.mode, zone.name.as_str()), (ZoneMode::Shadow, "Study"));
+
+        // A misspelt room field is a 400 too, rather than resetting the room to its defaults
+        let err = update_zone(
+            State(state.clone()),
+            Path(study),
+            request(r#"{"mode": "smart", "room": {"setback": 12}}"#),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert!(err.1.contains("unknown field `setback`"), "{}", err.1);
+        let zone = state.zones.read().unwrap().get(study).unwrap().clone();
+        assert_eq!(
+            (zone.mode, zone.room.setback_c),
+            (ZoneMode::Shadow, Some(15.0))
+        );
+
+        // A null room leaves it as it is
+        let zone = update_zone(
+            State(state.clone()),
+            Path(study),
+            request(r#"{"room": null}"#),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(zone.room.setback_c, Some(15.0));
 
         let err = update_zone(
             State(state.clone()),
