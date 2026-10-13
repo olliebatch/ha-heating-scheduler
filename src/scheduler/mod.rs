@@ -702,6 +702,7 @@ pub async fn run_scheduler<T: ClimateEntity + Clone>(state: SchedulerState<T>) {
             let ticks = zones
                 .zones
                 .iter()
+                .filter(|z| z.mode != crate::zones::room::ZoneMode::Schedule)
                 .filter_map(|z| {
                     let room_c = room_temperature(z, &entities_clone, sensors.get(&z.id).copied());
                     let previous = shadow.decisions.get(&z.id).map(|d| &d.decision);

@@ -11,7 +11,6 @@ use crate::smart::{
 };
 use crate::weather::{Weather, WeatherStatus};
 use crate::zones::Zone;
-use crate::zones::room::ZoneMode;
 use chrono::{DateTime, Local, NaiveTime, TimeDelta};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
@@ -24,8 +23,8 @@ pub const LOG_CAP: usize = 2000;
 /// Entries the log may run over [`LOG_CAP`] before the file is rewritten without them
 const LOG_SLACK: usize = 200;
 
-/// A shadow or smart zone's decision and what the tick knows around it; None for a Schedule zone,
-/// or one whose schedule has no On period. The schedule's own early start, as `status` (the
+/// A zone's smart decision and what the tick knows around it; None when its schedule has no On
+/// period. (The scheduler asks only for shadow and smart zones; a preview asks for any.) The schedule's own early start, as `status` (the
 /// zone's status this tick) has it, gives when the schedule starts heating.
 #[allow(clippy::too_many_arguments)]
 pub fn zone_tick(
@@ -38,9 +37,6 @@ pub fn zone_tick(
     previous: Option<&Decision>,
     now: DateTime<Local>,
 ) -> Option<Tick> {
-    if zone.mode == ZoneMode::Schedule {
-        return None;
-    }
     let schedule = zone
         .schedule_set_id
         .and_then(|id| sets.get(id))
@@ -351,6 +347,7 @@ mod tests {
     use crate::climate::MockClimate;
     use crate::schedule::{Schedule, ScheduleEntry, TimePeriod};
     use crate::weather::early::EarlyStart;
+    use crate::zones::room::ZoneMode;
     use crate::zones::{ZoneKind, Zones};
     use chrono::TimeZone;
 
@@ -559,9 +556,9 @@ mod tests {
     }
 
     #[test]
-    fn test_zone_tick_only_for_shadow_and_smart_zones() {
+    fn test_zone_tick() {
         let weather = WeatherStatus::default();
-        let (zone, sets) = shadow_zone(ZoneMode::Schedule);
+        let (zone, sets) = shadow_zone(ZoneMode::Shadow);
         let tick = |zone: &Zone, status: &ZoneStatus| {
             zone_tick(
                 zone,
@@ -574,9 +571,6 @@ mod tests {
                 at(16, 30),
             )
         };
-        assert!(tick(&zone, &off()).is_none());
-
-        let (zone, _) = shadow_zone(ZoneMode::Shadow);
         let t = tick(&zone, &off()).unwrap();
         assert_eq!(t.decision.decision.comfort, EVENING);
         assert_eq!(t.decision.schedule_start, time(17, 0));

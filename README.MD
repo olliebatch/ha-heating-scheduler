@@ -134,6 +134,10 @@ no setting. A boost or an On period takes precedence.
   start included once begun) and `decision`: `action` (`heat`, `off` or `not_needed`), `target`, `start_at`,
   `comfort` (`start`, `end`, `target`) and `reasons`, each tagged by `kind` (`outside`, `wind`, `sun`, `feels_like`,
   `indoors`, `warm_rate`, `lead`, `setback`, `no_weather`, `no_room_temperature`)
+- `POST /zones/{id}/preview` - `{"room": {...}}` (the same block as `PATCH`; left out, the zone's own): the decision
+  the zone would get right now with that room, whatever its mode, to show a setting's effect before saving. It saves
+  and logs nothing, uses the scheduler's last weather and the room temperature of the zone's latest decision (else
+  its TRVs' average), and is null when the zone's schedule has no On period
 - `GET /decisions?zone=<id>&since=<RFC 3339 time>` - The decisions log, oldest first (both filters optional): a
   `{"kind": "decision", "zone_id", "decision"}` each time a zone's action, target, start or comfort time changes, and
   a `{"kind": "outcome", "zone_id", "outcome"}` for each comfort time: `smart_start` (null when Smart found heating

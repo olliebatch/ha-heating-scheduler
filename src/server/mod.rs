@@ -87,6 +87,10 @@ pub async fn start_server(app_state: AppState<ClimateEntityWrapper>, port: u16) 
         )
         .route("/zones/merge", post(merge_zones::<ClimateEntityWrapper>))
         .route(
+            "/zones/{id}/preview",
+            post(zones::preview_zone::<ClimateEntityWrapper>),
+        )
+        .route(
             "/zones/{id}",
             patch(update_zone::<ClimateEntityWrapper>).delete(delete_zone::<ClimateEntityWrapper>),
         )

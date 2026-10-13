@@ -2,7 +2,7 @@ use crate::climate::ClimateEntity;
 use crate::schedule::TimePeriod;
 use crate::scheduler::{ZoneStatus, zone_status};
 use crate::server::AppState;
-use crate::shadow::{Logged, ZoneDecision};
+use crate::shadow::{Logged, ZoneDecision, room_temperature, zone_tick};
 use crate::weather::adjust::WindExposure;
 use crate::zones::areas::{DISCOVERY_TIMEOUT, fetch_areas_with_timeout};
 use crate::zones::{Zone, ZoneError, Zones, save_zones};
@@ -128,6 +128,70 @@ pub async fn get_decisions<T: ClimateEntity + Clone>(
     Query(query): Query<DecisionsQuery>,
 ) -> Json<Vec<Logged>> {
     Json(state.shadow.read().unwrap().log(query.zone, query.since))
+}
+
+#[derive(Deserialize)]
+pub struct PreviewRequest {
+    /// The room to try; fields left out get their defaults, and an unknown one is a 400. Left
+    /// out, the zone's own room.
+    #[serde(default, deserialize_with = "crate::zones::room::strict_room")]
+    pub room: Option<crate::zones::room::Room>,
+}
+
+/// The smart decision for a zone right now with `room` in its place, so a setting's effect shows
+/// before it's saved. Saves and logs nothing, and works whatever the zone's mode. It uses the
+/// scheduler's last weather, forecast and daylight, and the room temperature of the zone's
+/// latest decision (else its TRVs' average). Null when the zone's schedule has no On period.
+pub async fn preview_zone<T: ClimateEntity + Clone>(
+    State(state): State<AppState<T>>,
+    Path(zone_id): Path<Uuid>,
+    payload: Result<Json<PreviewRequest>, JsonRejection>,
+) -> Result<Json<Option<ZoneDecision>>, ApiError> {
+    let Json(payload) = payload.map_err(unreadable)?;
+    let room = payload
+        .room
+        .map(|r| r.validated())
+        .transpose()
+        .map_err(|e| zone_error(ZoneError::Invalid(e)))?;
+    let now = Local::now();
+    let weather = state.weather.read().unwrap().clone();
+    let room_c = state
+        .shadow
+        .read()
+        .unwrap()
+        .decisions
+        .get(&zone_id)
+        .and_then(|d| d.room_c);
+    let entities = state.climate_entities.read().unwrap().clone();
+    let sets = state.schedule.read().unwrap();
+    let zones = state.zones.read().unwrap();
+    let mut zone = zones
+        .get(zone_id)
+        .ok_or_else(|| zone_error(ZoneError::NotFound))?
+        .clone();
+    if let Some(room) = room {
+        zone.room = room;
+    }
+    let status = zone_status(
+        Some(&zone),
+        &sets,
+        weather.weather.as_ref(),
+        weather.held.get(&zone_id).copied(),
+        weather.begun.get(&zone_id),
+        &now,
+    );
+    let room_c = room_c.or_else(|| room_temperature(&zone, &entities, None));
+    let tick = zone_tick(
+        &zone,
+        &sets,
+        &status,
+        weather.weather.as_ref(),
+        &weather,
+        room_c,
+        None,
+        now,
+    );
+    Ok(Json(tick.map(|t| t.decision)))
 }
 
 /// Ask Home Assistant for its areas again and rebuild the zones
@@ -748,6 +812,76 @@ mod tests {
                 .0
                 .is_empty()
         );
+    }
+
+    #[tokio::test]
+    async fn test_preview_shows_a_rooms_effect_without_saving_it() {
+        use chrono::Timelike;
+        let (state, _dir) = test_state();
+        let zones = refresh_zones(State(state.clone())).await.unwrap().0;
+        let study = zone_named(&zones, "Study").id;
+        // An On period three hours from now at 22 °C; -5 °C outside; the study's TRV reads 20 °C
+        let start = (Local::now().hour() + 3) % 24;
+        state.schedule.write().unwrap().active_mut().add_entry(
+            crate::schedule::ScheduleEntry::new(
+                "Evening",
+                TimePeriod::new(start, 0, (start + 1) % 24, 0),
+                HeatingState::On,
+            )
+            .with_target(22.0),
+        );
+        state.weather.write().unwrap().weather = Some(crate::weather::Weather {
+            temperature: Some(-5.0),
+            ..Default::default()
+        });
+        let preview = |json: &str| {
+            preview_zone(
+                State(state.clone()),
+                Path(study),
+                Json::<PreviewRequest>::from_bytes(json.as_bytes()),
+            )
+        };
+        let lead = |d: Option<ZoneDecision>| {
+            let d = d.unwrap();
+            (d.decision.comfort.start - d.decision.start_at)
+                .num_minutes()
+                .rem_euclid(24 * 60)
+        };
+
+        // 2 °C to gain at 1.5 °C/h in a well insulated room, plus 10 minutes; a draughty one is
+        // capped at two hours
+        let snug = preview(r#"{"room": {"heat_loss": 0}}"#).await.unwrap().0;
+        assert_eq!(snug.as_ref().unwrap().room_c, Some(20.0));
+        assert_eq!(lead(snug), 90);
+        assert_eq!(
+            lead(preview(r#"{"room": {"heat_loss": 1}}"#).await.unwrap().0),
+            120
+        );
+        // Left out, the zone's own room; nothing was saved
+        assert!(preview("{}").await.unwrap().0.is_some());
+        assert_eq!(
+            state
+                .zones
+                .read()
+                .unwrap()
+                .get(study)
+                .unwrap()
+                .room
+                .heat_loss,
+            0.5
+        );
+        assert!(state.shadow.read().unwrap().log(None, None).is_empty());
+
+        let err = preview(r#"{"room": {"heat_los": 1}}"#).await.unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        let err = preview(r#"{"room": {"heat_loss": 3}}"#).await.unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        let missing = preview_zone(
+            State(state.clone()),
+            Path(Uuid::new_v4()),
+            Json::<PreviewRequest>::from_bytes(b"{}"),
+        );
+        assert_eq!(missing.await.unwrap_err().0, StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
