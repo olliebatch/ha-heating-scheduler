@@ -244,7 +244,7 @@ pub fn decide(inputs: &Inputs) -> Decision {
             between(comfort.start, reasons)
         };
     };
-    let outside_c = weather.temperature.unwrap_or_default();
+    let outside_c = round1(weather.temperature.unwrap_or_default());
     reasons.push(Factor::Outside {
         c: outside_c,
         forecast: from_forecast,
@@ -276,8 +276,8 @@ pub fn decide(inputs: &Inputs) -> Decision {
         feels_like -= chill_c;
         reasons.push(Factor::Wind {
             chill_c,
-            speed_kmh: speed,
-            bearing: weather.wind_bearing,
+            speed_kmh: round1(speed),
+            bearing: weather.wind_bearing.map(f64::round),
             faces_hit,
         });
     }
@@ -547,6 +547,30 @@ mod tests {
                 forecast: false
             }
         );
+
+        // Converted units can carry float noise; the reasons don't
+        case.weather = Some(weather(
+            2.000000000000001,
+            41.00000000000001,
+            Some(45.2),
+            100.0,
+        ));
+        let d = case.evening();
+        assert_eq!(
+            d.reasons[0],
+            Outside {
+                c: 2.0,
+                forecast: false
+            }
+        );
+        assert!(matches!(
+            d.reasons[1],
+            Wind {
+                speed_kmh: 41.0,
+                bearing: Some(45.0),
+                ..
+            }
+        ));
     }
 
     #[test]
