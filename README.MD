@@ -97,8 +97,12 @@ warm-up of `burst_minutes` falls `every_minutes` after the gap starts, and again
 colder than `below_c` outside at that moment. The weather is checked once, as each warm-up starts, and the warm-up
 then runs its full length. It heats to the schedule's `default_target_temp`, not adjusted for the weather. A warm-up
 that could overlap the zone's late finish after the previous On period, or its early start before the next one, is
-skipped, and with no weather reading there's none. Zones that don't opt in stay off for the whole Off gap; nothing
-else turns heating on during an Off period.
+skipped, and with no weather reading there's none. Zones that don't opt in stay off for the whole Off gap, apart from
+the frost floor.
+
+Frost floor: any managed entity that would be Off is turned on at 10 °C when the room temperature it reports drops
+below 7 °C, and turned off again once the room reaches 10 °C. It applies to every entity, in a zone or not, and needs
+no setting. A boost or an On period takes precedence.
 
 - `GET /weather` - The configured weather entity, the last reading and any error
 - `PUT /weather` - Choose the weather entity: `{"entity_id": "weather.home"}` (`null` to stop); stored in `data/weather.json`

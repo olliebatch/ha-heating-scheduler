@@ -372,6 +372,25 @@ pub fn desired_target_temp(
     }
 }
 
+/// Below this room temperature, an entity that would otherwise be Off is heated
+pub const FROST_BELOW_C: f64 = 7.0;
+/// The target it's heated to, and kept heating to, until the room reaches it
+pub const FROST_TARGET_C: f64 = 10.0;
+
+/// Whether an entity that would be Off is held On by the frost floor: the room has dropped below
+/// [`FROST_BELOW_C`], or the floor turned it on (it's heating to [`FROST_TARGET_C`]) and the room
+/// hasn't reached that yet
+pub fn frost_floor(
+    desired: &HeatingState,
+    room_c: f64,
+    heating: &HeatingState,
+    last_sent: Option<f64>,
+) -> bool {
+    let warming = *heating == HeatingState::On && last_sent == Some(FROST_TARGET_C);
+    *desired == HeatingState::Off
+        && (room_c < FROST_BELOW_C || (warming && room_c < FROST_TARGET_C))
+}
+
 /// Fetch one entity's state and bring it in line with the schedule and any boost.
 /// Turning On sets the mode, then the target temperature.
 ///
@@ -406,10 +425,24 @@ pub async fn apply_schedule_to_entity<T: ClimateEntity>(
     if should_update {
         entity.set_boost(None);
     }
-    let final_desired_state = final_desired_heating_state(&scheduled.state, &boosted_state);
+    let mut final_desired_state = final_desired_heating_state(&scheduled.state, &boosted_state);
 
     let cached = entity.get_cached_state().clone().unwrap();
     let heating_state = cached.state;
+
+    let frost = frost_floor(
+        &final_desired_state,
+        cached.current_temperature,
+        &heating_state,
+        *last_sent,
+    );
+    if frost {
+        println!(
+            "  Frost floor: {} °C in the room, heating to {FROST_TARGET_C} °C",
+            cached.current_temperature
+        );
+        final_desired_state = HeatingState::On;
+    }
 
     let action = calculate_heating_action_for_schedule(&heating_state, &final_desired_state);
 
@@ -428,8 +461,12 @@ pub async fn apply_schedule_to_entity<T: ClimateEntity>(
         }
     }
 
-    let Some(target) = desired_target_temp(&final_desired_state, scheduled, default_target_temp)
-    else {
+    let target = if frost {
+        Some(FROST_TARGET_C)
+    } else {
+        desired_target_temp(&final_desired_state, scheduled, default_target_temp)
+    };
+    let Some(target) = target else {
         *last_sent = None;
         return;
     };
@@ -882,6 +919,64 @@ mod tests {
 
         assert!(sent(&entity).is_empty());
         assert_eq!(last, None);
+    }
+
+    #[test]
+    fn test_frost_floor() {
+        use HeatingState::{Off, On};
+        // Only when it would be Off
+        assert!(frost_floor(&Off, 6.9, &Off, None));
+        assert!(!frost_floor(&On, 6.9, &Off, None));
+        assert!(!frost_floor(&Off, 7.0, &Off, None));
+        // Once it's heating to the floor's target, it keeps going until the room reaches it
+        assert!(frost_floor(&Off, 9.9, &On, Some(FROST_TARGET_C)));
+        assert!(!frost_floor(&Off, 10.0, &On, Some(FROST_TARGET_C)));
+        // Heating for another reason, or reporting Off, doesn't keep it going
+        assert!(!frost_floor(&Off, 9.0, &On, Some(20.0)));
+        assert!(!frost_floor(&Off, 9.0, &Off, Some(FROST_TARGET_C)));
+    }
+
+    #[tokio::test]
+    async fn test_frost_floor_heats_a_cold_room_until_it_reaches_the_target() {
+        let mut entity = mock(HeatingState::Off);
+        let mut last = None;
+        let off = scheduled(HeatingState::Off, None);
+
+        entity.current_temperature = 8.0;
+        tick(&mut entity, &off, &mut last).await;
+        assert!(sent(&entity).is_empty(), "above the floor, Off stays Off");
+
+        entity.current_temperature = 6.5;
+        tick(&mut entity, &off, &mut last).await;
+        assert_eq!(*entity.mode.lock().unwrap(), Some(HeatingState::On));
+        assert_eq!(sent(&entity), vec![FROST_TARGET_C]);
+
+        // Warming, but not there yet: keeps heating without resending
+        entity.current_temperature = 8.5;
+        tick(&mut entity, &off, &mut last).await;
+        assert_eq!(*entity.mode.lock().unwrap(), Some(HeatingState::On));
+        assert_eq!(sent(&entity), vec![FROST_TARGET_C]);
+
+        entity.current_temperature = 10.0;
+        tick(&mut entity, &off, &mut last).await;
+        assert_eq!(*entity.mode.lock().unwrap(), Some(HeatingState::Off));
+        assert_eq!(last, None);
+    }
+
+    #[tokio::test]
+    async fn test_frost_floor_leaves_a_scheduled_target_alone() {
+        let mut entity = mock(HeatingState::Off);
+        entity.current_temperature = 5.0;
+        let mut last = None;
+
+        tick(
+            &mut entity,
+            &scheduled(HeatingState::On, Some(18.0)),
+            &mut last,
+        )
+        .await;
+
+        assert_eq!(sent(&entity), vec![18.0]);
     }
 
     #[tokio::test]

@@ -227,6 +227,8 @@ pub struct MockClimate {
     pub fail_set_temperature: bool,
     /// The mode last set by `turn_on`/`turn_off`, reported on the next fetch as HA would
     pub mode: Arc<Mutex<Option<HeatingState>>>,
+    /// The room temperature reported on each fetch
+    pub current_temperature: f64,
 }
 
 impl MockClimate {
@@ -245,6 +247,7 @@ impl MockClimate {
             target_step: None,
             fail_set_temperature: false,
             mode: Default::default(),
+            current_temperature: 21.0,
         }
     }
 }
@@ -295,7 +298,7 @@ impl ClimateEntity for MockClimate {
                 .unwrap_or(HeatingState::Off)
         });
         self.info = Some(ClimateInfo {
-            current_temperature: 21.0,
+            current_temperature: self.current_temperature,
             state,
             target_temp,
             // Keep any limits a test gave the mock, as HA would keep reporting them
