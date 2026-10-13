@@ -67,6 +67,9 @@ pub struct Inputs<'a> {
     pub wind_exposure: WindExposure,
     /// The zone's sun windows, which say it's sunny whatever way the room faces
     pub sun_windows: &'a [TimePeriod],
+    /// Today's sunrise and sunset. Sun only counts between them; without them, the way a room faces
+    /// brings no sun, and only sun windows do.
+    pub daylight: Option<TimePeriod>,
     /// The most minutes heating may start before a comfort time
     pub max_early_minutes: u32,
 }
@@ -155,7 +158,7 @@ fn degrees(face: Facing) -> f64 {
     }
 }
 
-/// The sides of a house the sun is on at `hour`: east in the morning, south at midday and west
+/// The sides of a house the sun is on at `hour`, while it's up: east in the morning, south at midday and west
 /// in the afternoon
 fn sunny_faces(hour: u32) -> Vec<Facing> {
     [(Facing::E, 6..11), (Facing::S, 10..15), (Facing::W, 14..19)]
@@ -283,10 +286,13 @@ pub fn decide(inputs: &Inputs) -> Decision {
     }
 
     let local = at.with_timezone(&Local).time();
-    let sunny = inputs.sun_windows.iter().any(|w| w.contains(local))
-        || sunny_faces(local.hour())
-            .iter()
-            .any(|f| inputs.room.faces.contains(f));
+    // Sun windows are the user's word for when the sun's on the room, but not after dark
+    let daylight = inputs.daylight.map(|d| d.contains(local));
+    let sunny = (daylight != Some(false) && inputs.sun_windows.iter().any(|w| w.contains(local)))
+        || (daylight == Some(true)
+            && sunny_faces(local.hour())
+                .iter()
+                .any(|f| inputs.room.faces.contains(f)));
     if let (true, Some(cloud)) = (sunny, weather.cloud_coverage) {
         let gain_c = round1(inputs.room.sun_gain * FULL_SUN_C * (1.0 - cloud / 100.0));
         if gain_c > 0.0 {
@@ -377,6 +383,7 @@ mod tests {
         forecast: Vec<ForecastHour>,
         room: Room,
         exposure: WindExposure,
+        daylight: Option<TimePeriod>,
     }
 
     impl Case {
@@ -389,6 +396,8 @@ mod tests {
                 forecast: Vec::new(),
                 room: Room::default(),
                 exposure: WindExposure::Medium,
+                // A January day
+                daylight: Some(TimePeriod::new(8, 0, 16, 0)),
             }
         }
         fn decide(&self, comfort: ComfortTime) -> Decision {
@@ -402,6 +411,7 @@ mod tests {
                 room: &self.room,
                 wind_exposure: self.exposure,
                 sun_windows: &[],
+                daylight: self.daylight,
                 max_early_minutes: 120,
             })
         }
@@ -515,6 +525,66 @@ mod tests {
         assert_eq!(case.decide(afternoon).action, Action::NotNeeded);
         case.room.faces = vec![Facing::N];
         assert_eq!(case.decide(afternoon).action, Action::Heat);
+    }
+
+    #[test]
+    fn test_no_sun_from_the_way_a_room_faces_after_dark() {
+        // West faces the sun in the afternoon, but not at 18:00 in January
+        let mut case = Case::new(at(17, 0), 20.5, weather(14.0, 0.0, None, 0.0));
+        case.room.faces = vec![Facing::W];
+        case.inside = true;
+        let evening = ComfortTime {
+            start: time(17, 0),
+            end: time(22, 0),
+            target: 20.0,
+        };
+        case.now = at(18, 0);
+        let d = case.decide(evening);
+        assert!(
+            !d.reasons.iter().any(|r| matches!(r, Sun { .. })),
+            "{:?}",
+            d.reasons
+        );
+        assert_eq!(d.action, Action::Heat);
+
+        // In summer it's still light at 18:00
+        case.daylight = Some(TimePeriod::new(5, 0, 21, 30));
+        assert!(case.decide(evening).reasons.contains(&Sun { gain_c: 2.0 }));
+
+        // Without sunrise and sunset, no sun from the facing
+        case.daylight = None;
+        assert_eq!(case.decide(evening).action, Action::Heat);
+
+        // A sun window counts in daylight, or when daylight isn't known, but never after dark
+        let window = [TimePeriod::new(16, 0, 19, 0)];
+        let with_window = |daylight| {
+            let mut inputs_case = Case::new(at(18, 0), 20.5, weather(14.0, 0.0, None, 0.0));
+            inputs_case.inside = true;
+            inputs_case.daylight = daylight;
+            decide(&Inputs {
+                now: inputs_case.now,
+                comfort: evening,
+                inside: true,
+                room_c: inputs_case.room_c,
+                weather: inputs_case.weather.as_ref(),
+                forecast: &[],
+                room: &inputs_case.room,
+                wind_exposure: WindExposure::Medium,
+                sun_windows: &window,
+                daylight,
+                max_early_minutes: 120,
+            })
+            .action
+        };
+        assert_eq!(
+            with_window(Some(TimePeriod::new(8, 0, 16, 0))),
+            Action::Heat
+        );
+        assert_eq!(
+            with_window(Some(TimePeriod::new(5, 0, 21, 30))),
+            Action::NotNeeded
+        );
+        assert_eq!(with_window(None), Action::NotNeeded);
     }
 
     #[test]
