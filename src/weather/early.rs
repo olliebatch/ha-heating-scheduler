@@ -148,6 +148,7 @@ mod tests {
         Weather {
             temperature: Some(temperature),
             wind_speed: Some(wind),
+            wind_bearing: None,
             cloud_coverage: None,
         }
     }

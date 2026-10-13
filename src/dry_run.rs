@@ -77,11 +77,13 @@ pub fn enabled(
 }
 
 /// Requests that only read Home Assistant, so they're still sent in a dry run. Anything not
-/// listed is treated as a change. `/api/template` renders a template (a read) but is a POST,
-/// which is why this lists reads rather than blocking POSTs.
+/// listed is treated as a change. `/api/template` renders a template and `weather.get_forecasts`
+/// returns a forecast (both reads) but are POSTs, which is why this lists reads rather than
+/// blocking POSTs.
 pub fn is_read(method: &reqwest::Method, endpoint: &str) -> bool {
     (method == reqwest::Method::GET && endpoint.starts_with("/api/states/"))
-        || (method == reqwest::Method::POST && endpoint == "/api/template")
+        || (method == reqwest::Method::POST
+            && (endpoint == "/api/template" || endpoint == crate::weather::FORECAST_ENDPOINT))
 }
 
 impl DryRun {
@@ -233,6 +235,15 @@ mod tests {
         ));
         assert!(!is_read(&Method::DELETE, "/api/states/climate.lounge_trv"));
         assert!(!is_read(&Method::POST, "/api/template/extra"));
+        assert!(is_read(
+            &Method::POST,
+            "/api/services/weather/get_forecasts?return_response"
+        ));
+        // Without return_response it's an ordinary service call
+        assert!(!is_read(
+            &Method::POST,
+            "/api/services/weather/get_forecasts"
+        ));
     }
 
     #[test]

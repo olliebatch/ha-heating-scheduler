@@ -104,9 +104,14 @@ Frost floor: any managed entity that would be Off is turned on at 10 °C when th
 below 7 °C, and turned off again once the room reaches 10 °C. It applies to every entity, in a zone or not, and needs
 no setting. A boost or an On period takes precedence.
 
-- `GET /weather` - The configured weather entity, the last reading and any error
+- `GET /weather` - The configured weather entity, the last reading and any error. The reading includes
+  `wind_bearing` (degrees the wind blows from, 0 = north; a compass point like `"NE"` is converted). `forecast` is the
+  hourly forecast, soonest first (`at` in UTC, plus the same fields as the reading, in °C and km/h), read with
+  `weather.get_forecasts` at most every 30 minutes (`forecast_tried_at`). A failed read sets `forecast_error` and keeps
+  the hours still to come. The forecast read is a service call, but it changes nothing, so a dry run still makes it
 - `PUT /weather` - Choose the weather entity: `{"entity_id": "weather.home"}` (`null` to stop); stored in `data/weather.json`
-- `POST /weather/mock` - Debug builds only: set the mock weather, e.g. `{"temperature": -2, "wind_speed": 40, "cloud_coverage": 10}`
+- `POST /weather/mock` - Debug builds only: set the mock weather, e.g. `{"temperature": -2, "wind_speed": 40, "wind_bearing": 0, "cloud_coverage": 10}`; the mock forecast is
+  the next 24 hours of it, 0.5 °C colder each hour
 - `PATCH /zones/{id}` also takes `sun_windows` (`[{"start": "08:00", "end": "11:00"}]`), `wind_exposure`
   (`low`/`medium`/`high`), `weather_adjust` (`true`/`false`), `max_early_start_minutes` and
   `max_late_finish_minutes` (both 0-180), and `cold_warmups`: `{"enabled": true, "below_c": 0, "min_gap_minutes": 240,
