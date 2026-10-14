@@ -4,6 +4,7 @@ use crate::dry_run::CALL_CONTEXT;
 use crate::schedule::HeatingState;
 use crate::schedule::TARGET_TEMP_RANGE;
 use crate::schedule::sets::ScheduleSets;
+use crate::shadow::{room_temperature, zone_tick};
 use crate::weather::Begun;
 use crate::weather::adjust::{Reason, adjust_target};
 use crate::weather::early::{EarlyStart, continue_early_start, early_start};
@@ -13,7 +14,7 @@ use crate::weather::{
     FORECAST_EVERY, Held, KEEP_READING_FOR, Weather, WeatherSource, WeatherStatus,
 };
 use crate::zones::{Zone, Zones};
-use crate::{ScheduleState, WeatherState, ZonesState};
+use crate::{ScheduleState, ShadowState, WeatherState, ZonesState};
 use chrono::{Local, NaiveTime};
 use serde::Serialize;
 use std::collections::HashMap;
@@ -35,6 +36,7 @@ pub struct SchedulerState<T: ClimateEntity + Clone> {
     pub weather_source: Arc<dyn WeatherSource>,
     pub climate_entities: Arc<RwLock<Vec<T>>>,
     pub last_sent_targets: LastSentTargets,
+    pub shadow: ShadowState,
 }
 
 /// Represents an action to be taken on a climate entity
@@ -524,7 +526,7 @@ pub async fn read_weather(
 
 /// Read the hourly forecast into `status` when the last attempt is [`FORECAST_EVERY`] old (or
 /// there hasn't been one), so Home Assistant is asked at most twice an hour. A failed read keeps
-/// the last forecast, minus the hours that have passed.
+/// the last forecast, minus the hours that have passed. Sunrise and sunset are read with it.
 pub async fn read_forecast(
     status: &WeatherState,
     source: &dyn WeatherSource,
@@ -541,12 +543,17 @@ pub async fn read_forecast(
         }
     };
     let result = source.fetch_forecast(&entity_id).await;
+    let daylight = source.fetch_daylight().await;
     let mut status = status.write().unwrap();
     // The entity was changed while the forecast was read: it's for the old one
     if status.entity_id.as_deref() != Some(entity_id.as_str()) {
         return;
     }
     status.forecast_tried_at = Some(now);
+    match daylight {
+        Ok(daylight) => status.daylight = daylight,
+        Err(e) => eprintln!("Failed to read sunrise and sunset, keeping the last: {}", e),
+    }
     match result {
         Ok(forecast) => {
             status.forecast = forecast;
@@ -559,6 +566,33 @@ pub async fn read_forecast(
             status.forecast.retain(|h| h.at > this_hour);
         }
     }
+}
+
+/// The room sensors of shadow and smart zones, by zone id. A sensor that can't be read is left
+/// out, so its zone uses its TRVs' readings.
+pub async fn read_room_sensors(
+    zones: &ZonesState,
+    source: &dyn WeatherSource,
+) -> HashMap<Uuid, f64> {
+    let sensors: Vec<(Uuid, String)> = zones
+        .read()
+        .unwrap()
+        .zones
+        .iter()
+        .filter(|z| z.mode != crate::zones::room::ZoneMode::Schedule)
+        .filter_map(|z| Some((z.id, z.room.sensor_entity_id.clone()?)))
+        .collect();
+    let mut readings = HashMap::new();
+    for (zone_id, sensor) in sensors {
+        match source.fetch_temperature(&sensor).await {
+            Ok(Some(c)) => {
+                readings.insert(zone_id, c);
+            }
+            Ok(None) => eprintln!("{sensor} has no reading; using the TRVs"),
+            Err(e) => eprintln!("Failed to read {sensor}, using the TRVs: {}", e),
+        }
+    }
+    readings
 }
 
 /// Why an entity is being set the way it is, e.g. "Lounge: 20 °C scheduled, +1.5 cold = 21.5 °C"
@@ -654,6 +688,7 @@ pub async fn run_scheduler<T: ClimateEntity + Clone>(state: SchedulerState<T>) {
         // Read the weather once per tick; without it, targets aren't adjusted
         let weather = read_weather(&state.weather, state.weather_source.as_ref(), now).await;
         read_forecast(&state.weather, state.weather_source.as_ref(), now).await;
+        let sensors = read_room_sensors(&state.zones, state.weather_source.as_ref()).await;
 
         // What each entity's zone schedule asks for right now, and why (for the dry-run log)
         let (scheduled, contexts, default_target_temp): (Vec<Scheduled>, Vec<String>, f64) = {
@@ -662,6 +697,30 @@ pub async fn run_scheduler<T: ClimateEntity + Clone>(state: SchedulerState<T>) {
             let mut weather_status = state.weather.write().unwrap();
             let WeatherStatus { held, begun, .. } = &mut *weather_status;
             let statuses = zone_statuses(&zones, &sets, weather.as_ref(), held, begun, &now);
+            // What Smart would do for shadow and smart zones: kept and logged, never sent
+            let mut shadow = state.shadow.write().unwrap();
+            let ticks = zones
+                .zones
+                .iter()
+                .filter(|z| z.mode != crate::zones::room::ZoneMode::Schedule)
+                .filter_map(|z| {
+                    let room_c = room_temperature(z, &entities_clone, sensors.get(&z.id).copied());
+                    let previous = shadow.decisions.get(&z.id).map(|d| &d.decision);
+                    let tick = zone_tick(
+                        z,
+                        &sets,
+                        statuses.get(&z.id)?,
+                        weather.as_ref(),
+                        &weather_status,
+                        room_c,
+                        previous,
+                        now,
+                    )?;
+                    Some((z.id, tick))
+                })
+                .collect();
+            shadow.record(ticks);
+            drop(shadow);
             let no_zone = zone_status(None, &sets, weather.as_ref(), None, None, &now);
             let (scheduled, contexts) = entities_clone
                 .iter()
@@ -1197,6 +1256,9 @@ mod tests {
         ) -> anyhow::Result<Vec<crate::weather::ForecastHour>> {
             Err(anyhow::anyhow!("HA unreachable"))
         }
+        async fn fetch_daylight(&self) -> anyhow::Result<Option<crate::schedule::TimePeriod>> {
+            anyhow::bail!("no sun")
+        }
     }
 
     #[tokio::test]
@@ -1218,6 +1280,8 @@ mod tests {
         let first = forecast(&status);
         assert_eq!(first.len(), 24);
         assert_eq!(first[1].weather.temperature, Some(-5.5));
+        let daylight = status.read().unwrap().daylight;
+        assert!(daylight.is_some());
 
         // Not due again for 30 minutes, even if it would fail
         read_forecast(&status, &FailingWeather, at(29)).await;
@@ -1230,6 +1294,7 @@ mod tests {
         assert!(kept.len() >= 21 && kept.len() < 24, "{}", kept.len());
         assert_eq!(kept.last(), first.last());
         assert!(status.read().unwrap().forecast_error.is_some());
+        assert_eq!(status.read().unwrap().daylight, daylight);
 
         read_forecast(&status, &mock, at(180)).await;
         assert_eq!(forecast(&status).len(), 24);

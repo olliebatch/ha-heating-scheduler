@@ -229,6 +229,9 @@ pub struct MockClimate {
     pub mode: Arc<Mutex<Option<HeatingState>>>,
     /// The room temperature reported on each fetch
     pub current_temperature: f64,
+    /// The room warms 0.25 °C a fetch towards the target while On, and cools 0.05 °C a fetch
+    /// to 12 °C while Off, so a debug run's room responds to heating
+    pub warms: bool,
 }
 
 impl MockClimate {
@@ -248,6 +251,7 @@ impl MockClimate {
             fail_set_temperature: false,
             mode: Default::default(),
             current_temperature: 21.0,
+            warms: false,
         }
     }
 }
@@ -297,6 +301,15 @@ impl ClimateEntity for MockClimate {
                 .map(|i| i.state.clone())
                 .unwrap_or(HeatingState::Off)
         });
+        if self.warms {
+            self.current_temperature = match (&state, target_temp) {
+                (HeatingState::On, Some(target)) if self.current_temperature < target => {
+                    (self.current_temperature + 0.25).min(target)
+                }
+                (HeatingState::Off, _) => (self.current_temperature - 0.05).max(12.0),
+                _ => self.current_temperature,
+            };
+        }
         self.info = Some(ClimateInfo {
             current_temperature: self.current_temperature,
             state,
