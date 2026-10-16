@@ -212,12 +212,18 @@ and cleans up. It needs ports 3000 and 5173 free (`PANEL_PORT` changes the panel
 
 ## Dry run against your Home Assistant
 
-Dry run reads your Home Assistant (areas, climates and weather) and works out exactly what it would do, without
-changing anything. Use it to check zones and weather adjustment on your own house before trusting them.
+Dry run reads your Home Assistant (areas, climates, weather, the forecast, `sun.sun` and room sensors) and works out
+exactly what it would do, without changing anything. Use it to check zones, weather adjustment and smart decisions on
+your own house before trusting them.
 
 Every request that would change Home Assistant (`/api/services/...`) is cut at the HA client: it's recorded instead
-of sent, and the scheduler carries on as if HA had accepted it. Only reads reach HA: `GET /api/states/...` and
-`POST /api/template`, which renders a template. Boost and anything you do in the panel go through the same client.
+of sent, and the scheduler carries on as if HA had accepted it. Only reads reach HA:
+- `GET /api/states/...`: climates, the weather entity, `sun.sun` and room sensors;
+- `POST /api/template`, which renders a template (areas);
+- `POST /api/services/weather/get_forecasts?return_response`, the hourly forecast. It's a service call, but it only
+  returns the forecast.
+
+Boost and anything you do in the panel go through the same client.
 
 1. Build the release version (debug builds use mock climates): `cargo build --release`.
 2. Use a separate, empty data folder, so the dry run doesn't share state with your real instance. Your normal
