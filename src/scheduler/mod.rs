@@ -631,6 +631,72 @@ pub fn call_context(zone: Option<&str>, status: &ZoneStatus, boosted: bool) -> S
     format!("{zone}: {why}")
 }
 
+/// A smart zone on the first tick after a start, when it can't decide yet because nothing has
+/// been read. Its entities are only read that tick: falling back to the schedule could turn off a
+/// warm-up that's under way. From the next tick it decides, or (with no room temperature at all)
+/// follows its schedule, so a radiator that never reads can't stop the zone being heated.
+pub fn smart_waiting(zone: &Zone, first_tick: bool) -> bool {
+    first_tick && zone.mode == crate::zones::room::ZoneMode::Smart
+}
+
+/// The decisions that heat their zones: smart zones' only, never shadow zones'
+pub fn acting_decisions(
+    zones: &Zones,
+    ticks: &HashMap<Uuid, crate::shadow::Tick>,
+) -> HashMap<Uuid, crate::smart::Decision> {
+    ticks
+        .iter()
+        .filter(|(id, _)| {
+            zones
+                .get(**id)
+                .is_some_and(|z| z.mode == crate::zones::room::ZoneMode::Smart)
+        })
+        .map(|(id, t)| (*id, t.decision.decision.clone()))
+        .collect()
+}
+
+/// What a smart zone's decision asks of its entities: On at the decision's target to heat, else Off
+pub fn smart_scheduled(decision: &crate::smart::Decision) -> Scheduled {
+    match (decision.action, decision.target) {
+        (crate::smart::Action::Heat, Some(target)) => Scheduled {
+            state: HeatingState::On,
+            target_temp: Some(target),
+        },
+        _ => Scheduled {
+            state: HeatingState::Off,
+            target_temp: None,
+        },
+    }
+}
+
+/// Why a smart zone's entity is set the way it is, e.g. "Lounge: smart, heat to 20 °C from 16:10
+/// for 17:00"
+pub fn smart_context(
+    zone: Option<&str>,
+    decision: &crate::smart::Decision,
+    boosted: bool,
+) -> String {
+    use crate::smart::{Action, Factor};
+    let comfort = decision.comfort.start.format("%H:%M");
+    let setback = decision
+        .reasons
+        .iter()
+        .any(|r| matches!(r, Factor::Setback { .. }));
+    let mut why = match (decision.action, decision.target) {
+        (Action::Heat, Some(c)) if setback => format!("smart, setback {c} °C"),
+        (Action::Heat, Some(c)) => format!(
+            "smart, heat to {c} °C from {} for {comfort}",
+            decision.start_at.format("%H:%M")
+        ),
+        (Action::NotNeeded, _) => format!("smart, not needed for {comfort}"),
+        _ => format!("smart, off until {}", decision.start_at.format("%H:%M")),
+    };
+    if boosted {
+        why += ", boost";
+    }
+    format!("{}: {why}", zone.unwrap_or("no zone"))
+}
+
 /// Bring a tick's results into the live entity list: each entity's fetched state, and the end of
 /// any boost the tick found expired. Entities added or removed during the tick stay that way, and a
 /// boost set during the tick (the live boost no longer matches the one the tick started with) is
@@ -669,6 +735,7 @@ pub async fn run_scheduler<T: ClimateEntity + Clone>(state: SchedulerState<T>) {
 
     println!("\n=== Heating Scheduler Started ===");
 
+    let mut first_tick = true;
     loop {
         interval.tick().await;
 
@@ -691,7 +758,9 @@ pub async fn run_scheduler<T: ClimateEntity + Clone>(state: SchedulerState<T>) {
         let sensors = read_room_sensors(&state.zones, state.weather_source.as_ref()).await;
 
         // What each entity's zone schedule asks for right now, and why (for the dry-run log)
-        let (scheduled, contexts, default_target_temp): (Vec<Scheduled>, Vec<String>, f64) = {
+        // None for an entity of a smart zone whose radiators haven't been read yet (the first tick
+        // after a start): it's only read, so a warm-up under way isn't turned off for one tick
+        let (scheduled, contexts, default_target_temp): (Vec<Option<Scheduled>>, Vec<String>, f64) = {
             let sets = state.schedule.read().unwrap();
             let zones = state.zones.read().unwrap();
             let mut weather_status = state.weather.write().unwrap();
@@ -703,6 +772,8 @@ pub async fn run_scheduler<T: ClimateEntity + Clone>(state: SchedulerState<T>) {
                 .zones
                 .iter()
                 .filter(|z| z.mode != crate::zones::room::ZoneMode::Schedule)
+                // Not until its radiators have been read (the first tick after a start)
+                .filter(|z| crate::shadow::zone_read(z, &entities_clone))
                 .filter_map(|z| {
                     let room_c = room_temperature(z, &entities_clone, sensors.get(&z.id).copied());
                     let previous = shadow.decisions.get(&z.id).map(|d| &d.decision);
@@ -718,7 +789,9 @@ pub async fn run_scheduler<T: ClimateEntity + Clone>(state: SchedulerState<T>) {
                     )?;
                     Some((z.id, tick))
                 })
-                .collect();
+                .collect::<HashMap<Uuid, crate::shadow::Tick>>();
+            // Smart zones are heated by their decision; shadow zones only log theirs
+            let acting = acting_decisions(&zones, &ticks);
             shadow.record(ticks);
             drop(shadow);
             let no_zone = zone_status(None, &sets, weather.as_ref(), None, None, &now);
@@ -730,14 +803,26 @@ pub async fn run_scheduler<T: ClimateEntity + Clone>(state: SchedulerState<T>) {
                     let boosted = calculate_desired_heating_state_for_boost(e.get_boosted_status())
                         .0
                         == HeatingState::On;
+                    let name = zone.map(|z| z.name.as_str());
+                    // A boost still wins (in apply_schedule_to_entity), and the frost floor
+                    // still applies when Smart leaves a room off
+                    if let Some(decision) = zone.and_then(|z| acting.get(&z.id)) {
+                        return (
+                            Some(smart_scheduled(decision)),
+                            smart_context(name, decision, boosted),
+                        );
+                    }
+                    if zone.is_some_and(|z| smart_waiting(z, first_tick)) {
+                        return (
+                            None,
+                            format!("{}: smart, reading the room", name.unwrap_or("no zone")),
+                        );
+                    }
                     let scheduled = Scheduled {
                         state: status.state.clone(),
                         target_temp: status.target,
                     };
-                    (
-                        scheduled,
-                        call_context(zone.map(|z| z.name.as_str()), status, boosted),
-                    )
+                    (Some(scheduled), call_context(name, status, boosted))
                 })
                 .unzip();
             (scheduled, contexts, sets.default_target_temp)
@@ -754,6 +839,12 @@ pub async fn run_scheduler<T: ClimateEntity + Clone>(state: SchedulerState<T>) {
             if !still_managed() {
                 continue;
             }
+            let Some(scheduled) = scheduled else {
+                if let Err(e) = entity.fetch_and_update_state(&state.api_client).await {
+                    eprintln!("Error fetching state for {}: {}", id, e);
+                }
+                continue;
+            };
             let mut last_sent = state
                 .last_sent_targets
                 .lock()
@@ -788,6 +879,7 @@ pub async fn run_scheduler<T: ClimateEntity + Clone>(state: SchedulerState<T>) {
         if let Ok(mut climates) = state.climate_entities.write() {
             merge_tick_results(&mut climates, &entities_clone, &boosts_at_start);
         }
+        first_tick = false;
     }
 }
 
@@ -1062,6 +1154,145 @@ mod tests {
         tick(&mut entity, &off, &mut last).await;
         assert_eq!(*entity.mode.lock().unwrap(), Some(HeatingState::Off));
         assert_eq!(last, None);
+    }
+
+    fn smart_decision(action: crate::smart::Action) -> crate::smart::Decision {
+        let five = NaiveTime::from_hms_opt(17, 0, 0).unwrap();
+        crate::smart::Decision {
+            action,
+            target: (action == crate::smart::Action::Heat).then_some(20.5),
+            start_at: NaiveTime::from_hms_opt(16, 10, 0).unwrap(),
+            comfort: crate::smart::ComfortTime {
+                start: five,
+                end: NaiveTime::from_hms_opt(22, 0, 0).unwrap(),
+                target: 20.5,
+            },
+            reasons: Vec::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_a_smart_decision_heats_and_stops_and_the_frost_floor_still_applies() {
+        use crate::smart::Action;
+        let mut entity = mock(HeatingState::Off);
+        let mut last = None;
+        let heat = smart_scheduled(&smart_decision(Action::Heat));
+        tick(&mut entity, &heat, &mut last).await;
+        assert_eq!(*entity.mode.lock().unwrap(), Some(HeatingState::On));
+        assert_eq!(sent(&entity), vec![20.5]);
+
+        for action in [Action::NotNeeded, Action::Off] {
+            let off = smart_scheduled(&smart_decision(action));
+            entity.mode.lock().unwrap().replace(HeatingState::On);
+            tick(&mut entity, &off, &mut last).await;
+            assert_eq!(*entity.mode.lock().unwrap(), Some(HeatingState::Off));
+        }
+
+        // Smart leaves it off, but the room is freezing
+        entity.current_temperature = 6.0;
+        tick(
+            &mut entity,
+            &smart_scheduled(&smart_decision(Action::Off)),
+            &mut last,
+        )
+        .await;
+        assert_eq!(*entity.mode.lock().unwrap(), Some(HeatingState::On));
+        assert_eq!(sent(&entity).last(), Some(&FROST_TARGET_C));
+    }
+
+    #[tokio::test]
+    async fn test_only_smart_zones_act_on_their_decisions() {
+        use crate::zones::room::ZoneMode;
+        let mut zones = Zones::default();
+        zones.reconcile(None, &["climate.a".to_string()]);
+        zones
+            .create_manual(
+                "Loft",
+                &["climate.a".to_string()],
+                &["climate.a".to_string()],
+            )
+            .unwrap();
+        let ids: Vec<Uuid> = zones.zones.iter().map(|z| z.id).collect();
+        let zone_tick = || crate::shadow::Tick {
+            decision: crate::shadow::ZoneDecision {
+                at: Local::now(),
+                room_c: Some(18.0),
+                schedule_start: NaiveTime::from_hms_opt(17, 0, 0).unwrap(),
+                decision: smart_decision(crate::smart::Action::Heat),
+            },
+            inside: false,
+            schedule_heating: false,
+        };
+        let ticks: HashMap<Uuid, crate::shadow::Tick> =
+            ids.iter().map(|id| (*id, zone_tick())).collect();
+        let (shadow, smart) = (ids[0], ids[1]);
+        zones.zones[0].mode = ZoneMode::Shadow;
+        zones.zones[1].mode = ZoneMode::Smart;
+
+        let acting = acting_decisions(&zones, &ticks);
+        assert!(
+            !acting.contains_key(&shadow),
+            "a shadow zone never heats from its decision"
+        );
+        assert!(acting.contains_key(&smart));
+
+        // A tick for each zone's TRV, the schedule Off: the shadow zone's sends nothing, though
+        // its decision is Heat; the smart zone's heats
+        let schedule_off = scheduled(HeatingState::Off, None);
+        for (zone, heats) in [(shadow, false), (smart, true)] {
+            let mut trv = mock(HeatingState::Off);
+            let mut last = None;
+            let wanted = acting
+                .get(&zone)
+                .map_or(schedule_off.clone(), smart_scheduled);
+            tick(&mut trv, &wanted, &mut last).await;
+            assert_eq!(!sent(&trv).is_empty(), heats);
+            assert_eq!(*trv.mode.lock().unwrap() == Some(HeatingState::On), heats);
+        }
+    }
+
+    #[test]
+    fn test_a_smart_zone_waits_only_on_the_first_tick() {
+        use crate::zones::room::ZoneMode;
+        let mut zones = Zones::default();
+        zones.reconcile(None, &["climate.test".to_string()]);
+        let mut zone = zones.zones[0].clone();
+        zone.mode = ZoneMode::Smart;
+        assert!(smart_waiting(&zone, true));
+        assert!(
+            !smart_waiting(&zone, false),
+            "after that, never: a dead TRV can't stop it"
+        );
+        // Schedule and shadow zones follow the schedule from the first tick
+        for mode in [ZoneMode::Schedule, ZoneMode::Shadow] {
+            zone.mode = mode;
+            assert!(!smart_waiting(&zone, true));
+        }
+    }
+
+    #[test]
+    fn test_smart_context() {
+        use crate::smart::{Action, Factor};
+        let heat = smart_decision(Action::Heat);
+        assert_eq!(
+            smart_context(Some("Lounge"), &heat, false),
+            "Lounge: smart, heat to 20.5 °C from 16:10 for 17:00"
+        );
+        let mut setback = heat.clone();
+        setback.target = Some(15.0);
+        setback.reasons.push(Factor::Setback { c: 15.0 });
+        assert_eq!(
+            smart_context(None, &setback, true),
+            "no zone: smart, setback 15 °C, boost"
+        );
+        assert_eq!(
+            smart_context(Some("Lounge"), &smart_decision(Action::NotNeeded), false),
+            "Lounge: smart, not needed for 17:00"
+        );
+        assert_eq!(
+            smart_context(Some("Lounge"), &smart_decision(Action::Off), false),
+            "Lounge: smart, off until 16:10"
+        );
     }
 
     #[tokio::test]

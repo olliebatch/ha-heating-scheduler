@@ -11,7 +11,7 @@ use crate::smart::{
 };
 use crate::weather::{Weather, WeatherStatus};
 use crate::zones::Zone;
-use chrono::{DateTime, Local, NaiveTime, TimeDelta};
+use chrono::{DateTime, Local, NaiveTime, TimeDelta, Timelike};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
 use std::io::Write;
@@ -62,7 +62,8 @@ pub fn zone_tick(
         .filter(|e| e.period_start == comfort.start);
     Some(Tick {
         decision: ZoneDecision {
-            at: now,
+            // Whole seconds, so the times recorded from it read plainly
+            at: now.with_nanosecond(0).unwrap_or(now),
             room_c,
             schedule_start: early.map_or(comfort.start, |e| {
                 comfort.start - TimeDelta::minutes(i64::from(e.minutes_early))
@@ -74,6 +75,15 @@ pub fn zone_tick(
             && status.warm_up.is_none()
             && (inside || early.is_some()),
     })
+}
+
+/// Whether any of the zone's entities has been read, so its room temperature is known (it isn't
+/// on the first tick after a start). One that never reads doesn't hold the zone up.
+pub fn zone_read<T: ClimateEntity>(zone: &Zone, entities: &[T]) -> bool {
+    entities
+        .iter()
+        .filter(|e| zone.entity_ids.iter().any(|id| id == e.get_entity_id()))
+        .any(|e| e.get_cached_state().is_some())
 }
 
 /// The room temperature: the zone's sensor reading when there is one, else the average of its
@@ -573,6 +583,17 @@ mod tests {
         };
         let t = tick(&zone, &off()).unwrap();
         assert_eq!(t.decision.decision.comfort, EVENING);
+        let late = zone_tick(
+            &zone,
+            &sets,
+            &off(),
+            None,
+            &weather,
+            None,
+            None,
+            at(16, 30) + TimeDelta::milliseconds(250),
+        );
+        assert_eq!(late.unwrap().decision.at, at(16, 30), "whole seconds");
         assert_eq!(t.decision.schedule_start, time(17, 0));
         assert!(!t.inside && !t.schedule_heating);
 
@@ -606,5 +627,11 @@ mod tests {
         assert_eq!(room_temperature(&zone, &trvs, None), Some(18.6));
         assert_eq!(room_temperature(&zone, &trvs, Some(17.04)), Some(17.0));
         assert_eq!(room_temperature(&zone, &trvs[2..], None), None);
+        assert!(zone_read(&zone, &trvs));
+        let mut unread = trv("climate.a", 18.0);
+        unread.info = None;
+        assert!(!zone_read(&zone, std::slice::from_ref(&unread)));
+        // One radiator that never reads doesn't hold the zone up
+        assert!(zone_read(&zone, &[unread, trv("climate.b", 19.0)]));
     }
 }
