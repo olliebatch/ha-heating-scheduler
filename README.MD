@@ -16,6 +16,42 @@ Optional: `PORT` (default 3000) for the API, and `DRY_RUN=1` to read Home Assist
 "Dry run against your Home Assistant"). `DRY_RUN` takes 1/true/yes/on or 0/false/no/off, in any case; any other
 value stops the backend at startup, so a typo can't run it live.
 
+### Timezone
+
+Schedule times are local wall-clock time: an On at 19:00 means 19:00 on the clock in your timezone, summer and winter.
+The backend takes its timezone from `TZ` (e.g. `TZ=Europe/London`), or else `/etc/localtime`; with neither, it's UTC.
+The startup log says which, e.g. `Timezone: Europe/London (from TZ), now +01:00`, and warns loudly when none is set.
+
+When the clocks change, the schedule follows the clock. When they go back, the repeated hour is scheduled twice; when
+they go forward, a period entirely inside the skipped hour doesn't happen. A boost lasts as long as asked for either way.
+
+### Running in Docker
+
+The image has the timezone database and defaults to `TZ=Europe/London`. Set yours with `-e TZ=...`:
+
+```bash
+docker build -t ha-heating-scheduler .
+docker run -d --name heating -p 3000:3000 --env-file .env -e TZ=Europe/London \
+  -e DATA_PATH=/data -v "$PWD/data:/data" ha-heating-scheduler
+```
+
+With Compose:
+
+```yaml
+services:
+  heating:
+    build: .
+    ports: ["3000:3000"]
+    env_file: .env
+    environment:
+      TZ: Europe/London
+      DATA_PATH: /data
+    volumes:
+      - ./data:/data
+```
+
+Mounting the host's `/etc/localtime` (`-v /etc/localtime:/etc/localtime:ro`) works too, but `TZ` wins over it.
+
 ### Entity Management
 
 Climate entities are stored in `data/entities.json` and can be managed via API.

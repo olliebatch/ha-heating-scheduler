@@ -5,7 +5,6 @@ use axum::Router;
 use axum::body::Bytes;
 use axum::extract::State;
 use axum::http::{Method, Uri};
-use chrono::NaiveTime;
 use ha_heating_scheduler::api_client::ApiClient;
 use ha_heating_scheduler::climate::{BoostInfo, ClimateEntity, DefaultClimate};
 use ha_heating_scheduler::dry_run::DryRun;
@@ -82,11 +81,7 @@ async fn run_through(client: &ApiClient, ha: &FakeHa) {
     apply_schedule_to_entity(&mut trv, &on(21.0), 20.0, client, &mut last_sent, &|| true).await;
     apply_schedule_to_entity(&mut trv, &on(22.0), 20.0, client, &mut last_sent, &|| true).await;
 
-    // Boosted all day, so the time of day doesn't matter
-    trv.set_boost(Some(BoostInfo {
-        boost_start: NaiveTime::MIN,
-        boost_end: NaiveTime::from_hms_opt(23, 59, 59).unwrap(),
-    }));
+    trv.set_boost(Some(BoostInfo::starting(chrono::Local::now(), 60)));
     apply_schedule_to_entity(
         &mut trv,
         &scheduled(HeatingState::Off, None),

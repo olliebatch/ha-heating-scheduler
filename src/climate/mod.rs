@@ -2,7 +2,7 @@ use crate::api_client::ApiClient;
 use crate::climate::climate_state_api::{ApiHeatingState, ClimateState as ApiClimateState};
 use crate::schedule::HeatingState;
 use anyhow::anyhow;
-use chrono::NaiveTime;
+use chrono::{DateTime, Local, TimeDelta};
 use std::sync::{Arc, Mutex};
 
 pub mod climate;
@@ -21,21 +21,27 @@ pub struct ClimateInfo {
     pub max_temp: Option<f64>,
 }
 
-#[derive(Debug, Default, Clone, PartialEq)]
+/// A boost from when it was asked for until its end. These are instants, not times of day, so a
+/// boost lasts as long as asked for across midnight and when the clocks change.
+#[derive(Debug, Clone, PartialEq)]
 pub struct BoostInfo {
-    pub boost_start: NaiveTime,
-    pub boost_end: NaiveTime,
+    pub boost_start: DateTime<Local>,
+    pub boost_end: DateTime<Local>,
 }
 
 impl BoostInfo {
-    /// Whether the boost covers `now`; an end before the start means it runs past midnight
-    /// (a boost is at most 255 minutes, so it never covers a whole day)
-    pub fn is_active(&self, now: NaiveTime) -> bool {
-        if self.boost_start <= self.boost_end {
-            self.boost_start <= now && now <= self.boost_end
-        } else {
-            now >= self.boost_start || now <= self.boost_end
+    /// A boost from `now` for `minutes`
+    pub fn starting(now: DateTime<Local>, minutes: i64) -> Self {
+        Self {
+            boost_start: now,
+            boost_end: now + TimeDelta::minutes(minutes),
         }
+    }
+
+    /// Whether the boost covers `now`. Only its end counts, so a clock stepped back a moment
+    /// after a boost began doesn't end it.
+    pub fn is_active(&self, now: DateTime<Local>) -> bool {
+        now <= self.boost_end
     }
 }
 
