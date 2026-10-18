@@ -19,7 +19,9 @@ value stops the backend at startup, so a typo can't run it live.
 ### Timezone
 
 Schedule times are local wall-clock time: an On at 19:00 means 19:00 on the clock in your timezone, summer and winter.
-The backend takes its timezone from `TZ` (e.g. `TZ=Europe/London`), or else `/etc/localtime`; with neither, it's UTC.
+The backend takes its timezone from `TZ` (e.g. `TZ=Europe/London`), or else `/etc/localtime`; with neither, it's UTC. A
+`TZ` that is set but empty means UTC too, whatever `/etc/localtime` says: in Compose, `TZ: ${TZ}` does that when the
+host has no `TZ`.
 The startup log says which, e.g. `Timezone: Europe/London (from TZ), now +01:00`, and warns loudly when none is set.
 
 When the clocks change, the schedule follows the clock. When they go back, the repeated hour is scheduled twice; when

@@ -22,7 +22,7 @@ pub fn port(env: Option<String>) -> anyhow::Result<u16> {
 /// The startup line naming the timezone that schedule times are read in, and a warning when it may
 /// not be the one meant. `tz` is `TZ`; `localtime` is where `/etc/localtime` links to (itself when
 /// it's a plain file), if it's there; `zone_exists` says whether a zone file exists for a name.
-/// Without either, the clock is UTC.
+/// Without either, or with `TZ` set but empty (which wins over `/etc/localtime`), the clock is UTC.
 pub fn timezone(
     tz: Option<&str>,
     localtime: Option<&Path>,
@@ -30,16 +30,26 @@ pub fn timezone(
     offset: chrono::FixedOffset,
 ) -> (String, Option<String>) {
     match tz.map(|tz| tz.trim().trim_start_matches(':')) {
-        Some(tz) if !tz.is_empty() => {
+        // e.g. Compose's `TZ: ${TZ}` when the host has no TZ
+        Some("") => (
+            format!("Timezone: UTC, as TZ is empty, now {offset}"),
+            Some(
+                "=== WARNING: TZ IS SET BUT EMPTY, SO SCHEDULE TIMES ARE UTC ===\n\
+                 Set TZ to yours, e.g. TZ=Europe/London, or leave it unset."
+                    .to_string(),
+            ),
+        ),
+        Some(tz) => {
             let warning = (tz != "UTC" && !zone_exists(tz)).then(|| {
                 format!(
                     "=== WARNING: TZ={tz}, BUT THERE'S NO SUCH TIMEZONE ===\n\
-                     Is tzdata installed? Without it, schedule times are UTC."
+                     Is tzdata installed? Without it, schedule times follow /etc/localtime, \
+                     or else UTC."
                 )
             });
             (format!("Timezone: {tz} (from TZ), now {offset}"), warning)
         }
-        _ => match localtime {
+        None => match localtime {
             Some(path) => {
                 let path = path.to_string_lossy();
                 let line = match path.split_once("zoneinfo/") {
@@ -206,11 +216,17 @@ mod tests {
         assert_eq!(line, "Timezone: from /etc/localtime, now +01:00");
 
         // Neither: UTC, loudly
-        let (line, warning) = timezone(Some(""), None, london, utc);
+        let (line, warning) = timezone(None, None, london, utc);
         assert_eq!(line, "Timezone: UTC, as none is set, now +00:00");
         assert!(warning.unwrap().contains("NO TIMEZONE SET"));
 
-        // A zone with no zone file (no tzdata) is UTC too
+        // An empty TZ is UTC, even with /etc/localtime there
+        let (line, warning) = timezone(Some(""), Some(link), london, utc);
+        assert_eq!(line, "Timezone: UTC, as TZ is empty, now +00:00");
+        assert!(warning.unwrap().contains("TZ IS SET BUT EMPTY"));
+        assert!(timezone(Some(" : "), None, london, utc).1.is_some());
+
+        // A zone with no zone file (no tzdata) isn't the zone meant
         let (_, warning) = timezone(Some("Europe/Paris"), None, london, utc);
         assert!(warning.unwrap().contains("TZ=Europe/Paris, BUT"));
         // UTC asked for is no surprise
