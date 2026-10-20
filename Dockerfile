@@ -10,11 +10,15 @@ RUN cargo build --release --locked
 # Runtime image
 FROM debian:bookworm-slim
 
-# Install OpenSSL (needed for reqwest)
+# Install OpenSSL (needed for reqwest), and tzdata so TZ names a real timezone
 RUN apt-get update && apt-get install -y \
     ca-certificates \
     libssl3 \
+    tzdata \
     && rm -rf /var/lib/apt/lists/*
+
+# Schedule times are local wall-clock time in this timezone; `-e TZ=...` sets yours
+ENV TZ=Europe/London
 
 WORKDIR /app
 

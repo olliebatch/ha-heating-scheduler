@@ -6,7 +6,7 @@ use crate::server::AppState;
 use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
-use chrono::{Duration, Local};
+use chrono::Local;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -275,11 +275,7 @@ pub async fn boost_all<T: ClimateEntity + Clone>(
 ) -> Result<StatusCode, (StatusCode, String)> {
     if let Ok(mut climates) = state.climate_entities.write() {
         for entity in climates.iter_mut() {
-            let now = Local::now().time();
-            entity.set_boost(Some(BoostInfo {
-                boost_start: now.clone(),
-                boost_end: now + Duration::minutes(45),
-            }));
+            entity.set_boost(Some(BoostInfo::starting(Local::now(), 45)));
         }
         return Ok(StatusCode::OK);
     }
@@ -305,11 +301,10 @@ pub async fn boost<T: ClimateEntity + Clone>(
                 .climate_names
                 .contains(&entity.get_entity_id().to_string())
             {
-                let now = Local::now().time();
-                entity.set_boost(Some(BoostInfo {
-                    boost_start: now,
-                    boost_end: now + Duration::minutes(boost_climates.time_length as i64),
-                }));
+                entity.set_boost(Some(BoostInfo::starting(
+                    Local::now(),
+                    i64::from(boost_climates.time_length),
+                )));
             }
         }
         return Ok(StatusCode::OK);
@@ -367,8 +362,10 @@ pub async fn get_entities<T: ClimateEntity + Clone>(
                     target_temp: cached_state.as_ref().and_then(|s| s.target_temp),
                     state: cached_state.as_ref().map(|s| format!("{:?}", s.state)),
                     boost_active: boost_info.is_some(),
-                    boost_start: boost_info.as_ref().map(|b| b.boost_start.to_string()),
-                    boost_end: boost_info.as_ref().map(|b| b.boost_end.to_string()),
+                    boost_start: boost_info
+                        .as_ref()
+                        .map(|b| b.boost_start.time().to_string()),
+                    boost_end: boost_info.as_ref().map(|b| b.boost_end.time().to_string()),
                 }
             })
             .collect();

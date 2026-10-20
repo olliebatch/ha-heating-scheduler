@@ -15,7 +15,7 @@ use crate::weather::{
 };
 use crate::zones::{Zone, Zones};
 use crate::{ScheduleState, ShadowState, WeatherState, ZonesState};
-use chrono::{Local, NaiveTime};
+use chrono::Local;
 use serde::Serialize;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
@@ -68,10 +68,13 @@ pub fn calculate_heating_action_for_schedule(
 pub fn calculate_desired_heating_state_for_boost(
     boost_info: &Option<BoostInfo>,
 ) -> (HeatingState, bool) {
-    boost_state_at(boost_info, Local::now().time())
+    boost_state_at(boost_info, Local::now())
 }
 
-fn boost_state_at(boost_info: &Option<BoostInfo>, now: NaiveTime) -> (HeatingState, bool) {
+fn boost_state_at(
+    boost_info: &Option<BoostInfo>,
+    now: chrono::DateTime<Local>,
+) -> (HeatingState, bool) {
     if let Some(boosted) = boost_info {
         if boosted.is_active(now) {
             return (HeatingState::On, false);
@@ -886,6 +889,7 @@ pub async fn run_scheduler<T: ClimateEntity + Clone>(state: SchedulerState<T>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::NaiveTime;
 
     #[test]
     fn test_call_context() {
@@ -1314,11 +1318,7 @@ mod tests {
     #[tokio::test]
     async fn test_boost_during_off_uses_default_target() {
         let mut entity = mock(HeatingState::Off);
-        let now = Local::now().time();
-        entity.set_boost(Some(BoostInfo {
-            boost_start: now,
-            boost_end: now + chrono::Duration::minutes(1),
-        }));
+        entity.set_boost(Some(BoostInfo::starting(Local::now(), 1)));
         let mut last = None;
 
         tick(&mut entity, &scheduled(HeatingState::Off, None), &mut last).await;
@@ -2184,40 +2184,35 @@ mod tests {
         assert_eq!(status.state, HeatingState::Off);
     }
 
+    /// `h:m` UTC on `day` `month` 2026
+    fn utc(month: u32, day: u32, h: u32, m: u32) -> chrono::DateTime<Local> {
+        use chrono::TimeZone;
+        let at = chrono::NaiveDate::from_ymd_opt(2026, month, day)
+            .unwrap()
+            .and_hms_opt(h, m, 0)
+            .unwrap();
+        Local.from_utc_datetime(&at)
+    }
+
     fn boost(minutes: i64) -> BoostInfo {
-        let start = chrono::NaiveTime::from_hms_opt(12, 0, 0).unwrap();
-        BoostInfo {
-            boost_start: start,
-            boost_end: start + chrono::Duration::minutes(minutes),
-        }
-    }
-
-    fn at(h: u32, m: u32) -> NaiveTime {
-        NaiveTime::from_hms_opt(h, m, 0).unwrap()
-    }
-
-    fn boost_from(h: u32, m: u32, minutes: i64) -> Option<BoostInfo> {
-        Some(BoostInfo {
-            boost_start: at(h, m),
-            boost_end: at(h, m) + chrono::Duration::minutes(minutes),
-        })
+        BoostInfo::starting(utc(1, 15, 12, 0), minutes)
     }
 
     const HEATS: (HeatingState, bool) = (HeatingState::On, false);
     const ENDS: (HeatingState, bool) = (HeatingState::Off, true);
 
     #[test]
-    fn test_boost_heats_until_its_end_the_same_day() {
-        let b = boost_from(12, 0, 60);
-        assert_eq!(boost_state_at(&b, at(12, 0)), HEATS);
-        assert_eq!(boost_state_at(&b, at(12, 59)), HEATS);
+    fn test_boost_heats_until_its_end() {
+        let b = Some(boost(60));
+        assert_eq!(boost_state_at(&b, utc(1, 15, 12, 0)), HEATS);
+        assert_eq!(boost_state_at(&b, utc(1, 15, 12, 59)), HEATS);
         assert_eq!(
-            boost_state_at(&b, at(13, 1)),
+            boost_state_at(&b, utc(1, 15, 13, 1)),
             ENDS,
             "expired boost is cleared"
         );
         assert_eq!(
-            boost_state_at(&None, at(12, 30)),
+            boost_state_at(&None, utc(1, 15, 12, 30)),
             (HeatingState::Off, false)
         );
     }
@@ -2225,25 +2220,57 @@ mod tests {
     #[test]
     fn test_boost_past_midnight_heats_until_its_real_end() {
         // 23:30 to 01:30
-        let b = boost_from(23, 30, 120);
-        assert_eq!(boost_state_at(&b, at(23, 30)), HEATS, "first tick");
-        assert_eq!(boost_state_at(&b, at(23, 59)), HEATS);
+        let b = Some(BoostInfo::starting(utc(1, 15, 23, 30), 120));
+        assert_eq!(boost_state_at(&b, utc(1, 15, 23, 30)), HEATS, "first tick");
         assert_eq!(
-            boost_state_at(&b, at(0, 0)),
+            boost_state_at(&b, utc(1, 16, 0, 0)),
             HEATS,
-            "tick right after midnight"
+            "after midnight"
         );
-        assert_eq!(boost_state_at(&b, at(1, 29)), HEATS);
-        assert_eq!(boost_state_at(&b, at(1, 31)), ENDS, "cleared after its end");
+        assert_eq!(boost_state_at(&b, utc(1, 16, 1, 29)), HEATS);
+        assert_eq!(
+            boost_state_at(&b, utc(1, 16, 1, 31)),
+            ENDS,
+            "cleared after its end"
+        );
     }
 
     #[test]
-    fn test_boost_started_just_before_midnight() {
-        // 23:59 for 30 minutes, so it ends at 00:29
-        let b = boost_from(23, 59, 30);
-        assert_eq!(boost_state_at(&b, at(23, 59)), HEATS);
-        assert_eq!(boost_state_at(&b, at(0, 1)), HEATS);
-        assert_eq!(boost_state_at(&b, at(0, 30)), ENDS);
+    fn test_boost_lasts_as_long_as_asked_when_the_clocks_go_back() {
+        // 25 Oct 2026: at 01:00 UTC, UK clocks go back from 02:00 BST to 01:00 GMT. A boost from
+        // 01:30 BST (00:30 UTC) for an hour then sees the clock read 01:00, before its start,
+        // which a boost of times of day took as over.
+        let b = Some(BoostInfo::starting(utc(10, 25, 0, 30), 60));
+        assert_eq!(
+            boost_state_at(&b, utc(10, 25, 1, 0)),
+            HEATS,
+            "clocks just went back"
+        );
+        assert_eq!(boost_state_at(&b, utc(10, 25, 1, 29)), HEATS);
+        assert_eq!(
+            boost_state_at(&b, utc(10, 25, 1, 31)),
+            ENDS,
+            "an hour after it began"
+        );
+    }
+
+    #[test]
+    fn test_boost_lasts_as_long_as_asked_when_the_clocks_go_forward() {
+        // 29 Mar 2026: at 01:00 UTC, UK clocks go forward from 01:00 GMT to 02:00 BST. A boost from
+        // 00:50 GMT for 45 minutes then sees the clock read 02:00, past its 01:35 end, which a
+        // boost of times of day took as over.
+        let b = Some(BoostInfo::starting(utc(3, 29, 0, 50), 45));
+        assert_eq!(
+            boost_state_at(&b, utc(3, 29, 1, 0)),
+            HEATS,
+            "clocks just went forward"
+        );
+        assert_eq!(boost_state_at(&b, utc(3, 29, 1, 34)), HEATS);
+        assert_eq!(
+            boost_state_at(&b, utc(3, 29, 1, 36)),
+            ENDS,
+            "45 minutes after it began"
+        );
     }
 
     fn named(id: &str) -> crate::climate::MockClimate {

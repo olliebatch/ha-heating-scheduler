@@ -37,6 +37,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = config::Config::from_env_with_persisted_entities()?;
     let port = config::port(std::env::var("PORT").ok())?;
 
+    // Schedule times are local wall-clock time, so say which zone that is
+    let (timezone, warning) = config::system_timezone();
+    println!("{timezone}");
+    if let Some(warning) = warning {
+        eprintln!("\n{warning}\n");
+    }
+
     // Dry run: read Home Assistant, but record the calls that would change it instead of sending them
     let dry_run = dry_run::enabled(std::env::args(), std::env::var("DRY_RUN").ok())
         .map_err(|e| anyhow::anyhow!(e))?
