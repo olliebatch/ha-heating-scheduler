@@ -39,20 +39,26 @@ add to it in the same change when you learn something the next contributor would
   from before this tick's fetch). A failed fetch leaves the old cached state in place, so check
   `EntityMemory.read` before trusting a reading: `drive_reading` and `smart_reading` do. Don't
   call `shadow::room_temperature` on all the entities for a decision.
-
 - A smart zone's TRVs on the first tick after a start (`smart_waiting`) are fetched in
   `run_scheduler`'s `let Some(scheduled) = scheduled else` branch, not by
   `apply_schedule_to_entity`. Anything apply records per entity (like `EntityMemory.read`) must
-  be recorded there too. `run_scheduler` has no test harness, so check that branch by running it
-  against a fake HA.
+  be recorded there too.
+- `run_scheduler` has no test harness. Keep logic out of it, in functions you can test
+  (`smart_reading`, `smart_waiting`), and check anything left inline against a fake HA.
 - Decisions are made before the tick's fetch, so the tick on which a TRV comes back still decides
-  without it; its reading counts from the next tick.
+  without it (and that decision is sent); driving also pauses for that tick. Its reading counts
+  from the next tick.
 
 ## Gotchas
 - `smart::decide` has early returns (no room temperature, no weather) for falling back to the
   schedule. A fallback that comes before the "begun" check cancels a warm-up under way: the
   no-room-temperature one keeps a begun Heat (and its `Lead` reason, which is what marks it
   begun), but the no-weather one doesn't yet. Keep a begun warm-up in any new fallback.
+- `ComfortTime` has no date, so tomorrow's same period compares equal. A warm-up stops counting
+  as begun only because every tick inside the comfort time drops the `Lead` reason; keep that
+  true if you change the decision inside the comfort time.
+- `Shadow::load` restores the decisions log but not the latest `decisions`, so after a restart
+  there's no `previous`: no hysteresis and no begun warm-up carry over.
 - The top-level readme is `README.MD` (upper-case extension) in git. It opens as `README.md` on
   a case-insensitive filesystem but not on Linux, so use the real name in scripts.
 - The frost floor knows it started the heating from `last_sent == Some(FROST_TARGET_C)` (10 °C).
