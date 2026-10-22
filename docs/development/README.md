@@ -1,6 +1,7 @@
-# What the team knows about the backend
+# Backend development notes
 
-Read this before starting a ticket, and add to it before one ships.
+How the backend works, its conventions and its pitfalls. Read it before changing the code, and
+add to it in the same change when you learn something the next contributor would want.
 
 ## Where things live
 - `src/scheduler/mod.rs`: the loop (`run_scheduler`), what each entity is sent
@@ -41,7 +42,7 @@ Read this before starting a ticket, and add to it before one ships.
 - The frost floor knows it started the heating from `last_sent == Some(FROST_TARGET_C)` (10 °C).
   A schedule target of exactly 10 °C looks the same. Don't send 10 °C for any other reason
   without changing that check.
-- Driving TRVs harder (gh-32): the TRV offset applies only to the drive reading. Smart and
+- Driving TRVs harder: the TRV offset applies only to the drive reading. Smart and
   Shadow decisions use `shadow::room_temperature`, which has no offset. A zone with a room sensor
   is driven only by that sensor and never falls back to its TRVs.
 - Room sensor readings have no age check: an unavailable or unreadable sensor gives None, but a
@@ -52,10 +53,12 @@ Read this before starting a ticket, and add to it before one ships.
   Request bodies use `strict_room`, which picks up new fields automatically from `Room::default()`.
   A new room field is also safe from the panel only because the panel (ha-heating-scheduler-panel,
   `ZoneWeather.tsx`, `ZoneRoom.tsx`) PATCHes back the whole `zone.room` it got from `GET /zones`.
-  If it ever builds the room from its own TS type, new fields get reset to their defaults. Check
-  the panel's `origin/main`; its local checkout can lag.
+  If it ever builds the room from its own TS type, new fields get reset to their defaults, so
+  check the panel before adding one.
 - Reviewing what's sent to HA: for every new target source, trace `last_sent`, put-back and the
   frost floor. Repeated-call bugs come from a target that changes every tick (weather adjust)
   and isn't compared against what was actually sent.
-- Anything that changes what's sent to HA, how DRY_RUN is read, or the `data/*.json` format is
-  held for Ollie, and every backend PR states its panel impact.
+- Take extra care with, and call out in the PR, any change to what's sent to Home Assistant
+  (turning heating on or off, targets, boosts), how DRY_RUN is parsed or honoured, or the
+  `data/*.json` format: these control a real house's heating or its saved settings. Say too
+  whether the panel needs a matching change.
