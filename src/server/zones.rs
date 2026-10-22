@@ -1,6 +1,6 @@
 use crate::climate::ClimateEntity;
 use crate::schedule::TimePeriod;
-use crate::scheduler::{ZoneStatus, zone_status};
+use crate::scheduler::{ZoneStatus, zone_drive, zone_status};
 use crate::server::AppState;
 use crate::shadow::{Logged, ZoneDecision, room_temperature, zone_tick};
 use crate::weather::adjust::WindExposure;
@@ -90,6 +90,7 @@ pub async fn get_zones<T: ClimateEntity + Clone>(
         )
     };
     let mut decisions = state.shadow.read().unwrap().decisions.clone();
+    let memories = state.memories.lock().unwrap().clone();
     // Lock order everywhere: schedule sets, then zones
     let sets = state.schedule.read().unwrap();
     let zones = state.zones.read().unwrap();
@@ -97,17 +98,25 @@ pub async fn get_zones<T: ClimateEntity + Clone>(
         zones
             .zones
             .iter()
-            .map(|zone| ZoneView {
-                zone: zone.clone(),
-                status: zone_status(
-                    Some(zone),
-                    &sets,
-                    weather.as_ref(),
-                    held.get(&zone.id).copied(),
-                    begun.get(&zone.id),
-                    &now,
-                ),
-                decision: decisions.remove(&zone.id),
+            .map(|zone| {
+                let (room_c, driving, drive_setpoint) = zone_drive(zone, &memories);
+                ZoneView {
+                    zone: zone.clone(),
+                    status: ZoneStatus {
+                        room_c,
+                        driving,
+                        drive_setpoint,
+                        ..zone_status(
+                            Some(zone),
+                            &sets,
+                            weather.as_ref(),
+                            held.get(&zone.id).copied(),
+                            begun.get(&zone.id),
+                            &now,
+                        )
+                    },
+                    decision: decisions.remove(&zone.id),
+                }
             })
             .collect(),
     )
@@ -412,6 +421,7 @@ mod tests {
             mock_weather: None,
             dry_run: None,
             last_sent_targets: Default::default(),
+            memories: Default::default(),
             shadow: Default::default(),
         };
         (state, dir)
@@ -594,6 +604,80 @@ mod tests {
         .await
         .unwrap_err();
         assert_eq!(err.0, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_trv_offset_is_set_through_the_zone_api_and_drive_shows_on_the_zone() {
+        let (state, _dir) = test_state();
+        let zones = refresh_zones(State(state.clone())).await.unwrap().0;
+        let study = zone_named(&zones, "Study").id;
+        let request = |json: &str| Json::<UpdateZoneRequest>::from_bytes(json.as_bytes());
+
+        let zone = update_zone(
+            State(state.clone()),
+            Path(study),
+            request(r#"{"room": {"trv_offset_c": -1.5}}"#),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(zone.room.trv_offset_c, -1.5);
+        let err = update_zone(
+            State(state.clone()),
+            Path(study),
+            request(r#"{"room": {"trv_offset_c": 9}}"#),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert!(err.1.contains("trv_offset_c"), "{}", err.1);
+
+        // The scheduler's last tick is driving the study's TRV to its max_temp
+        state.schedule.write().unwrap().active_mut().add_entry(
+            crate::schedule::ScheduleEntry::new(
+                "All day",
+                TimePeriod::new(0, 0, 0, 0),
+                HeatingState::On,
+            )
+            .with_target(20.0),
+        );
+        state.memories.lock().unwrap().insert(
+            "climate.study_trv".to_string(),
+            crate::scheduler::EntityMemory {
+                driving: true,
+                drive_setpoint: Some(28.0),
+                room_c: Some(17.5),
+                read: true,
+                ..Default::default()
+            },
+        );
+        // Sending the max_temp failed, so the last target sent is still the old one
+        state
+            .last_sent_targets
+            .lock()
+            .unwrap()
+            .insert("climate.study_trv".to_string(), Some(20.0));
+
+        let views = get_zones(State(state.clone())).await.0;
+        let json = serde_json::to_value(&views).unwrap();
+        let view = |name: &str| {
+            json.as_array()
+                .unwrap()
+                .iter()
+                .find(|v| v["name"] == name)
+                .unwrap()
+                .clone()
+        };
+        let study = view("Study");
+        assert_eq!(study["room"]["trv_offset_c"], -1.5);
+        assert_eq!(study["status"]["target"], 20.0, "the real target");
+        assert_eq!(study["status"]["room_c"], 17.5);
+        assert_eq!(study["status"]["driving"], true);
+        assert_eq!(study["status"]["drive_setpoint"], 28.0);
+        let lounge = view("Lounge");
+        assert_eq!(lounge["status"]["driving"], false);
+        assert!(lounge["status"]["drive_setpoint"].is_null());
+        assert!(lounge["status"]["room_c"].is_null());
     }
 
     #[tokio::test]

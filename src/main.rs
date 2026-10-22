@@ -9,7 +9,9 @@ use ha_heating_scheduler::dry_run::{self, DryRun};
 #[cfg(debug_assertions)]
 use ha_heating_scheduler::schedule::HeatingState;
 use ha_heating_scheduler::schedule::persistence;
-use ha_heating_scheduler::scheduler::{LastSentTargets, SchedulerState, run_scheduler};
+use ha_heating_scheduler::scheduler::{
+    EntityMemories, LastSentTargets, SchedulerState, run_scheduler,
+};
 use ha_heating_scheduler::server::{AppState, start_server};
 use ha_heating_scheduler::shadow::Shadow;
 #[cfg(not(debug_assertions))]
@@ -197,6 +199,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let schedule: ScheduleState = Arc::new(RwLock::new(schedule_sets));
     let last_sent_targets: LastSentTargets = Default::default();
+    let memories: EntityMemories = Default::default();
     let shadow: ShadowState = Arc::new(RwLock::new(Shadow::load(decisions_file_path)));
     let api_task = tokio::spawn(start_server(
         AppState {
@@ -212,6 +215,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             mock_weather,
             dry_run,
             last_sent_targets: Arc::clone(&last_sent_targets),
+            memories: Arc::clone(&memories),
             shadow: Arc::clone(&shadow),
         },
         port,
@@ -225,6 +229,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         weather_source,
         climate_entities: Arc::clone(&climate_entities),
         last_sent_targets,
+        memories,
         shadow,
     }));
 

@@ -768,6 +768,37 @@ mod tests {
     }
 
     #[test]
+    fn test_a_zones_file_from_before_the_trv_offset_loads_and_saves_back_whole() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("zones.json");
+        let old = serde_json::json!({"zones": [{"id": "6f1c1d2e-0000-4000-8000-000000000001",
+            "name": "Lounge", "kind": "area", "area_ids": ["lounge"],
+            "entity_ids": ["climate.lounge_trv"], "wind_exposure": "high", "weather_adjust": true,
+            "mode": "smart", "room": {"faces": ["N"], "sun_gain": 0.2, "heat_loss": 0.7,
+                "warm_rate_c_per_hour": 2.0, "setback_c": 15.0,
+                "sensor_entity_id": "sensor.lounge"}}]});
+        std::fs::write(&path, old.to_string()).unwrap();
+
+        let zones = load_zones(&path).unwrap();
+        assert_eq!(zones.zones[0].room.trv_offset_c, 0.0);
+        save_zones(&zones, &path).unwrap();
+
+        let saved: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let (old, saved) = (&old["zones"][0], &saved["zones"][0]);
+        for (key, value) in old.as_object().unwrap() {
+            if key != "room" {
+                assert_eq!(&saved[key], value, "{key}");
+            }
+        }
+        for (key, value) in old["room"].as_object().unwrap() {
+            assert_eq!(&saved["room"][key], value, "room.{key}");
+        }
+        assert_eq!(saved["room"]["trv_offset_c"], 0.0);
+        assert_eq!(load_zones(&path).unwrap().zones, zones.zones);
+    }
+
+    #[test]
     fn test_merge_with_blank_name_changes_nothing() {
         let mut zones = Zones::default();
         zones.reconcile(Some(areas()), &all_managed());

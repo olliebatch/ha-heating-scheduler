@@ -42,6 +42,9 @@ pub struct Room {
     pub setback_c: Option<f64>,
     /// A temperature sensor to read the room from; None uses the average of the zone's TRVs
     pub sensor_entity_id: Option<String>,
+    /// Added to the TRVs' average to read the room when driving TRVs harder (never to a room
+    /// sensor's reading), in °C; e.g. -1.5 when the TRVs read warm by the radiator
+    pub trv_offset_c: f64,
 }
 
 impl Default for Room {
@@ -53,6 +56,7 @@ impl Default for Room {
             warm_rate_c_per_hour: 1.5,
             setback_c: None,
             sensor_entity_id: None,
+            trv_offset_c: 0.0,
         }
     }
 }
@@ -61,6 +65,8 @@ impl Default for Room {
 pub const WARM_RATE_RANGE: std::ops::RangeInclusive<f64> = 0.5..=4.0;
 /// Allowed `setback_c`
 pub const SETBACK_RANGE: std::ops::RangeInclusive<f64> = 10.0..=18.0;
+/// Allowed `trv_offset_c`
+pub const TRV_OFFSET_RANGE: std::ops::RangeInclusive<f64> = -5.0..=5.0;
 
 /// A room in a request: like [`Room`], but a field it doesn't know is an error, so a misspelt
 /// one can't reset the room to its defaults. (A saved room stays lenient, so a file from a later
@@ -118,6 +124,7 @@ impl Room {
         if let Some(setback) = self.setback_c {
             in_range("setback_c", setback, SETBACK_RANGE)?;
         }
+        in_range("trv_offset_c", self.trv_offset_c, TRV_OFFSET_RANGE)?;
         let mut seen = Vec::new();
         self.faces.retain(|f| {
             let new = !seen.contains(f);

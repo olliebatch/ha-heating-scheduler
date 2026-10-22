@@ -9,7 +9,7 @@ use ha_heating_scheduler::api_client::ApiClient;
 use ha_heating_scheduler::climate::{BoostInfo, ClimateEntity, DefaultClimate};
 use ha_heating_scheduler::dry_run::DryRun;
 use ha_heating_scheduler::schedule::HeatingState;
-use ha_heating_scheduler::scheduler::{Scheduled, apply_schedule_to_entity};
+use ha_heating_scheduler::scheduler::{EntityMemory, Scheduled, apply_schedule_to_entity};
 use ha_heating_scheduler::weather::{HomeAssistantWeather, WeatherSource};
 use ha_heating_scheduler::zones::areas::{AreaSource, HomeAssistantAreas};
 use serde_json::json;
@@ -40,6 +40,9 @@ async fn answer(State(ha): State<FakeHa>, method: Method, uri: Uri, _body: Bytes
         })
         .to_string();
     }
+    if path.starts_with("/api/states/sensor.") {
+        return json!({"state": "17.0", "attributes": {"unit_of_measurement": "°C"}}).to_string();
+    }
     if path.starts_with("/api/states/weather.") {
         return json!({"state": "cloudy", "attributes": {"temperature": 4.0, "temperature_unit": "°C"}})
             .to_string();
@@ -68,6 +71,7 @@ fn scheduled(state: HeatingState, target: Option<f64>) -> Scheduled {
     Scheduled {
         state,
         target_temp: target,
+        room_c: None,
     }
 }
 
@@ -83,7 +87,7 @@ async fn run_through(client: &ApiClient, ha: &FakeHa) {
         20.0,
         client,
         &mut last_sent,
-        &mut None,
+        &mut EntityMemory::default(),
         &|| true,
     )
     .await;
@@ -93,7 +97,7 @@ async fn run_through(client: &ApiClient, ha: &FakeHa) {
         20.0,
         client,
         &mut last_sent,
-        &mut None,
+        &mut EntityMemory::default(),
         &|| true,
     )
     .await;
@@ -103,7 +107,7 @@ async fn run_through(client: &ApiClient, ha: &FakeHa) {
         20.0,
         client,
         &mut last_sent,
-        &mut None,
+        &mut EntityMemory::default(),
         &|| true,
     )
     .await;
@@ -115,7 +119,7 @@ async fn run_through(client: &ApiClient, ha: &FakeHa) {
         20.0,
         client,
         &mut last_sent,
-        &mut None,
+        &mut EntityMemory::default(),
         &|| true,
     )
     .await;
@@ -129,7 +133,7 @@ async fn run_through(client: &ApiClient, ha: &FakeHa) {
         20.0,
         client,
         &mut last_sent,
-        &mut None,
+        &mut EntityMemory::default(),
         &|| true,
     )
     .await;
@@ -226,7 +230,7 @@ async fn test_an_entity_removed_while_its_state_is_read_is_sent_nothing() {
         20.0,
         &client,
         &mut last_sent,
-        &mut None,
+        &mut EntityMemory::default(),
         &|| false,
     )
     .await;
@@ -241,10 +245,52 @@ async fn test_an_entity_removed_while_its_state_is_read_is_sent_nothing() {
         20.0,
         &client,
         &mut last_sent,
-        &mut None,
+        &mut EntityMemory::default(),
         &|| true,
     )
     .await;
     assert_eq!(count(&ha, "POST /api/services/climate/set_hvac_mode"), 1);
     assert_eq!(count(&ha, "POST /api/services/climate/set_temperature"), 1);
+}
+
+#[tokio::test]
+async fn test_a_dry_run_records_a_cold_rooms_trv_driven_at_its_max_temp() {
+    let (ha, url) = fake_ha().await;
+    let dry_run = Arc::new(DryRun::default());
+    let client = || ApiClient::new(url.clone(), "fake".to_string(), Some(Arc::clone(&dry_run)));
+    let room_c = HomeAssistantWeather {
+        api_client: client(),
+    }
+    .fetch_temperature("sensor.lounge")
+    .await
+    .unwrap();
+    assert_eq!(room_c, Some(17.0));
+    let cold = Scheduled {
+        room_c,
+        ..scheduled(HeatingState::On, Some(20.0))
+    };
+
+    let mut trv = DefaultClimate::new("climate.lounge_trv".to_string());
+    let (mut last_sent, mut memory) = (None, EntityMemory::default());
+    for _ in 0..2 {
+        apply_schedule_to_entity(
+            &mut trv,
+            &cold,
+            20.0,
+            &client(),
+            &mut last_sent,
+            &mut memory,
+            &|| true,
+        )
+        .await;
+    }
+
+    // The fake HA reports max_temp 30
+    let summaries: Vec<String> = dry_run.calls().into_iter().map(|c| c.summary).collect();
+    assert!(
+        summaries.contains(&"would set climate.lounge_trv to 30 °C".to_string()),
+        "{summaries:?}"
+    );
+    assert!(memory.driving);
+    assert_eq!(count(&ha, "POST /api/services/climate/set_temperature"), 0);
 }
