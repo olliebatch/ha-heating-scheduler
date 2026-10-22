@@ -1,8 +1,8 @@
 use crate::climate::ClimateEntity;
 use crate::schedule::TimePeriod;
-use crate::scheduler::{ZoneStatus, zone_drive, zone_status};
+use crate::scheduler::{ZoneStatus, smart_reading, zone_drive, zone_status};
 use crate::server::AppState;
-use crate::shadow::{Logged, ZoneDecision, room_temperature, zone_tick};
+use crate::shadow::{Logged, ZoneDecision, zone_tick};
 use crate::weather::adjust::WindExposure;
 use crate::zones::areas::{DISCOVERY_TIMEOUT, fetch_areas_with_timeout};
 use crate::zones::{Zone, ZoneError, Zones, save_zones};
@@ -150,7 +150,7 @@ pub struct PreviewRequest {
 /// The smart decision for a zone right now with `room` in its place, so a setting's effect shows
 /// before it's saved. Saves and logs nothing, and works whatever the zone's mode. It uses the
 /// scheduler's last weather, forecast and daylight, and the room temperature of the zone's
-/// latest decision (else its TRVs' average). Null when the zone's schedule has no On period.
+/// latest decision (else the average of its TRVs that could be read). Null when the zone's schedule has no On period.
 pub async fn preview_zone<T: ClimateEntity + Clone>(
     State(state): State<AppState<T>>,
     Path(zone_id): Path<Uuid>,
@@ -172,6 +172,7 @@ pub async fn preview_zone<T: ClimateEntity + Clone>(
         .get(&zone_id)
         .and_then(|d| d.room_c);
     let entities = state.climate_entities.read().unwrap().clone();
+    let memories = state.memories.lock().unwrap().clone();
     let sets = state.schedule.read().unwrap();
     let zones = state.zones.read().unwrap();
     let mut zone = zones
@@ -189,7 +190,7 @@ pub async fn preview_zone<T: ClimateEntity + Clone>(
         weather.begun.get(&zone_id),
         &now,
     );
-    let room_c = room_c.or_else(|| room_temperature(&zone, &entities, None));
+    let room_c = room_c.or_else(|| smart_reading(&zone, &entities, None, &memories));
     let tick = zone_tick(
         &zone,
         &sets,
@@ -918,6 +919,16 @@ mod tests {
             temperature: Some(-5.0),
             ..Default::default()
         });
+        let read = |read| crate::scheduler::EntityMemory {
+            read,
+            ..Default::default()
+        };
+        let study_trv = "climate.study_trv".to_string();
+        state
+            .memories
+            .lock()
+            .unwrap()
+            .insert(study_trv.clone(), read(true));
         let preview = |json: &str| {
             preview_zone(
                 State(state.clone()),
@@ -937,6 +948,15 @@ mod tests {
         let snug = preview(r#"{"room": {"heat_loss": 0}}"#).await.unwrap().0;
         assert_eq!(snug.as_ref().unwrap().room_c, Some(20.0));
         assert_eq!(lead(snug), 90);
+        // Its TRV's last fetch failed: its 20 °C is frozen, so there's no room reading
+        state
+            .memories
+            .lock()
+            .unwrap()
+            .insert(study_trv.clone(), read(false));
+        let stale = preview(r#"{"room": {"heat_loss": 0}}"#).await.unwrap().0;
+        assert_eq!(stale.unwrap().room_c, None);
+        state.memories.lock().unwrap().insert(study_trv, read(true));
         assert_eq!(
             lead(preview(r#"{"room": {"heat_loss": 1}}"#).await.unwrap().0),
             120

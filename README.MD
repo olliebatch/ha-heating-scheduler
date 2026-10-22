@@ -187,7 +187,7 @@ known, the target is sent as before; the frost floor is never driven.
 - `POST /zones/{id}/preview` - `{"room": {...}}` (the same block as `PATCH`; left out, the zone's own): the decision
   the zone would get right now with that room, whatever its mode, to show a setting's effect before saving. It saves
   and logs nothing, uses the scheduler's last weather and the room temperature of the zone's latest decision (else
-  its TRVs' average), and is null when the zone's schedule has no On period
+  the average of its TRVs that were read on their last tick), and is null when the zone's schedule has no On period
 - `GET /decisions?zone=<id>&since=<RFC 3339 time>` - The decisions log, oldest first (both filters optional): a
   `{"kind": "decision", "zone_id", "decision"}` each time a zone's action, target, start or comfort time changes, and
   a `{"kind": "outcome", "zone_id", "outcome"}` for each comfort time: `smart_start` (null when Smart found heating
@@ -197,7 +197,8 @@ known, the target is sent as before; the frost floor is never driven.
 
 Shadow mode: a zone in `shadow` (or `smart`) mode gets the smart decision every tick, once any of its TRVs has been read
 (not on the first tick after a start). In `shadow` nothing is sent from it: the schedule still drives the TRVs. A comfort time is one of the zone's schedule's On periods. The decision looks at
-the room temperature (the zone's sensor, or the average of its TRVs), the forecast for the comfort time's start, wind
+the room temperature (the zone's sensor, or the average of its TRVs that were read on their last tick: a TRV that
+can't be read is left out rather than trusted at its last reading, and with none read there's no room temperature), the forecast for the comfort time's start, wind
 on the sides the room faces, sun while the sun is up (sunrise and sunset from `sun.sun`, read with the forecast) and
 the room's warm rate, and starts heating up to 120 minutes early. Heating that has begun for a comfort time keeps going
 until it starts, and once heating isn't needed it stays so until the room is 0.5 °C below the target. The outcome
