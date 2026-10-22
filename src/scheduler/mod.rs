@@ -401,16 +401,21 @@ pub fn frost_floor(
 /// Fetch one entity's state and bring it in line with the schedule and any boost.
 /// Turning On sets the mode, then the target temperature.
 ///
-/// `last_sent` is the target last sent to this entity successfully. The target is only sent
-/// when it differs from that, or right after turning On, never because the entity reports a
-/// different value: a TRV that rounds or clamps the target would otherwise be re-commanded
-/// every tick. A failed send leaves `last_sent` unchanged, so it is retried on the next tick.
+/// `last_sent` is the target last sent to this entity successfully. The target is sent when it
+/// differs from that, or right after turning On. A failed send leaves `last_sent` unchanged, so
+/// it is retried on the next tick.
+///
+/// While On, a target changed on the TRV itself (a preset, its buttons) is put back when it's
+/// more than [`PUT_BACK_BEYOND_C`] from the one sent, at most every [`PUT_BACK_EVERY`]
+/// (`last_put_back`), so a TRV that ignores it isn't commanded every tick. A TRV that only
+/// rounds the target stays within the tolerance and isn't re-commanded.
 pub async fn apply_schedule_to_entity<T: ClimateEntity>(
     entity: &mut T,
     scheduled: &Scheduled,
     default_target_temp: f64,
     api_client: &ApiClient,
     last_sent: &mut Option<f64>,
+    last_put_back: &mut Option<chrono::DateTime<Local>>,
     still_managed: &(dyn Fn() -> bool + Sync),
 ) {
     let now = Local::now();
@@ -484,13 +489,33 @@ pub async fn apply_schedule_to_entity<T: ClimateEntity>(
     if !still_managed() {
         return;
     }
-    if action == HeatingAction::TurnOn || *last_sent != Some(target) {
+    let changed_on_trv = action == HeatingAction::NoChange
+        && *last_sent == Some(target)
+        && cached
+            .target_temp
+            .is_some_and(|t| (t - target).abs() > PUT_BACK_BEYOND_C);
+    let put_back = changed_on_trv && last_put_back.is_none_or(|at| now - at >= PUT_BACK_EVERY);
+    if put_back {
+        println!(
+            "  {} reports {:?} °C, putting back {target} °C",
+            entity.get_entity_id(),
+            cached.target_temp
+        );
+        *last_put_back = Some(now);
+    }
+    if action == HeatingAction::TurnOn || *last_sent != Some(target) || put_back {
         match entity.set_temperature(api_client, target).await {
             Ok(()) => *last_sent = Some(target),
             Err(e) => eprintln!("  ✗ Error setting temperature: {}", e),
         }
     }
 }
+
+/// How far a TRV's reported target may be from the one sent before it's put back: past a
+/// 0.5 °C step's rounding
+pub const PUT_BACK_BEYOND_C: f64 = 0.5;
+/// The least time between putting back a TRV's target
+pub const PUT_BACK_EVERY: chrono::TimeDelta = chrono::TimeDelta::minutes(5);
 
 /// Read the weather and record the reading (or the error) in `status`
 /// If the read fails, the last good reading is kept for up to [`KEEP_READING_FOR`], so a brief
@@ -739,6 +764,8 @@ pub async fn run_scheduler<T: ClimateEntity + Clone>(state: SchedulerState<T>) {
     println!("\n=== Heating Scheduler Started ===");
 
     let mut first_tick = true;
+    // When each entity's target was last put back after being changed on the TRV
+    let mut put_back_at: HashMap<String, chrono::DateTime<Local>> = HashMap::new();
     loop {
         interval.tick().await;
 
@@ -855,6 +882,7 @@ pub async fn run_scheduler<T: ClimateEntity + Clone>(state: SchedulerState<T>) {
                 .get(&id)
                 .copied()
                 .flatten();
+            let mut last_put_back = put_back_at.get(&id).copied();
             CALL_CONTEXT
                 .scope(
                     context,
@@ -864,10 +892,14 @@ pub async fn run_scheduler<T: ClimateEntity + Clone>(state: SchedulerState<T>) {
                         default_target_temp,
                         &state.api_client,
                         &mut last_sent,
+                        &mut last_put_back,
                         &still_managed,
                     ),
                 )
                 .await;
+            if let Some(at) = last_put_back {
+                put_back_at.insert(id.clone(), at);
+            }
             if still_managed() {
                 state
                     .last_sent_targets
@@ -1011,8 +1043,16 @@ mod tests {
         scheduled: &Scheduled,
         last_sent: &mut Option<f64>,
     ) {
-        apply_schedule_to_entity(entity, scheduled, 20.0, &fake_client(), last_sent, &|| true)
-            .await;
+        apply_schedule_to_entity(
+            entity,
+            scheduled,
+            20.0,
+            &fake_client(),
+            last_sent,
+            &mut None,
+            &|| true,
+        )
+        .await;
     }
 
     fn sent(entity: &crate::climate::MockClimate) -> Vec<f64> {
@@ -1046,6 +1086,59 @@ mod tests {
         // The TRV reports 21.5, but we only sent once
         assert_eq!(entity.info.as_ref().unwrap().target_temp, Some(21.5));
         assert_eq!(sent(&entity), vec![21.3]);
+    }
+
+    #[tokio::test]
+    async fn test_target_changed_on_the_trv_is_put_back() {
+        let mut entity = mock(HeatingState::Off);
+        let mut last = None;
+        let on = scheduled(HeatingState::On, Some(20.0));
+
+        tick(&mut entity, &on, &mut last).await;
+        // The TRV drops to its Away preset's 5 °C
+        *entity.changed_on_trv.lock().unwrap() = Some(5.0);
+        tick(&mut entity, &on, &mut last).await;
+        tick(&mut entity, &on, &mut last).await;
+
+        assert_eq!(sent(&entity), vec![20.0, 20.0]);
+    }
+
+    #[tokio::test]
+    async fn test_trv_that_ignores_the_put_back_is_retried_every_5_minutes() {
+        let mut entity = mock(HeatingState::Off);
+        let mut last = None;
+        let mut put_back = None;
+        let on = scheduled(HeatingState::On, Some(20.0));
+        let mut tick =
+            async |entity: &mut crate::climate::MockClimate,
+                   put_back: &mut Option<chrono::DateTime<Local>>| {
+                // Stuck in its Away preset: it keeps reporting 5 °C whatever it's sent
+                apply_schedule_to_entity(
+                    entity,
+                    &on,
+                    20.0,
+                    &fake_client(),
+                    &mut last,
+                    put_back,
+                    &|| true,
+                )
+                .await;
+                *entity.changed_on_trv.lock().unwrap() = Some(5.0);
+            };
+
+        tick(&mut entity, &mut put_back).await;
+        for _ in 0..3 {
+            tick(&mut entity, &mut put_back).await;
+        }
+        assert_eq!(sent(&entity), vec![20.0, 20.0], "put back once");
+
+        put_back = put_back.map(|at| at - PUT_BACK_EVERY);
+        tick(&mut entity, &mut put_back).await;
+        assert_eq!(
+            sent(&entity),
+            vec![20.0, 20.0, 20.0],
+            "and again 5 minutes on"
+        );
     }
 
     #[tokio::test]
