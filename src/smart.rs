@@ -209,13 +209,48 @@ pub fn decide(inputs: &Inputs) -> Decision {
         },
     };
 
-    // Without the room temperature there's nothing to go on: do what the schedule does
+    let same = |action| {
+        inputs
+            .previous
+            .is_some_and(|p| p.action == action && p.comfort == comfort)
+    };
+    // Heating that has begun for this comfort time keeps going, from when it began, even though
+    // the lead shrinks as the room warms
+    // (Only a Heat decided before the start counts: one with a lead, and not the setback. The
+    // comfort time's own Heat, once it's over, must not carry on to the next one.)
+    let begun = inputs.previous.filter(|p| {
+        same(Action::Heat)
+            && p.reasons.iter().any(|r| matches!(r, Factor::Lead { .. }))
+            && !p
+                .reasons
+                .iter()
+                .any(|r| matches!(r, Factor::Setback { .. }))
+    });
+
+    // Without the room temperature there's nothing to go on: do what the schedule does, but keep
+    // heating that has begun (a TRV that can't be read for a tick mustn't cancel it). Its lead is
+    // kept so it still counts as begun on the next tick.
     let Some(room_c) = inputs.room_c else {
-        let reasons = vec![Factor::NoRoomTemperature];
-        return if inputs.inside {
-            scheduled(Action::Heat, reasons)
-        } else {
-            between(comfort.start, reasons)
+        let mut reasons = vec![Factor::NoRoomTemperature];
+        return match begun {
+            _ if inputs.inside => scheduled(Action::Heat, reasons),
+            Some(begun) => {
+                reasons.extend(
+                    begun
+                        .reasons
+                        .iter()
+                        .filter(|r| matches!(r, Factor::Lead { .. }))
+                        .cloned(),
+                );
+                Decision {
+                    action: Action::Heat,
+                    target: Some(comfort.target),
+                    start_at: begun.start_at,
+                    comfort,
+                    reasons,
+                }
+            }
+            None => between(comfort.start, reasons),
         };
     };
     let mut reasons = Vec::new();
@@ -315,11 +350,6 @@ pub fn decide(inputs: &Inputs) -> Decision {
 
     // Warm and mild enough to stay warm: no need to heat for this comfort time yet. Once that's
     // decided it holds until the room is clearly below the target, so it doesn't flip each tick.
-    let same = |action| {
-        inputs
-            .previous
-            .is_some_and(|p| p.action == action && p.comfort == comfort)
-    };
     let warm_from = if same(Action::NotNeeded) {
         comfort.target - HYSTERESIS_C
     } else {
@@ -355,18 +385,6 @@ pub fn decide(inputs: &Inputs) -> Decision {
     });
     let start_at = comfort.start - TimeDelta::minutes(i64::from(lead));
 
-    // Heating that has begun for this comfort time keeps going, from when it began, even though
-    // the lead shrinks as the room warms
-    // (Only a Heat decided before the start counts: one with a lead, and not the setback. The
-    // comfort time's own Heat, once it's over, must not carry on to the next one.)
-    let begun = inputs.previous.filter(|p| {
-        same(Action::Heat)
-            && p.reasons.iter().any(|r| matches!(r, Factor::Lead { .. }))
-            && !p
-                .reasons
-                .iter()
-                .any(|r| matches!(r, Factor::Setback { .. }))
-    });
     // (A warm room needs no lead, so it waits for the comfort time to start)
     if let Some(begun) = begun {
         Decision {
@@ -764,6 +782,83 @@ mod tests {
         setback.reasons.push(Setback { c: 15.0 });
         case.previous = Some(setback);
         assert_eq!(case.evening().action, Action::Off);
+    }
+
+    #[test]
+    fn test_no_room_temperature_keeps_heating_that_has_begun() {
+        // 16:00, 2 °C outside, room 17 °C: heating begins
+        let mut case = Case::new(at(16, 0), 17.0, weather(2.0, 0.0, None, 100.0));
+        let begun = case.evening();
+        assert_eq!(begun.action, Action::Heat);
+
+        // 16:20 the TRV can't be read: heating carries on for the same comfort time, from when
+        // it began
+        case.now = at(16, 20);
+        case.room_c = None;
+        case.previous = Some(begun.clone());
+        let d = case.evening();
+        assert_eq!(
+            (d.action, d.target, d.start_at, d.comfort),
+            (Action::Heat, Some(20.0), begun.start_at, begun.comfort)
+        );
+        assert_eq!(d.reasons[0], NoRoomTemperature);
+
+        // and still counts as begun on the next tick, read again and nearly there
+        case.now = at(16, 40);
+        case.room_c = Some(19.9);
+        case.previous = Some(d);
+        let d = case.evening();
+        assert_eq!((d.action, d.start_at), (Action::Heat, begun.start_at));
+    }
+
+    #[test]
+    fn test_no_room_temperature_without_heating_begun_does_what_the_schedule_does() {
+        let mut case = Case::new(at(16, 20), 17.0, weather(2.0, 0.0, None, 100.0));
+        case.room_c = None;
+        let expected = |action, target, start_at| Decision {
+            action,
+            target,
+            start_at,
+            comfort: ComfortTime {
+                start: time(17, 0),
+                end: time(22, 0),
+                target: 20.0,
+            },
+            reasons: vec![NoRoomTemperature],
+        };
+        let off = expected(Action::Off, None, time(17, 0));
+        assert_eq!(case.evening(), off);
+
+        // Nor after a decision that wasn't a begun warm-up: off, a setback, or another comfort
+        // time's heating
+        case.previous = Some(off.clone());
+        assert_eq!(case.evening(), off);
+        let mut setback = expected(Action::Heat, Some(15.0), time(15, 30));
+        setback.reasons = vec![
+            Lead {
+                minutes: 90,
+                capped: false,
+            },
+            Setback { c: 15.0 },
+        ];
+        case.previous = Some(setback);
+        assert_eq!(case.evening(), off);
+        let mut other = expected(Action::Heat, Some(20.0), time(5, 30));
+        other.comfort.start = time(7, 0);
+        other.reasons = vec![Lead {
+            minutes: 90,
+            capped: false,
+        }];
+        case.previous = Some(other);
+        assert_eq!(case.evening(), off);
+
+        // Within the comfort time it heats, as the schedule does
+        case.now = at(18, 0);
+        case.inside = true;
+        assert_eq!(
+            case.evening(),
+            expected(Action::Heat, Some(20.0), time(17, 0))
+        );
     }
 
     #[test]

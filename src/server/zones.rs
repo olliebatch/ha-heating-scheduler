@@ -150,7 +150,8 @@ pub struct PreviewRequest {
 /// The smart decision for a zone right now with `room` in its place, so a setting's effect shows
 /// before it's saved. Saves and logs nothing, and works whatever the zone's mode. It uses the
 /// scheduler's last weather, forecast and daylight, and the room temperature of the zone's
-/// latest decision (else the average of its TRVs that could be read). Null when the zone's schedule has no On period.
+/// latest decision (else the average of its TRVs that could be read). Null when the zone's
+/// schedule has no On period.
 pub async fn preview_zone<T: ClimateEntity + Clone>(
     State(state): State<AppState<T>>,
     Path(zone_id): Path<Uuid>,

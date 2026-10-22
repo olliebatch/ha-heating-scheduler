@@ -195,15 +195,17 @@ known, the target is sent as before; the frost floor is never driven.
   didn't reach the target before the comfort time ended) and `at`. Stored in `data/decisions.jsonl`, the last 2000
   entries
 
-Shadow mode: a zone in `shadow` (or `smart`) mode gets the smart decision every tick, once any of its TRVs has been read
-(not on the first tick after a start). In `shadow` nothing is sent from it: the schedule still drives the TRVs. A comfort time is one of the zone's schedule's On periods. The decision looks at
-the room temperature (the zone's sensor, or the average of its TRVs that were read on their last tick: a TRV that
-can't be read is left out rather than trusted at its last reading, and with none read there's no room temperature), the forecast for the comfort time's start, wind
-on the sides the room faces, sun while the sun is up (sunrise and sunset from `sun.sun`, read with the forecast) and
-the room's warm rate, and starts heating up to 120 minutes early. Heating that has begun for a comfort time keeps going
-until it starts, and once heating isn't needed it stays so until the room is 0.5 °C below the target. The outcome
-of a comfort time is recorded once the room reaches the target, or when it ends; one first seen while under way (after
-a restart, say) has none.
+Shadow mode: a zone in `shadow` (or `smart`) mode gets the smart decision every tick, once any of its TRVs has been
+read (not on the first tick after a start). In `shadow` nothing is sent from it: the schedule still drives the TRVs. A
+comfort time is one of the zone's schedule's On periods. The decision looks at the room temperature (the zone's
+sensor, or the average of its TRVs that were read on their last tick: a TRV that can't be read is left out rather than
+trusted at its last reading, and with none read there's no room temperature), the forecast for the comfort time's
+start, wind on the sides the room faces, sun while the sun is up (sunrise and sunset from `sun.sun`, read with the
+forecast) and the room's warm rate, and starts heating up to 120 minutes early. Heating that has begun for a comfort
+time keeps going until it starts, even through ticks with no room temperature (otherwise, with no room temperature, it
+does what the schedule does), and once heating isn't needed it stays so until the room is 0.5 °C below the target. The
+outcome of a comfort time is recorded once the room reaches the target, or when it ends; one first seen while under
+way (after a restart, say) has none.
 
 Smart mode: a zone in `smart` mode is heated by its decision instead of its schedule: On at the decision's target to
 heat (the comfort time's target, or the setback between comfort times), Off otherwise. Its early start, late finish
