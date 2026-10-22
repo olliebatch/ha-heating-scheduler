@@ -9,7 +9,7 @@ use ha_heating_scheduler::api_client::ApiClient;
 use ha_heating_scheduler::climate::{BoostInfo, ClimateEntity, DefaultClimate};
 use ha_heating_scheduler::dry_run::DryRun;
 use ha_heating_scheduler::schedule::HeatingState;
-use ha_heating_scheduler::scheduler::{Scheduled, apply_schedule_to_entity};
+use ha_heating_scheduler::scheduler::{EntityMemory, Scheduled, apply_schedule_to_entity};
 use ha_heating_scheduler::weather::{HomeAssistantWeather, WeatherSource};
 use ha_heating_scheduler::zones::areas::{AreaSource, HomeAssistantAreas};
 use serde_json::json;
@@ -68,6 +68,7 @@ fn scheduled(state: HeatingState, target: Option<f64>) -> Scheduled {
     Scheduled {
         state,
         target_temp: target,
+        room_c: None,
     }
 }
 
@@ -83,7 +84,7 @@ async fn run_through(client: &ApiClient, ha: &FakeHa) {
         20.0,
         client,
         &mut last_sent,
-        &mut None,
+        &mut EntityMemory::default(),
         &|| true,
     )
     .await;
@@ -93,7 +94,7 @@ async fn run_through(client: &ApiClient, ha: &FakeHa) {
         20.0,
         client,
         &mut last_sent,
-        &mut None,
+        &mut EntityMemory::default(),
         &|| true,
     )
     .await;
@@ -103,7 +104,7 @@ async fn run_through(client: &ApiClient, ha: &FakeHa) {
         20.0,
         client,
         &mut last_sent,
-        &mut None,
+        &mut EntityMemory::default(),
         &|| true,
     )
     .await;
@@ -115,7 +116,7 @@ async fn run_through(client: &ApiClient, ha: &FakeHa) {
         20.0,
         client,
         &mut last_sent,
-        &mut None,
+        &mut EntityMemory::default(),
         &|| true,
     )
     .await;
@@ -129,7 +130,7 @@ async fn run_through(client: &ApiClient, ha: &FakeHa) {
         20.0,
         client,
         &mut last_sent,
-        &mut None,
+        &mut EntityMemory::default(),
         &|| true,
     )
     .await;
@@ -226,7 +227,7 @@ async fn test_an_entity_removed_while_its_state_is_read_is_sent_nothing() {
         20.0,
         &client,
         &mut last_sent,
-        &mut None,
+        &mut EntityMemory::default(),
         &|| false,
     )
     .await;
@@ -241,7 +242,7 @@ async fn test_an_entity_removed_while_its_state_is_read_is_sent_nothing() {
         20.0,
         &client,
         &mut last_sent,
-        &mut None,
+        &mut EntityMemory::default(),
         &|| true,
     )
     .await;

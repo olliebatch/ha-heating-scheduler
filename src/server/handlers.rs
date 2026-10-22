@@ -525,10 +525,13 @@ pub async fn add_entities(
     })?;
     // A re-added entity has its target sent again
     let mut last_sent = state.last_sent_targets.lock().unwrap();
+    let mut memories = state.memories.lock().unwrap();
     for id in &payload_ids {
         last_sent.remove(id);
+        memories.remove(id);
     }
     drop(last_sent);
+    drop(memories);
 
     if added > 0 {
         crate::server::zones::reconcile_zones(&state)?;
@@ -550,6 +553,7 @@ pub async fn remove_entity(
         .lock()
         .unwrap()
         .remove(&payload.entity_id);
+    state.memories.lock().unwrap().remove(&payload.entity_id);
 
     crate::server::zones::reconcile_zones(&state)?;
     println!("Removed entity: {}", payload.entity_id);
@@ -592,6 +596,7 @@ mod tests {
             mock_weather: None,
             dry_run: None,
             last_sent_targets: Default::default(),
+            memories: Default::default(),
             shadow: Default::default(),
         };
         (state, dir)
@@ -1144,6 +1149,7 @@ mod tests {
             mock_weather: None,
             dry_run: None,
             last_sent_targets: state.last_sent_targets,
+            memories: state.memories,
             shadow: state.shadow,
         };
         (state, dir)

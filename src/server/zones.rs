@@ -1,6 +1,6 @@
 use crate::climate::ClimateEntity;
 use crate::schedule::TimePeriod;
-use crate::scheduler::{ZoneStatus, zone_status};
+use crate::scheduler::{ZoneStatus, zone_drive, zone_status};
 use crate::server::AppState;
 use crate::shadow::{Logged, ZoneDecision, room_temperature, zone_tick};
 use crate::weather::adjust::WindExposure;
@@ -90,6 +90,8 @@ pub async fn get_zones<T: ClimateEntity + Clone>(
         )
     };
     let mut decisions = state.shadow.read().unwrap().decisions.clone();
+    let memories = state.memories.lock().unwrap().clone();
+    let last_sent = state.last_sent_targets.lock().unwrap().clone();
     // Lock order everywhere: schedule sets, then zones
     let sets = state.schedule.read().unwrap();
     let zones = state.zones.read().unwrap();
@@ -97,17 +99,25 @@ pub async fn get_zones<T: ClimateEntity + Clone>(
         zones
             .zones
             .iter()
-            .map(|zone| ZoneView {
-                zone: zone.clone(),
-                status: zone_status(
-                    Some(zone),
-                    &sets,
-                    weather.as_ref(),
-                    held.get(&zone.id).copied(),
-                    begun.get(&zone.id),
-                    &now,
-                ),
-                decision: decisions.remove(&zone.id),
+            .map(|zone| {
+                let (room_c, driving, drive_setpoint) = zone_drive(zone, &memories, &last_sent);
+                ZoneView {
+                    zone: zone.clone(),
+                    status: ZoneStatus {
+                        room_c,
+                        driving,
+                        drive_setpoint,
+                        ..zone_status(
+                            Some(zone),
+                            &sets,
+                            weather.as_ref(),
+                            held.get(&zone.id).copied(),
+                            begun.get(&zone.id),
+                            &now,
+                        )
+                    },
+                    decision: decisions.remove(&zone.id),
+                }
             })
             .collect(),
     )
@@ -412,6 +422,7 @@ mod tests {
             mock_weather: None,
             dry_run: None,
             last_sent_targets: Default::default(),
+            memories: Default::default(),
             shadow: Default::default(),
         };
         (state, dir)

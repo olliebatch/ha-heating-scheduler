@@ -38,6 +38,9 @@ pub struct AppState<T: ClimateEntity + Clone> {
     pub dry_run: Option<Arc<DryRun>>,
     /// Shared with the scheduler; adding or removing an entity forgets its entry
     pub last_sent_targets: crate::scheduler::LastSentTargets,
+    /// Shared with the scheduler, to show the zones being driven harder; adding or removing an
+    /// entity forgets its entry
+    pub memories: crate::scheduler::EntityMemories,
     /// Shadow and smart zones' decisions and their log, kept by the scheduler
     pub shadow: crate::ShadowState,
 }
