@@ -50,5 +50,12 @@ Read this before starting a ticket, and add to it before one ships.
   `EntityMemory` rather than adding a parameter.
 - `Room` is `#[serde(default)]`: a new room field needs a default so older zones.json files load.
   Request bodies use `strict_room`, which picks up new fields automatically from `Room::default()`.
+  A new room field is also safe from the panel only because the panel (ha-heating-scheduler-panel,
+  `ZoneWeather.tsx`, `ZoneRoom.tsx`) PATCHes back the whole `zone.room` it got from `GET /zones`.
+  If it ever builds the room from its own TS type, new fields get reset to their defaults. Check
+  the panel's `origin/main`; its local checkout can lag.
+- Reviewing what's sent to HA: for every new target source, trace `last_sent`, put-back and the
+  frost floor. Repeated-call bugs come from a target that changes every tick (weather adjust)
+  and isn't compared against what was actually sent.
 - Anything that changes what's sent to HA, how DRY_RUN is read, or the `data/*.json` format is
   held for Ollie, and every backend PR states its panel impact.
