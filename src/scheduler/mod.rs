@@ -622,14 +622,31 @@ pub fn drive_reading<T: ClimateEntity + Clone>(
     if zone.room.sensor_entity_id.is_some() {
         return sensor;
     }
-    // Only TRVs read on their last tick: one that can't be read keeps its last reading
-    let read: Vec<T> = entities
+    room_temperature(zone, &read_entities(entities, memories), None)
+        .map(|c| ((c + zone.room.trv_offset_c) * 10.0).round() / 10.0)
+}
+
+/// The room reading Smart and Shadow decide a zone by: [`room_temperature`] from its room sensor,
+/// else from only its TRVs that were read on their last tick. None without either.
+pub fn smart_reading<T: ClimateEntity + Clone>(
+    zone: &Zone,
+    entities: &[T],
+    sensor: Option<f64>,
+    memories: &HashMap<String, EntityMemory>,
+) -> Option<f64> {
+    room_temperature(zone, &read_entities(entities, memories), sensor)
+}
+
+/// The entities read on their last tick: one that can't be read keeps its last reading
+fn read_entities<T: ClimateEntity + Clone>(
+    entities: &[T],
+    memories: &HashMap<String, EntityMemory>,
+) -> Vec<T> {
+    entities
         .iter()
         .filter(|e| memories.get(e.get_entity_id()).is_some_and(|m| m.read))
         .cloned()
-        .collect();
-    room_temperature(zone, &read, None)
-        .map(|c| ((c + zone.room.trv_offset_c) * 10.0).round() / 10.0)
+        .collect()
 }
 
 /// The room reading a zone's entities were last driven by (or not), whether any of them is being
@@ -942,7 +959,8 @@ pub async fn run_scheduler<T: ClimateEntity + Clone>(state: SchedulerState<T>) {
                 // Not until its radiators have been read (the first tick after a start)
                 .filter(|z| crate::shadow::zone_read(z, &entities_clone))
                 .filter_map(|z| {
-                    let room_c = room_temperature(z, &entities_clone, sensors.get(&z.id).copied());
+                    let sensor = sensors.get(&z.id).copied();
+                    let room_c = smart_reading(z, &entities_clone, sensor, &memories);
                     let previous = shadow.decisions.get(&z.id).map(|d| &d.decision);
                     let tick = zone_tick(
                         z,
@@ -1012,8 +1030,17 @@ pub async fn run_scheduler<T: ClimateEntity + Clone>(state: SchedulerState<T>) {
                 continue;
             }
             let Some(scheduled) = scheduled else {
-                if let Err(e) = entity.fetch_and_update_state(&state.api_client).await {
-                    eprintln!("Error fetching state for {}: {}", id, e);
+                let read = match entity.fetch_and_update_state(&state.api_client).await {
+                    Ok(()) => true,
+                    Err(e) => {
+                        eprintln!("Error fetching state for {}: {}", id, e);
+                        false
+                    }
+                };
+                // So the next tick's smart decision trusts this reading (see smart_reading)
+                if still_managed() {
+                    let mut memories = state.memories.lock().unwrap();
+                    memories.entry(id).or_default().read = read;
                 }
                 continue;
             };
@@ -2717,6 +2744,46 @@ mod tests {
         assert!(!drive(20.0, Some(19.5), true));
         assert!(!drive(20.0, Some(21.0), true), "above the target");
         assert!(!drive(20.0, None, true), "never without a reading");
+    }
+
+    #[test]
+    fn test_smart_reads_only_the_trvs_read_on_their_last_tick() {
+        let mut zones = Zones::default();
+        zones.reconcile(None, &["climate.a".to_string(), "climate.b".to_string()]);
+        let mut zone = zones.zones.remove(0);
+        zone.room.trv_offset_c = -1.5;
+        // a's last fetch failed, so it still holds a frozen 15 °C
+        let entities: Vec<_> = [15.0, 20.0]
+            .into_iter()
+            .zip(["climate.a", "climate.b"])
+            .map(|(c, id)| {
+                let mut e = crate::climate::MockClimate::new(id.to_string(), HeatingState::On);
+                e.info.as_mut().unwrap().current_temperature = c;
+                e
+            })
+            .collect();
+        let read = |ids: &[&str]| -> HashMap<String, EntityMemory> {
+            let memory = EntityMemory {
+                read: true,
+                ..Default::default()
+            };
+            ids.iter().map(|id| (id.to_string(), memory)).collect()
+        };
+
+        // Both read: their average, without the TRV offset (that's only for driving)
+        let both = read(&["climate.a", "climate.b"]);
+        assert_eq!(smart_reading(&zone, &entities, None, &both), Some(17.5));
+        // Only the fresh TRV
+        let stale_a = read(&["climate.b"]);
+        assert_eq!(smart_reading(&zone, &entities, None, &stale_a), Some(20.0));
+        // Every TRV stale: no reading, as when none has been read
+        let none_read = HashMap::new();
+        assert_eq!(smart_reading(&zone, &entities, None, &none_read), None);
+        // A room sensor's reading is used whatever its TRVs
+        assert_eq!(
+            smart_reading(&zone, &entities, Some(18.0), &none_read),
+            Some(18.0)
+        );
     }
 
     #[test]

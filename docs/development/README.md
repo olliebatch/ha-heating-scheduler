@@ -6,8 +6,9 @@ add to it in the same change when you learn something the next contributor would
 ## Where things live
 - `src/scheduler/mod.rs`: the loop (`run_scheduler`), what each entity is sent
   (`apply_schedule_to_entity`), zone status, frost floor, put-back and drive constants.
-- `src/shadow.rs` / `src/smart.rs`: Shadow logging and the Smart decision; `shadow::room_temperature`
-  is the room reading Smart uses.
+- `src/shadow.rs` / `src/smart.rs`: Shadow logging and the Smart decision. The room reading Smart
+  and Shadow use is `scheduler::smart_reading`: `shadow::room_temperature` over only the TRVs read
+  on their last tick.
 - `src/zones/` (`room.rs` for a zone's mode and room settings) and `src/server/zones.rs` (the zone
   API: `GET /zones` builds each status, `PATCH /zones/{id}` takes the room).
 - `src/server/handlers.rs`: entities add and remove; `src/main.rs` wires the shared state.
@@ -36,14 +37,29 @@ add to it in the same change when you learn something the next contributor would
   entity in **both** maps, or a re-added TRV inherits stale state; a new map would need the same.
 - TRV readings used to build a tick's `Scheduled` are the *previous* tick's (the cached state
   from before this tick's fetch). A failed fetch leaves the old cached state in place, so check
-  `EntityMemory.read` before trusting a reading.
+  `EntityMemory.read` before trusting a reading: `drive_reading` and `smart_reading` do. Don't
+  call `shadow::room_temperature` on all the entities for a decision.
+
+- A smart zone's TRVs on the first tick after a start (`smart_waiting`) are fetched in
+  `run_scheduler`'s `let Some(scheduled) = scheduled else` branch, not by
+  `apply_schedule_to_entity`. Anything apply records per entity (like `EntityMemory.read`) must
+  be recorded there too. `run_scheduler` has no test harness, so check that branch by running it
+  against a fake HA.
+- Decisions are made before the tick's fetch, so the tick on which a TRV comes back still decides
+  without it; its reading counts from the next tick.
 
 ## Gotchas
+- `smart::decide` has early returns (no room temperature, no weather) for falling back to the
+  schedule. A fallback that comes before the "begun" check cancels a warm-up under way: the
+  no-room-temperature one keeps a begun Heat (and its `Lead` reason, which is what marks it
+  begun), but the no-weather one doesn't yet. Keep a begun warm-up in any new fallback.
+- The top-level readme is `README.MD` (upper-case extension) in git. It opens as `README.md` on
+  a case-insensitive filesystem but not on Linux, so use the real name in scripts.
 - The frost floor knows it started the heating from `last_sent == Some(FROST_TARGET_C)` (10 °C).
   A schedule target of exactly 10 °C looks the same. Don't send 10 °C for any other reason
   without changing that check.
 - Driving TRVs harder: the TRV offset applies only to the drive reading. Smart and
-  Shadow decisions use `shadow::room_temperature`, which has no offset. A zone with a room sensor
+  Shadow decisions use `smart_reading`, which has no offset. A zone with a room sensor
   is driven only by that sensor and never falls back to its TRVs.
 - Room sensor readings have no age check: an unavailable or unreadable sensor gives None, but a
   sensor that stops updating while still reporting a number is trusted.
