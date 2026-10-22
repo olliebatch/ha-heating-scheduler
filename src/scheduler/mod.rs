@@ -1030,8 +1030,17 @@ pub async fn run_scheduler<T: ClimateEntity + Clone>(state: SchedulerState<T>) {
                 continue;
             }
             let Some(scheduled) = scheduled else {
-                if let Err(e) = entity.fetch_and_update_state(&state.api_client).await {
-                    eprintln!("Error fetching state for {}: {}", id, e);
+                let read = match entity.fetch_and_update_state(&state.api_client).await {
+                    Ok(()) => true,
+                    Err(e) => {
+                        eprintln!("Error fetching state for {}: {}", id, e);
+                        false
+                    }
+                };
+                // So the next tick's smart decision trusts this reading (see smart_reading)
+                if still_managed() {
+                    let mut memories = state.memories.lock().unwrap();
+                    memories.entry(id).or_default().read = read;
                 }
                 continue;
             };
