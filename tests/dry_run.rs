@@ -77,9 +77,36 @@ async fn run_through(client: &ApiClient, ha: &FakeHa) {
     let mut last_sent = None;
     let on = |t| scheduled(HeatingState::On, Some(t));
 
-    apply_schedule_to_entity(&mut trv, &on(21.0), 20.0, client, &mut last_sent, &|| true).await;
-    apply_schedule_to_entity(&mut trv, &on(21.0), 20.0, client, &mut last_sent, &|| true).await;
-    apply_schedule_to_entity(&mut trv, &on(22.0), 20.0, client, &mut last_sent, &|| true).await;
+    apply_schedule_to_entity(
+        &mut trv,
+        &on(21.0),
+        20.0,
+        client,
+        &mut last_sent,
+        &mut None,
+        &|| true,
+    )
+    .await;
+    apply_schedule_to_entity(
+        &mut trv,
+        &on(21.0),
+        20.0,
+        client,
+        &mut last_sent,
+        &mut None,
+        &|| true,
+    )
+    .await;
+    apply_schedule_to_entity(
+        &mut trv,
+        &on(22.0),
+        20.0,
+        client,
+        &mut last_sent,
+        &mut None,
+        &|| true,
+    )
+    .await;
 
     trv.set_boost(Some(BoostInfo::starting(chrono::Local::now(), 60)));
     apply_schedule_to_entity(
@@ -88,6 +115,7 @@ async fn run_through(client: &ApiClient, ha: &FakeHa) {
         20.0,
         client,
         &mut last_sent,
+        &mut None,
         &|| true,
     )
     .await;
@@ -101,6 +129,7 @@ async fn run_through(client: &ApiClient, ha: &FakeHa) {
         20.0,
         client,
         &mut last_sent,
+        &mut None,
         &|| true,
     )
     .await;
@@ -191,13 +220,31 @@ async fn test_an_entity_removed_while_its_state_is_read_is_sent_nothing() {
     let on = scheduled(HeatingState::On, Some(21.0));
 
     // Managed when the tick started, removed by the time its state comes back
-    apply_schedule_to_entity(&mut trv, &on, 20.0, &client, &mut last_sent, &|| false).await;
+    apply_schedule_to_entity(
+        &mut trv,
+        &on,
+        20.0,
+        &client,
+        &mut last_sent,
+        &mut None,
+        &|| false,
+    )
+    .await;
     assert_eq!(count(&ha, "GET /api/states/climate.lounge_trv"), 1);
     assert_eq!(count(&ha, "POST /api/services"), 0);
     assert_eq!(last_sent, None);
 
     // Still managed: the same step turns it on and sets its target
-    apply_schedule_to_entity(&mut trv, &on, 20.0, &client, &mut last_sent, &|| true).await;
+    apply_schedule_to_entity(
+        &mut trv,
+        &on,
+        20.0,
+        &client,
+        &mut last_sent,
+        &mut None,
+        &|| true,
+    )
+    .await;
     assert_eq!(count(&ha, "POST /api/services/climate/set_hvac_mode"), 1);
     assert_eq!(count(&ha, "POST /api/services/climate/set_temperature"), 1);
 }

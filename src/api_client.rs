@@ -30,12 +30,17 @@ impl ApiClient {
 
     pub async fn fetch_climate_state(&self, entity_id: &str) -> Result<ClimateInfo, anyhow::Error> {
         let endpoint = format!("/api/states/{}", entity_id);
-        let resp = self
+        let body = self
             .get(&endpoint)
             .await
             .map_err(|e| anyhow!(e))?
-            .json::<ClimateState>()
+            .error_for_status()?
+            .text()
             .await?;
+        // Decoded here rather than by reqwest, so the error says what didn't fit (e.g. an
+        // "unavailable" state) instead of only "error decoding response body"
+        let resp = serde_json::from_str::<ClimateState>(&body)
+            .map_err(|e| anyhow!("Home Assistant's state for {entity_id} didn't fit: {e}"))?;
 
         Ok(resp.into())
     }

@@ -181,7 +181,8 @@ impl ClimateEntity for DefaultClimate {
 
         api_client
             .post("/api/services/climate/set_hvac_mode", &body)
-            .await?;
+            .await?
+            .error_for_status()?;
 
         Ok(())
     }
@@ -195,7 +196,8 @@ impl ClimateEntity for DefaultClimate {
 
         api_client
             .post("/api/services/climate/set_hvac_mode", &body)
-            .await?;
+            .await?
+            .error_for_status()?;
 
         Ok(())
     }
@@ -231,6 +233,9 @@ pub struct MockClimate {
     pub target_step: Option<f64>,
     /// Make `set_temperature` fail, like a rejected HA call
     pub fail_set_temperature: bool,
+    /// A target changed on the TRV itself (a preset, its buttons), reported in place of the
+    /// last one sent until the next `set_temperature`
+    pub changed_on_trv: Arc<Mutex<Option<f64>>>,
     /// The mode last set by `turn_on`/`turn_off`, reported on the next fetch as HA would
     pub mode: Arc<Mutex<Option<HeatingState>>>,
     /// The room temperature reported on each fetch
@@ -255,6 +260,7 @@ impl MockClimate {
             set_temperatures: Default::default(),
             target_step: None,
             fail_set_temperature: false,
+            changed_on_trv: Default::default(),
             mode: Default::default(),
             current_temperature: 21.0,
             warms: false,
@@ -291,14 +297,17 @@ impl ClimateEntity for MockClimate {
         println!("[MOCK] Fetching state for {} (no API call)", self.entity_id);
         // Optionally update with mock data
         // Report the last temperature set, as Home Assistant would
-        let target_temp = self
-            .set_temperatures
-            .lock()
-            .unwrap()
-            .last()
-            .map(|t| match self.target_step {
-                Some(step) => (t / step).round() * step,
-                None => *t,
+        let target_temp = *self.changed_on_trv.lock().unwrap();
+        let target_temp = target_temp
+            .or_else(|| {
+                self.set_temperatures
+                    .lock()
+                    .unwrap()
+                    .last()
+                    .map(|t| match self.target_step {
+                        Some(step) => (t / step).round() * step,
+                        None => *t,
+                    })
             })
             .or_else(|| self.info.as_ref().and_then(|i| i.target_temp));
         let state = self.mode.lock().unwrap().clone().unwrap_or_else(|| {
@@ -349,6 +358,7 @@ impl ClimateEntity for MockClimate {
         if self.fail_set_temperature {
             return Err(anyhow!("mock set_temperature failure"));
         }
+        *self.changed_on_trv.lock().unwrap() = None;
         Ok(())
     }
 }
