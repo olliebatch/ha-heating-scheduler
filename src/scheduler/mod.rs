@@ -35,8 +35,12 @@ pub struct EntityMemory {
     pub put_back_at: Option<chrono::DateTime<Local>>,
     /// It's being driven harder because its room is well below the target (see [`drive`])
     pub driving: bool,
+    /// The `max_temp` it's being driven to, while driving
+    pub drive_setpoint: Option<f64>,
     /// The room reading the last tick used to decide that (see [`drive_reading`])
     pub room_c: Option<f64>,
+    /// Its state was read on its last tick, so its reading is current
+    pub read: bool,
 }
 
 /// Each entity's [`EntityMemory`], by entity id. Shared with the API, which shows the zones being
@@ -453,6 +457,7 @@ pub async fn apply_schedule_to_entity<T: ClimateEntity>(
     still_managed: &(dyn Fn() -> bool + Sync),
 ) {
     let now = Local::now();
+    memory.read = false;
     if let Err(e) = entity.fetch_and_update_state(api_client).await {
         eprintln!(
             "[{}] Error fetching state for {}: {}",
@@ -462,6 +467,7 @@ pub async fn apply_schedule_to_entity<T: ClimateEntity>(
         );
         return;
     }
+    memory.read = true;
     // Removed while its state was read: it's no longer controlled, so send it nothing
     if !still_managed() {
         return;
@@ -518,6 +524,7 @@ pub async fn apply_schedule_to_entity<T: ClimateEntity>(
         _ => false,
     };
     memory.room_c = scheduled.room_c;
+    memory.drive_setpoint = cached.max_temp.filter(|_| driving);
     let started_driving = driving && !memory.driving;
     if memory.driving && !driving {
         println!(
@@ -605,36 +612,44 @@ pub fn drive(target: f64, room_c: Option<f64>, driving: bool) -> bool {
 
 /// The room reading to drive a zone's TRVs by: its room sensor's, else its TRVs' average plus the
 /// zone's TRV offset (their sensors sit by the radiator), to 0.1 °C. None without either.
-pub fn drive_reading<T: ClimateEntity>(
+pub fn drive_reading<T: ClimateEntity + Clone>(
     zone: &Zone,
     entities: &[T],
     sensor: Option<f64>,
+    memories: &HashMap<String, EntityMemory>,
 ) -> Option<f64> {
-    sensor.or_else(|| {
-        room_temperature(zone, entities, None)
-            .map(|c| ((c + zone.room.trv_offset_c) * 10.0).round() / 10.0)
-    })
+    // A zone with a sensor is read only from it, as its offset is for its TRVs
+    if zone.room.sensor_entity_id.is_some() {
+        return sensor;
+    }
+    // Only TRVs read on their last tick: one that can't be read keeps its last reading
+    let read: Vec<T> = entities
+        .iter()
+        .filter(|e| memories.get(e.get_entity_id()).is_some_and(|m| m.read))
+        .cloned()
+        .collect();
+    room_temperature(zone, &read, None)
+        .map(|c| ((c + zone.room.trv_offset_c) * 10.0).round() / 10.0)
 }
 
 /// The room reading a zone's entities were last driven by (or not), whether any of them is being
-/// driven harder, and the highest setpoint sent to them meanwhile
+/// driven harder, and the highest `max_temp` they're driven to
 pub fn zone_drive(
     zone: &Zone,
     memories: &HashMap<String, EntityMemory>,
-    last_sent: &HashMap<String, Option<f64>>,
 ) -> (Option<f64>, bool, Option<f64>) {
     let room_c = zone
         .entity_ids
         .iter()
         .find_map(|id| memories.get(id)?.room_c);
-    let driven: Vec<&String> = zone
+    let driven: Vec<&EntityMemory> = zone
         .entity_ids
         .iter()
-        .filter(|id| memories.get(*id).is_some_and(|m| m.driving))
+        .filter_map(|id| memories.get(id).filter(|m| m.driving))
         .collect();
     let setpoint = driven
         .iter()
-        .filter_map(|id| last_sent.get(*id).copied().flatten())
+        .filter_map(|m| m.drive_setpoint)
         .reduce(f64::max);
     (room_c, !driven.is_empty(), setpoint)
 }
@@ -907,6 +922,7 @@ pub async fn run_scheduler<T: ClimateEntity + Clone>(state: SchedulerState<T>) {
         let weather = read_weather(&state.weather, state.weather_source.as_ref(), now).await;
         read_forecast(&state.weather, state.weather_source.as_ref(), now).await;
         let sensors = read_room_sensors(&state.zones, state.weather_source.as_ref()).await;
+        let memories = state.memories.lock().unwrap().clone();
 
         // What each entity's zone schedule asks for right now, and why (for the dry-run log)
         // None for an entity of a smart zone whose radiators haven't been read yet (the first tick
@@ -956,7 +972,7 @@ pub async fn run_scheduler<T: ClimateEntity + Clone>(state: SchedulerState<T>) {
                         == HeatingState::On;
                     let name = zone.map(|z| z.name.as_str());
                     let room_c = zone.and_then(|z| {
-                        drive_reading(z, &entities_clone, sensors.get(&z.id).copied())
+                        drive_reading(z, &entities_clone, sensors.get(&z.id).copied(), &memories)
                     });
                     // A boost still wins (in apply_schedule_to_entity), and the frost floor
                     // still applies when Smart leaves a room off
@@ -2718,20 +2734,97 @@ mod tests {
             })
             .collect();
 
-        // TRVs at 0.5 °C below the target: not far enough, unless they read warm
-        assert_eq!(drive_reading(&zone, &entities, None), Some(19.5));
-        assert!(!drive(20.0, drive_reading(&zone, &entities, None), false));
-        zone.room.trv_offset_c = -1.5;
-        assert_eq!(drive_reading(&zone, &entities, None), Some(18.0));
-        assert!(drive(20.0, drive_reading(&zone, &entities, None), false));
+        let read = |ids: &[&str]| -> HashMap<String, EntityMemory> {
+            ids.iter()
+                .map(|id| {
+                    let memory = EntityMemory {
+                        read: true,
+                        ..Default::default()
+                    };
+                    (id.to_string(), memory)
+                })
+                .collect()
+        };
+        let both = read(&["climate.a", "climate.b"]);
 
-        // A room sensor's reading is used as it is
-        assert_eq!(drive_reading(&zone, &entities, Some(19.5)), Some(19.5));
-        // Nothing to read
+        // TRVs at 0.5 °C below the target: not far enough, unless they read warm
+        assert_eq!(drive_reading(&zone, &entities, None, &both), Some(19.5));
+        assert!(!drive(
+            20.0,
+            drive_reading(&zone, &entities, None, &both),
+            false
+        ));
+        zone.room.trv_offset_c = -1.5;
+        assert_eq!(drive_reading(&zone, &entities, None, &both), Some(18.0));
+        assert!(drive(
+            20.0,
+            drive_reading(&zone, &entities, None, &both),
+            false
+        ));
+
+        // A TRV that couldn't be read on its last tick is left out: a's frozen 15 °C would make
+        // the average 17.5 and drive, but b's 20 °C alone doesn't
+        zone.room.trv_offset_c = 0.0;
+        let mut frozen = entities.clone();
+        frozen[0].info.as_mut().unwrap().current_temperature = 15.0;
+        assert_eq!(drive_reading(&zone, &frozen, None, &both), Some(17.5));
+        let stale_a = read(&["climate.b"]);
+        assert_eq!(drive_reading(&zone, &frozen, None, &stale_a), Some(20.0));
+        assert!(!drive(
+            20.0,
+            drive_reading(&zone, &frozen, None, &stale_a),
+            false
+        ));
+        // None read: nothing to drive by
+        assert_eq!(drive_reading(&zone, &entities, None, &HashMap::new()), None);
         assert_eq!(
-            drive_reading(&zone, &Vec::<crate::climate::MockClimate>::new(), None),
+            drive_reading(
+                &zone,
+                &Vec::<crate::climate::MockClimate>::new(),
+                None,
+                &both
+            ),
             None
         );
+
+        // A zone with a room sensor reads only the sensor, as it is, without the offset
+        zone.room.sensor_entity_id = Some("sensor.lounge".to_string());
+        assert_eq!(
+            drive_reading(&zone, &entities, Some(19.5), &both),
+            Some(19.5)
+        );
+        // and when the sensor can't be read, doesn't fall back to its TRVs
+        assert_eq!(drive_reading(&zone, &entities, None, &both), None);
+    }
+
+    #[tokio::test]
+    async fn test_a_failed_fetch_marks_the_entity_unread() {
+        // Nothing listens on port 1, so reading its state fails
+        let unreachable = ApiClient::new(
+            reqwest::Url::parse("http://127.0.0.1:1").unwrap(),
+            "fake_token".to_string(),
+            None,
+        );
+        let mut entity = crate::climate::DefaultClimate::new("climate.test".to_string());
+        let mut memory = EntityMemory {
+            read: true,
+            ..Default::default()
+        };
+        apply_schedule_to_entity(
+            &mut entity,
+            &on_in_room(20.0, Some(15.0)),
+            20.0,
+            &unreachable,
+            &mut None,
+            &mut memory,
+            &|| true,
+        )
+        .await;
+        assert!(!memory.read);
+
+        let mut entity = trv(Some(28.0));
+        drive_tick(&mut entity, &on_in_room(20.0, None), &mut None, &mut memory).await;
+        assert!(memory.read);
     }
 
     #[tokio::test]
@@ -2822,6 +2915,7 @@ mod tests {
                 &zones.read().unwrap().zones[0],
                 &[mock(HeatingState::Off)],
                 sensors.get(&zone_id).copied(),
+                &HashMap::new(),
             );
             // Smart heats by its decision; Schedule and Shadow by the schedule
             let scheduled = match mode {
@@ -2845,31 +2939,19 @@ mod tests {
         let mut zones = Zones::default();
         zones.reconcile(None, &["climate.a".to_string(), "climate.b".to_string()]);
         let zone = &zones.zones[0];
-        let memory = |driving| EntityMemory {
-            put_back_at: None,
-            driving,
+        let memory = |drive_setpoint: Option<f64>| EntityMemory {
+            driving: drive_setpoint.is_some(),
+            drive_setpoint,
             room_c: Some(17.0),
+            ..Default::default()
         };
         let memories = HashMap::from([
-            ("climate.a".to_string(), memory(true)),
-            ("climate.b".to_string(), memory(true)),
+            ("climate.a".to_string(), memory(Some(28.0))),
+            ("climate.b".to_string(), memory(Some(30.0))),
         ]);
-        let last_sent = HashMap::from([
-            ("climate.a".to_string(), Some(28.0)),
-            ("climate.b".to_string(), Some(30.0)),
-        ]);
-        assert_eq!(
-            zone_drive(zone, &memories, &last_sent),
-            (Some(17.0), true, Some(30.0))
-        );
-        let memories = HashMap::from([("climate.a".to_string(), memory(false))]);
-        assert_eq!(
-            zone_drive(zone, &memories, &last_sent),
-            (Some(17.0), false, None)
-        );
-        assert_eq!(
-            zone_drive(zone, &HashMap::new(), &last_sent),
-            (None, false, None)
-        );
+        assert_eq!(zone_drive(zone, &memories), (Some(17.0), true, Some(30.0)));
+        let memories = HashMap::from([("climate.a".to_string(), memory(None))]);
+        assert_eq!(zone_drive(zone, &memories), (Some(17.0), false, None));
+        assert_eq!(zone_drive(zone, &HashMap::new()), (None, false, None));
     }
 }

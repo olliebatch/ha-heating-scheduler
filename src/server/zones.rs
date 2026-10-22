@@ -91,7 +91,6 @@ pub async fn get_zones<T: ClimateEntity + Clone>(
     };
     let mut decisions = state.shadow.read().unwrap().decisions.clone();
     let memories = state.memories.lock().unwrap().clone();
-    let last_sent = state.last_sent_targets.lock().unwrap().clone();
     // Lock order everywhere: schedule sets, then zones
     let sets = state.schedule.read().unwrap();
     let zones = state.zones.read().unwrap();
@@ -100,7 +99,7 @@ pub async fn get_zones<T: ClimateEntity + Clone>(
             .zones
             .iter()
             .map(|zone| {
-                let (room_c, driving, drive_setpoint) = zone_drive(zone, &memories, &last_sent);
+                let (room_c, driving, drive_setpoint) = zone_drive(zone, &memories);
                 ZoneView {
                     zone: zone.clone(),
                     status: ZoneStatus {
@@ -633,7 +632,7 @@ mod tests {
         assert_eq!(err.0, StatusCode::BAD_REQUEST);
         assert!(err.1.contains("trv_offset_c"), "{}", err.1);
 
-        // The scheduler's last tick drove the study's TRV at its max_temp
+        // The scheduler's last tick is driving the study's TRV to its max_temp
         state.schedule.write().unwrap().active_mut().add_entry(
             crate::schedule::ScheduleEntry::new(
                 "All day",
@@ -645,16 +644,19 @@ mod tests {
         state.memories.lock().unwrap().insert(
             "climate.study_trv".to_string(),
             crate::scheduler::EntityMemory {
-                put_back_at: None,
                 driving: true,
+                drive_setpoint: Some(28.0),
                 room_c: Some(17.5),
+                read: true,
+                ..Default::default()
             },
         );
+        // Sending the max_temp failed, so the last target sent is still the old one
         state
             .last_sent_targets
             .lock()
             .unwrap()
-            .insert("climate.study_trv".to_string(), Some(28.0));
+            .insert("climate.study_trv".to_string(), Some(20.0));
 
         let views = get_zones(State(state.clone())).await.0;
         let json = serde_json::to_value(&views).unwrap();

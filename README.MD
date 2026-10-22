@@ -145,9 +145,10 @@ no setting. A boost or an On period takes precedence.
 Driving TRVs harder: a TRV closes its valve as its own sensor, by the radiator, nears the target, so a cold room heats
 slowly. While a zone is On (in any mode, boosts included) and its room reads 1.5 °C or more below the target, each of
 its TRVs is sent its own `max_temp` instead, so its valve opens fully; once the room is within 0.5 °C of the target it
-gets the target again, and driving only restarts at 1.5 °C below. The room reading is the zone's room sensor, else its
-TRVs' average plus the zone's `room.trv_offset_c` (e.g. -1.5 when the TRVs read warm). With no reading, or a TRV whose
-`max_temp` isn't known, the target is sent as before; the frost floor is never driven.
+gets the target again, and driving only restarts at 1.5 °C below. The room reading is the zone's room sensor if it has
+one (if it can't be read, there's no reading); otherwise the average of the TRVs that were read on their last tick, plus
+the zone's `room.trv_offset_c` (e.g. -1.5 when the TRVs read warm). With no reading, or a TRV whose `max_temp` isn't
+known, the target is sent as before; the frost floor is never driven.
 
 - `GET /weather` - The configured weather entity, the last reading and any error. The reading includes
   `wind_bearing` (degrees the wind blows from, 0 = north; a compass point like `"NE"` is converted). `forecast` is the
@@ -176,8 +177,8 @@ TRVs' average plus the zone's `room.trv_offset_c` (e.g. -1.5 when the TRVs read 
   allowed by the weather, `minutes_early` it actually started, and `causes`) while a period is being started early, and
   `late_finish` (`period_end`, `extra_minutes`, `causes`) while one is kept going past its end, and `warm_up`
   (`started_at`, `until`, `outside_c`) during a cold-day warm-up. From the scheduler's last tick: `room_c` (the
-  reading used to drive TRVs harder, with any TRV offset), `driving` and `drive_setpoint` (the `max_temp` sent, the
-  highest if its TRVs differ; null when not driving). `target` stays the real target
+  reading used to drive TRVs harder, with any TRV offset), `driving` and `drive_setpoint` (the `max_temp` its TRVs are
+  driven to, the highest if they differ; null when not driving). `target` stays the real target
 - `GET /zones` also includes each shadow or smart zone's `decision` from the latest tick (null for Schedule zones):
   `at`, the `room_c` it used, `schedule_start` (when the schedule starts heating for the same comfort time, its early
   start included once begun) and `decision`: `action` (`heat`, `off` or `not_needed`), `target`, `start_at`,
