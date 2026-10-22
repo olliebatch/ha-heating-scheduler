@@ -2818,9 +2818,8 @@ mod tests {
 
             let sensors = read_room_sensors(&zones, &ColdRoom).await;
             assert_eq!(sensors.get(&zone_id), Some(&17.0), "{mode:?}");
-            let zones = zones.read().unwrap();
             let room_c = drive_reading(
-                &zones.zones[0],
+                &zones.read().unwrap().zones[0],
                 &[mock(HeatingState::Off)],
                 sensors.get(&zone_id).copied(),
             );
