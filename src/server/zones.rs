@@ -608,6 +608,77 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_trv_offset_is_set_through_the_zone_api_and_drive_shows_on_the_zone() {
+        let (state, _dir) = test_state();
+        let zones = refresh_zones(State(state.clone())).await.unwrap().0;
+        let study = zone_named(&zones, "Study").id;
+        let request = |json: &str| Json::<UpdateZoneRequest>::from_bytes(json.as_bytes());
+
+        let zone = update_zone(
+            State(state.clone()),
+            Path(study),
+            request(r#"{"room": {"trv_offset_c": -1.5}}"#),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(zone.room.trv_offset_c, -1.5);
+        let err = update_zone(
+            State(state.clone()),
+            Path(study),
+            request(r#"{"room": {"trv_offset_c": 9}}"#),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert!(err.1.contains("trv_offset_c"), "{}", err.1);
+
+        // The scheduler's last tick drove the study's TRV at its max_temp
+        state.schedule.write().unwrap().active_mut().add_entry(
+            crate::schedule::ScheduleEntry::new(
+                "All day",
+                TimePeriod::new(0, 0, 0, 0),
+                HeatingState::On,
+            )
+            .with_target(20.0),
+        );
+        state.memories.lock().unwrap().insert(
+            "climate.study_trv".to_string(),
+            crate::scheduler::EntityMemory {
+                put_back_at: None,
+                driving: true,
+                room_c: Some(17.5),
+            },
+        );
+        state
+            .last_sent_targets
+            .lock()
+            .unwrap()
+            .insert("climate.study_trv".to_string(), Some(28.0));
+
+        let views = get_zones(State(state.clone())).await.0;
+        let json = serde_json::to_value(&views).unwrap();
+        let view = |name: &str| {
+            json.as_array()
+                .unwrap()
+                .iter()
+                .find(|v| v["name"] == name)
+                .unwrap()
+                .clone()
+        };
+        let study = view("Study");
+        assert_eq!(study["room"]["trv_offset_c"], -1.5);
+        assert_eq!(study["status"]["target"], 20.0, "the real target");
+        assert_eq!(study["status"]["room_c"], 17.5);
+        assert_eq!(study["status"]["driving"], true);
+        assert_eq!(study["status"]["drive_setpoint"], 28.0);
+        let lounge = view("Lounge");
+        assert_eq!(lounge["status"]["driving"], false);
+        assert!(lounge["status"]["drive_setpoint"].is_null());
+        assert!(lounge["status"]["room_c"].is_null());
+    }
+
+    #[tokio::test]
     async fn test_mode_and_room_update() {
         use crate::zones::room::{Facing, ZoneMode};
         let (state, _dir) = test_state();

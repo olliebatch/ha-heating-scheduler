@@ -555,8 +555,10 @@ pub async fn apply_schedule_to_entity<T: ClimateEntity>(
         && cached
             .target_temp
             .is_some_and(|t| (t - target).abs() > PUT_BACK_BEYOND_C);
-    let put_back =
-        changed_on_trv && memory.put_back_at.is_none_or(|at| now - at >= PUT_BACK_EVERY);
+    let put_back = changed_on_trv
+        && memory
+            .put_back_at
+            .is_none_or(|at| now - at >= PUT_BACK_EVERY);
     if put_back {
         println!(
             "  {} reports {:?} °C, putting back {target} °C",
@@ -1245,21 +1247,21 @@ mod tests {
         let mut last = None;
         let mut put_back = EntityMemory::default();
         let on = scheduled(HeatingState::On, Some(20.0));
-        let mut tick =
-            async |entity: &mut crate::climate::MockClimate, put_back: &mut EntityMemory| {
-                // Stuck in its Away preset: it keeps reporting 5 °C whatever it's sent
-                apply_schedule_to_entity(
-                    entity,
-                    &on,
-                    20.0,
-                    &fake_client(),
-                    &mut last,
-                    put_back,
-                    &|| true,
-                )
-                .await;
-                *entity.changed_on_trv.lock().unwrap() = Some(5.0);
-            };
+        let mut tick = async |entity: &mut crate::climate::MockClimate,
+                              put_back: &mut EntityMemory| {
+            // Stuck in its Away preset: it keeps reporting 5 °C whatever it's sent
+            apply_schedule_to_entity(
+                entity,
+                &on,
+                20.0,
+                &fake_client(),
+                &mut last,
+                put_back,
+                &|| true,
+            )
+            .await;
+            *entity.changed_on_trv.lock().unwrap() = Some(5.0);
+        };
 
         tick(&mut entity, &mut put_back).await;
         for _ in 0..3 {
@@ -2596,6 +2598,279 @@ mod tests {
             live[2].get_boosted_status(),
             &Some(boost(60)),
             "replacing boost kept"
+        );
+    }
+
+    /// A mock TRV that takes up to `max_temp`
+    fn trv(max_temp: Option<f64>) -> crate::climate::MockClimate {
+        let mut entity = mock(HeatingState::Off);
+        entity.info.as_mut().unwrap().max_temp = max_temp;
+        entity
+    }
+
+    /// On at `target`, with the room reading `room_c`
+    fn on_in_room(target: f64, room_c: Option<f64>) -> Scheduled {
+        Scheduled {
+            room_c,
+            ..scheduled(HeatingState::On, Some(target))
+        }
+    }
+
+    /// One scheduler tick for `entity`, keeping what it remembers between ticks in `memory`
+    async fn drive_tick(
+        entity: &mut crate::climate::MockClimate,
+        scheduled: &Scheduled,
+        last_sent: &mut Option<f64>,
+        memory: &mut EntityMemory,
+    ) {
+        apply_schedule_to_entity(
+            entity,
+            scheduled,
+            20.0,
+            &fake_client(),
+            last_sent,
+            memory,
+            &|| true,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn test_a_room_well_below_the_target_drives_the_trv_at_its_max_temp() {
+        let mut entity = trv(Some(28.0));
+        let (mut last, mut memory) = (None, EntityMemory::default());
+
+        drive_tick(
+            &mut entity,
+            &on_in_room(20.0, Some(18.0)),
+            &mut last,
+            &mut memory,
+        )
+        .await;
+
+        assert_eq!(sent(&entity), vec![28.0]);
+        assert!(memory.driving);
+        assert_eq!(memory.room_c, Some(18.0));
+        assert_eq!(last, Some(28.0));
+    }
+
+    #[tokio::test]
+    async fn test_driving_stops_near_the_target_and_restarts_only_well_below_it() {
+        let mut entity = trv(Some(28.0));
+        let (mut last, mut memory) = (None, EntityMemory::default());
+        let mut at = async |room_c: f64| {
+            drive_tick(
+                &mut entity,
+                &on_in_room(20.0, Some(room_c)),
+                &mut last,
+                &mut memory,
+            )
+            .await;
+            (sent(&entity), memory.driving)
+        };
+
+        assert_eq!(at(18.0).await, (vec![28.0], true));
+        assert_eq!(
+            at(19.0).await,
+            (vec![28.0], true),
+            "1 °C below: still driving"
+        );
+        assert_eq!(at(19.6).await, (vec![28.0, 20.0], false), "within 0.5 °C");
+        assert_eq!(
+            at(19.0).await,
+            (vec![28.0, 20.0], false),
+            "1 °C below: not again"
+        );
+        assert_eq!(
+            at(18.5).await,
+            (vec![28.0, 20.0, 28.0], true),
+            "1.5 °C below"
+        );
+        assert_eq!(
+            at(18.5).await,
+            (vec![28.0, 20.0, 28.0], true),
+            "nothing resent"
+        );
+    }
+
+    #[test]
+    fn test_drive() {
+        assert!(drive(20.0, Some(18.5), false));
+        assert!(!drive(20.0, Some(18.6), false));
+        assert!(drive(20.0, Some(19.4), true));
+        assert!(!drive(20.0, Some(19.5), true));
+        assert!(!drive(20.0, Some(21.0), true), "above the target");
+        assert!(!drive(20.0, None, true), "never without a reading");
+    }
+
+    #[test]
+    fn test_a_trv_only_zone_reads_its_trvs_plus_its_offset() {
+        let mut zones = Zones::default();
+        zones.reconcile(None, &["climate.a".to_string(), "climate.b".to_string()]);
+        let mut zone = zones.zones.remove(0);
+        let entities: Vec<_> = [19.0, 20.0]
+            .into_iter()
+            .zip(["climate.a", "climate.b"])
+            .map(|(c, id)| {
+                let mut e = crate::climate::MockClimate::new(id.to_string(), HeatingState::On);
+                e.info.as_mut().unwrap().current_temperature = c;
+                e
+            })
+            .collect();
+
+        // TRVs at 0.5 °C below the target: not far enough, unless they read warm
+        assert_eq!(drive_reading(&zone, &entities, None), Some(19.5));
+        assert!(!drive(20.0, drive_reading(&zone, &entities, None), false));
+        zone.room.trv_offset_c = -1.5;
+        assert_eq!(drive_reading(&zone, &entities, None), Some(18.0));
+        assert!(drive(20.0, drive_reading(&zone, &entities, None), false));
+
+        // A room sensor's reading is used as it is
+        assert_eq!(drive_reading(&zone, &entities, Some(19.5)), Some(19.5));
+        // Nothing to read
+        assert_eq!(
+            drive_reading(&zone, &Vec::<crate::climate::MockClimate>::new(), None),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn test_no_reading_or_no_max_temp_sends_exactly_the_target() {
+        for (max_temp, room_c) in [(Some(28.0), None), (None, Some(15.0))] {
+            let mut entity = trv(max_temp);
+            let (mut last, mut memory) = (None, EntityMemory::default());
+            for _ in 0..3 {
+                let on = on_in_room(20.0, room_c);
+                drive_tick(&mut entity, &on, &mut last, &mut memory).await;
+            }
+            assert_eq!(sent(&entity), vec![20.0], "{max_temp:?} {room_c:?}");
+            assert!(!memory.driving);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_the_frost_floor_is_never_driven() {
+        let mut entity = trv(Some(28.0));
+        entity.current_temperature = 5.0;
+        let (mut last, mut memory) = (None, EntityMemory::default());
+        let off = Scheduled {
+            room_c: Some(4.0),
+            ..scheduled(HeatingState::Off, None)
+        };
+
+        drive_tick(&mut entity, &off, &mut last, &mut memory).await;
+        drive_tick(&mut entity, &off, &mut last, &mut memory).await;
+
+        assert_eq!(sent(&entity), vec![FROST_TARGET_C]);
+        assert!(!memory.driving);
+    }
+
+    #[tokio::test]
+    async fn test_a_driven_trv_is_put_back_only_when_changed_by_hand() {
+        let mut entity = trv(Some(28.0));
+        let (mut last, mut memory) = (None, EntityMemory::default());
+        let cold = on_in_room(20.0, Some(17.0));
+
+        drive_tick(&mut entity, &cold, &mut last, &mut memory).await;
+        // It reports its max_temp, as it was sent: that's not a change on the TRV
+        drive_tick(&mut entity, &cold, &mut last, &mut memory).await;
+        drive_tick(&mut entity, &cold, &mut last, &mut memory).await;
+        assert_eq!(sent(&entity), vec![28.0]);
+
+        // Turned down by hand
+        *entity.changed_on_trv.lock().unwrap() = Some(21.0);
+        drive_tick(&mut entity, &cold, &mut last, &mut memory).await;
+        assert_eq!(sent(&entity), vec![28.0, 28.0]);
+    }
+
+    /// Reads every room sensor at 17 °C
+    struct ColdRoom;
+
+    #[async_trait::async_trait]
+    impl WeatherSource for ColdRoom {
+        async fn fetch(&self, _entity_id: Option<&str>) -> anyhow::Result<Option<Weather>> {
+            Ok(None)
+        }
+        async fn fetch_forecast(
+            &self,
+            _entity_id: &str,
+        ) -> anyhow::Result<Vec<crate::weather::ForecastHour>> {
+            Ok(Vec::new())
+        }
+        async fn fetch_daylight(&self) -> anyhow::Result<Option<crate::schedule::TimePeriod>> {
+            Ok(None)
+        }
+        async fn fetch_temperature(&self, _entity_id: &str) -> anyhow::Result<Option<f64>> {
+            Ok(Some(17.0))
+        }
+    }
+
+    #[tokio::test]
+    async fn test_every_mode_drives_a_cold_room() {
+        use crate::zones::room::ZoneMode;
+        for mode in [ZoneMode::Schedule, ZoneMode::Shadow, ZoneMode::Smart] {
+            let mut zones = Zones::default();
+            zones.reconcile(None, &["climate.test".to_string()]);
+            zones.zones[0].mode = mode;
+            zones.zones[0].room.sensor_entity_id = Some("sensor.lounge".to_string());
+            let zone_id = zones.zones[0].id;
+            let zones: ZonesState = Arc::new(RwLock::new(zones));
+
+            let sensors = read_room_sensors(&zones, &ColdRoom).await;
+            assert_eq!(sensors.get(&zone_id), Some(&17.0), "{mode:?}");
+            let zones = zones.read().unwrap();
+            let room_c = drive_reading(
+                &zones.zones[0],
+                &[mock(HeatingState::Off)],
+                sensors.get(&zone_id).copied(),
+            );
+            // Smart heats by its decision; Schedule and Shadow by the schedule
+            let scheduled = match mode {
+                ZoneMode::Smart => smart_scheduled(&smart_decision(crate::smart::Action::Heat)),
+                _ => scheduled(HeatingState::On, Some(20.0)),
+            };
+            let scheduled = Scheduled {
+                room_c,
+                ..scheduled
+            };
+
+            let mut entity = trv(Some(28.0));
+            let (mut last, mut memory) = (None, EntityMemory::default());
+            drive_tick(&mut entity, &scheduled, &mut last, &mut memory).await;
+            assert_eq!(sent(&entity), vec![28.0], "{mode:?}");
+        }
+    }
+
+    #[test]
+    fn test_zone_drive() {
+        let mut zones = Zones::default();
+        zones.reconcile(None, &["climate.a".to_string(), "climate.b".to_string()]);
+        let zone = &zones.zones[0];
+        let memory = |driving| EntityMemory {
+            put_back_at: None,
+            driving,
+            room_c: Some(17.0),
+        };
+        let memories = HashMap::from([
+            ("climate.a".to_string(), memory(true)),
+            ("climate.b".to_string(), memory(true)),
+        ]);
+        let last_sent = HashMap::from([
+            ("climate.a".to_string(), Some(28.0)),
+            ("climate.b".to_string(), Some(30.0)),
+        ]);
+        assert_eq!(
+            zone_drive(zone, &memories, &last_sent),
+            (Some(17.0), true, Some(30.0))
+        );
+        let memories = HashMap::from([("climate.a".to_string(), memory(false))]);
+        assert_eq!(
+            zone_drive(zone, &memories, &last_sent),
+            (Some(17.0), false, None)
+        );
+        assert_eq!(
+            zone_drive(zone, &HashMap::new(), &last_sent),
+            (None, false, None)
         );
     }
 }
