@@ -2,6 +2,16 @@
 
 Read this before starting a ticket, and add to it before one ships.
 
+## Where things live
+- `src/scheduler/mod.rs`: the loop (`run_scheduler`), what each entity is sent
+  (`apply_schedule_to_entity`), zone status, frost floor, put-back and drive constants.
+- `src/shadow.rs` / `src/smart.rs`: Shadow logging and the Smart decision; `shadow::room_temperature`
+  is the room reading Smart uses.
+- `src/zones/` (`room.rs` for a zone's mode and room settings) and `src/server/zones.rs` (the zone
+  API: `GET /zones` builds each status, `PATCH /zones/{id}` takes the room).
+- `src/server/handlers.rs`: entities add and remove; `src/main.rs` wires the shared state.
+- `tests/dry_run.rs`: the fake HA. `README.md` documents every API field; update it with the code.
+
 ## Testing and checking
 - `cargo fmt --check && cargo test` is the check; `cargo build --all-targets` builds the tests too.
   `cargo clippy --all-targets` has 3 old warnings (module inception, a derivable `Default`, a
@@ -21,8 +31,8 @@ Read this before starting a ticket, and add to it before one ships.
   outside the locks.
 - What's kept per entity between ticks: `LastSentTargets` (the last target sent) and
   `EntityMemories` (put-back time, driving, the room reading, whether it was read). Both are
-  shared with the API, which forgets an entity's entries when it's added or removed. Keep the
-  two in step.
+  shared with the API. `add_entities` and `remove_entity` (src/server/handlers.rs) must forget an
+  entity in **both** maps, or a re-added TRV inherits stale state; a new map would need the same.
 - TRV readings used to build a tick's `Scheduled` are the *previous* tick's (the cached state
   from before this tick's fetch). A failed fetch leaves the old cached state in place, so check
   `EntityMemory.read` before trusting a reading.
@@ -34,6 +44,10 @@ Read this before starting a ticket, and add to it before one ships.
 - Driving TRVs harder (gh-32): the TRV offset applies only to the drive reading. Smart and
   Shadow decisions use `shadow::room_temperature`, which has no offset. A zone with a room sensor
   is driven only by that sensor and never falls back to its TRVs.
+- Room sensor readings have no age check: an unavailable or unreadable sensor gives None, but a
+  sensor that stops updating while still reporting a number is trusted.
+- `apply_schedule_to_entity` has 7 parameters, clippy's limit. Put new per-entity state in
+  `EntityMemory` rather than adding a parameter.
 - `Room` is `#[serde(default)]`: a new room field needs a default so older zones.json files load.
   Request bodies use `strict_room`, which picks up new fields automatically from `Room::default()`.
 - Anything that changes what's sent to HA, how DRY_RUN is read, or the `data/*.json` format is
