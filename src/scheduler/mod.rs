@@ -447,6 +447,10 @@ pub fn frost_floor(
 /// While the room is well below the target, the entity is driven harder: sent its `max_temp`
 /// (see [`drive`]; `memory.driving`), so its valve opens fully. One with no `max_temp` known
 /// isn't. Put-back then compares against `max_temp`, as it's what was sent.
+///
+/// While boosted, the entity is sent its `max_temp` whatever the schedule, so its valve opens
+/// fully for the whole boost. It isn't driven meanwhile (a boost already sends `max_temp`), so
+/// driving starts afresh when the boost ends. One with no `max_temp` known gets the usual target.
 pub async fn apply_schedule_to_entity<T: ClimateEntity>(
     entity: &mut T,
     scheduled: &Scheduled,
@@ -480,6 +484,9 @@ pub async fn apply_schedule_to_entity<T: ClimateEntity>(
     let mut final_desired_state = final_desired_heating_state(&scheduled.state, &boosted_state);
 
     let cached = entity.get_cached_state().clone().unwrap();
+    let boost_max = cached
+        .max_temp
+        .filter(|_| boosted_state == HeatingState::On);
     let heating_state = cached.state;
 
     let frost = frost_floor(
@@ -518,15 +525,17 @@ pub async fn apply_schedule_to_entity<T: ClimateEntity>(
     } else {
         desired_target_temp(&final_desired_state, scheduled, default_target_temp)
     };
-    // Never for the frost floor, which heats to exactly its target
+    // Never for the frost floor, which heats to exactly its target, nor while boosted at max
     let driving = match (target, cached.max_temp) {
-        (Some(target), Some(_)) if !frost => drive(target, scheduled.room_c, memory.driving),
+        (Some(target), Some(_)) if !frost && boost_max.is_none() => {
+            drive(target, scheduled.room_c, memory.driving)
+        }
         _ => false,
     };
     memory.room_c = scheduled.room_c;
     memory.drive_setpoint = cached.max_temp.filter(|_| driving);
     let started_driving = driving && !memory.driving;
-    if memory.driving && !driving {
+    if memory.driving && !driving && boost_max.is_none() {
         println!(
             "  {}: room {:?} °C, no longer driving harder; back to the target",
             entity.get_entity_id(),
@@ -543,10 +552,14 @@ pub async fn apply_schedule_to_entity<T: ClimateEntity>(
     let target = target
         .max(cached.min_temp.unwrap_or(f64::MIN))
         .min(cached.max_temp.unwrap_or(f64::MAX));
-    let target = match cached.max_temp {
-        Some(max_temp) if driving => max_temp,
+    let target = match (boost_max, cached.max_temp) {
+        (Some(max_temp), _) => max_temp,
+        (None, Some(max_temp)) if driving => max_temp,
         _ => target,
     };
+    if boost_max.is_some() && *last_sent != Some(target) {
+        println!("  {}: boosted, at {target} °C", entity.get_entity_id());
+    }
     if started_driving {
         println!(
             "  {}: room {:?} °C is well below {room_target} °C, driving harder at {target} °C",
@@ -1589,14 +1602,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_boost_during_off_uses_default_target() {
-        let mut entity = mock(HeatingState::Off);
-        entity.set_boost(Some(BoostInfo::starting(Local::now(), 1)));
-        let mut last = None;
+    async fn test_boost_with_no_max_temp_uses_the_usual_target() {
+        for (scheduled, expected) in [
+            (scheduled(HeatingState::Off, None), 20.0),
+            (scheduled(HeatingState::On, Some(18.0)), 18.0),
+        ] {
+            let mut entity = mock(HeatingState::Off);
+            entity.set_boost(Some(BoostInfo::starting(Local::now(), 1)));
+            let mut last = None;
 
-        tick(&mut entity, &scheduled(HeatingState::Off, None), &mut last).await;
+            tick(&mut entity, &scheduled, &mut last).await;
 
-        assert_eq!(sent(&entity), vec![20.0]);
+            assert_eq!(sent(&entity), vec![expected], "{scheduled:?}");
+        }
     }
 
     #[test]
@@ -2941,6 +2959,118 @@ mod tests {
         *entity.changed_on_trv.lock().unwrap() = Some(21.0);
         drive_tick(&mut entity, &cold, &mut last, &mut memory).await;
         assert_eq!(sent(&entity), vec![28.0, 28.0]);
+    }
+
+    fn boosted_trv(max_temp: Option<f64>) -> crate::climate::MockClimate {
+        let mut entity = trv(max_temp);
+        entity.set_boost(Some(BoostInfo::starting(Local::now(), 60)));
+        entity
+    }
+
+    /// A boost that ended a minute ago
+    fn ended_boost() -> BoostInfo {
+        BoostInfo::starting(Local::now() - chrono::TimeDelta::minutes(61), 60)
+    }
+
+    #[tokio::test]
+    async fn test_a_boost_sends_the_max_temp_whatever_the_schedule() {
+        for scheduled in [
+            scheduled(HeatingState::Off, None),
+            scheduled(HeatingState::On, Some(18.0)),
+        ] {
+            let mut entity = boosted_trv(Some(28.0));
+            let (mut last, mut memory) = (None, EntityMemory::default());
+
+            drive_tick(&mut entity, &scheduled, &mut last, &mut memory).await;
+
+            assert_eq!(sent(&entity), vec![28.0], "{scheduled:?}");
+            assert_eq!(last, Some(28.0));
+            assert!(!memory.driving);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_a_boost_sends_the_max_temp_once_then_the_usual_target_after() {
+        let mut entity = boosted_trv(Some(28.0));
+        let (mut last, mut memory) = (None, EntityMemory::default());
+        let on = scheduled(HeatingState::On, Some(18.0));
+
+        // The TRV reports the max_temp it was sent: not a change on the TRV, so not put back
+        for _ in 0..3 {
+            drive_tick(&mut entity, &on, &mut last, &mut memory).await;
+        }
+        assert_eq!(sent(&entity), vec![28.0]);
+        assert_eq!(memory.put_back_at, None);
+
+        entity.set_boost(Some(ended_boost()));
+        for _ in 0..2 {
+            drive_tick(&mut entity, &on, &mut last, &mut memory).await;
+        }
+        assert_eq!(sent(&entity), vec![28.0, 18.0]);
+        assert_eq!(entity.get_boosted_status(), &None);
+        assert_eq!(memory.put_back_at, None);
+    }
+
+    #[tokio::test]
+    async fn test_a_boost_while_driving_sends_the_max_temp_and_driving_resumes_after() {
+        let mut entity = trv(Some(28.0));
+        let (mut last, mut memory) = (None, EntityMemory::default());
+        let cold = on_in_room(20.0, Some(17.0));
+
+        drive_tick(&mut entity, &cold, &mut last, &mut memory).await;
+        assert!(memory.driving);
+        assert_eq!(memory.drive_setpoint, Some(28.0));
+
+        // Boosted: still the max_temp, nothing resent, and it's the boost not driving
+        entity.set_boost(Some(BoostInfo::starting(Local::now(), 60)));
+        drive_tick(&mut entity, &cold, &mut last, &mut memory).await;
+        assert_eq!(sent(&entity), vec![28.0]);
+        assert!(!memory.driving);
+        assert_eq!(memory.drive_setpoint, None);
+
+        // Ended with the room still cold: driven again, at the max_temp already sent
+        entity.set_boost(Some(ended_boost()));
+        drive_tick(&mut entity, &cold, &mut last, &mut memory).await;
+        assert_eq!(sent(&entity), vec![28.0]);
+        assert!(memory.driving);
+        assert_eq!(memory.drive_setpoint, Some(28.0));
+
+        // Ended with the room near the target: back to the target, not driving
+        entity.set_boost(Some(BoostInfo::starting(Local::now(), 60)));
+        drive_tick(&mut entity, &cold, &mut last, &mut memory).await;
+        entity.set_boost(Some(ended_boost()));
+        let warm = on_in_room(20.0, Some(19.8));
+        drive_tick(&mut entity, &warm, &mut last, &mut memory).await;
+        assert_eq!(sent(&entity), vec![28.0, 20.0]);
+        assert!(!memory.driving);
+        assert_eq!(memory.drive_setpoint, None);
+    }
+
+    #[tokio::test]
+    async fn test_a_boost_in_a_frosty_room_sends_the_max_temp_and_the_floor_resumes_after() {
+        let mut entity = trv(Some(28.0));
+        entity.current_temperature = 5.0;
+        let (mut last, mut memory) = (None, EntityMemory::default());
+        let off = Scheduled {
+            room_c: Some(4.0),
+            ..scheduled(HeatingState::Off, None)
+        };
+
+        drive_tick(&mut entity, &off, &mut last, &mut memory).await;
+        assert_eq!(sent(&entity), vec![FROST_TARGET_C]);
+
+        entity.set_boost(Some(BoostInfo::starting(Local::now(), 60)));
+        drive_tick(&mut entity, &off, &mut last, &mut memory).await;
+        drive_tick(&mut entity, &off, &mut last, &mut memory).await;
+        assert_eq!(sent(&entity), vec![FROST_TARGET_C, 28.0]);
+        assert!(!memory.driving);
+
+        // Still below the frost floor when it ends: heated to the floor's target again
+        entity.set_boost(Some(ended_boost()));
+        drive_tick(&mut entity, &off, &mut last, &mut memory).await;
+        assert_eq!(sent(&entity), vec![FROST_TARGET_C, 28.0, FROST_TARGET_C]);
+        assert!(!memory.driving);
+        assert_eq!(memory.drive_setpoint, None);
     }
 
     /// Reads every room sensor at 17 °C

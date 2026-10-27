@@ -198,7 +198,7 @@ async fn test_dry_run_sends_no_service_calls_but_still_reads() {
         calls,
         vec![
             ("would turn climate.lounge_trv off".to_string(), 0),
-            ("would set climate.lounge_trv to 20 °C".to_string(), 0),
+            ("would set climate.lounge_trv to 30 °C".to_string(), 0),
             ("would set climate.lounge_trv to 22 °C".to_string(), 0),
             ("would set climate.lounge_trv to 21 °C".to_string(), 1),
             ("would turn climate.lounge_trv on (heat)".to_string(), 3),

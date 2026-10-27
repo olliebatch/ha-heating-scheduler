@@ -84,9 +84,11 @@ On first run, an existing `data/schedule.json` becomes the only (active) set and
 - `DELETE /schedule_sets/{id}/entries/{entry_id}` - Delete an entry (409 for the only entry). Returns the set
 
 While an On entry is active, the scheduler sets its `target_temp` on each climate (after turning it on).
-Off stays off, with no temperature set. Boost uses the active On entry's target, or `default_target_temp`
-(stored in `schedule_sets.json`, 20 °C unless changed there) when nothing On is scheduled. On entries
-saved before targets existed get `default_target_temp` when loaded.
+Off stays off, with no temperature set. A boost sends each boosted TRV its own `max_temp`, so its valve opens fully
+for the whole boost, whatever is scheduled; when the boost ends, the usual target is sent again. A TRV whose `max_temp`
+isn't known gets the active On entry's target instead, or `default_target_temp` (stored in `schedule_sets.json`, 20 °C
+unless changed there) when nothing On is scheduled. On entries saved before targets existed get `default_target_temp`
+when loaded.
 
 ### Zones
 Each Home Assistant Area with managed climate entities is a zone (found through HA's `/api/template` endpoint;
@@ -143,12 +145,13 @@ below 7 °C, and turned off again once the room reaches 10 °C. It applies to ev
 no setting. A boost or an On period takes precedence.
 
 Driving TRVs harder: a TRV closes its valve as its own sensor, by the radiator, nears the target, so a cold room heats
-slowly. While a zone is On (in any mode, boosts included) and its room reads 1.5 °C or more below the target, each of
+slowly. While a zone is On (in any mode) and its room reads 1.5 °C or more below the target, each of
 its TRVs is sent its own `max_temp` instead, so its valve opens fully; once the room is within 0.5 °C of the target it
 gets the target again, and driving only restarts at 1.5 °C below. The room reading is the zone's room sensor if it has
 one (if it can't be read, there's no reading); otherwise the average of the TRVs that were read on their last tick, plus
 the zone's `room.trv_offset_c` (e.g. -1.5 when the TRVs read warm). With no reading, or a TRV whose `max_temp` isn't
-known, the target is sent as before; the frost floor is never driven.
+known, the target is sent as before; the frost floor is never driven. A boosted TRV is already at its `max_temp`, so
+it isn't counted as driven during the boost; driving starts afresh when the boost ends.
 
 - `GET /weather` - The configured weather entity, the last reading and any error. The reading includes
   `wind_bearing` (degrees the wind blows from, 0 = north; a compass point like `"NE"` is converted). `forecast` is the

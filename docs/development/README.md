@@ -64,6 +64,12 @@ add to it in the same change when you learn something the next contributor would
 - The frost floor knows it started the heating from `last_sent == Some(FROST_TARGET_C)` (10 °C).
   A schedule target of exactly 10 °C looks the same. Don't send 10 °C for any other reason
   without changing that check.
+- A boost sends `max_temp` (`boost_max` in `apply_schedule_to_entity`), ahead of the frost floor
+  and driving. A boosted entity isn't driving (`memory.driving` false), so when the boost ends
+  driving is decided afresh from the room, like a TRV that was never driven. One with no
+  `max_temp` known gets the scheduled or default target, as before. The only reader of
+  `memory.driving`/`drive_setpoint` outside the scheduler is `zone_drive` (`GET /zones`), which
+  reports a boosted TRV as not driven.
 - Driving TRVs harder: the TRV offset applies only to the drive reading. Smart and
   Shadow decisions use `smart_reading`, which has no offset. A zone with a room sensor
   is driven only by that sensor and never falls back to its TRVs.
