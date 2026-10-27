@@ -26,6 +26,9 @@ add to it in the same change when you learn something the next contributor would
   `Scheduled` values and check `set_temperatures`. Carry `last_sent` and `EntityMemory` across
   ticks when the behaviour depends on the previous tick (put-back, driving).
 - An unreachable `ApiClient` (`http://127.0.0.1:1`) with a `DefaultClimate` makes a failed fetch.
+- Handler tests call the handler functions directly (`test_state()` in `src/server/handlers.rs`),
+  so routes and request-body parsing in `start_server` are untested. Known gap: extract the router
+  into `fn router(state)` so routes can be tested with tower's `oneshot`.
 
 ## How the scheduler loop works (src/scheduler/mod.rs)
 - Every 15 s it copies the entities, reads the weather, forecast and room sensors, works out each
