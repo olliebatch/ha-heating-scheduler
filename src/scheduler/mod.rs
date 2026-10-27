@@ -535,7 +535,7 @@ pub async fn apply_schedule_to_entity<T: ClimateEntity>(
     memory.room_c = scheduled.room_c;
     memory.drive_setpoint = cached.max_temp.filter(|_| driving);
     let started_driving = driving && !memory.driving;
-    if memory.driving && !driving {
+    if memory.driving && !driving && boost_max.is_none() {
         println!(
             "  {}: room {:?} °C, no longer driving harder; back to the target",
             entity.get_entity_id(),
