@@ -53,8 +53,10 @@ add to it in the same change when you learn something the next contributor would
 - `run_scheduler` has no test harness. Keep logic out of it, in functions you can test
   (`smart_reading`, `smart_waiting`), and check anything left inline against a fake HA.
 - Decisions are made before the tick's fetch, so the tick on which a TRV comes back still decides
-  without it (and that decision is sent); driving also pauses for that tick. Its reading counts
-  from the next tick.
+  without it (and that decision is sent). Its reading counts from the next tick. A TRV that was
+  driving keeps driving on that tick if there's no room reading for it (`recovering` in
+  `apply_schedule_to_entity`), so it isn't sent the target and then `max_temp` again; with no
+  reading on the next tick either, driving stops.
 
 ## Gotchas
 - `smart::decide` has early returns (no room temperature, no weather) for falling back to the
