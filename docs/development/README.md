@@ -56,7 +56,8 @@ add to it in the same change when you learn something the next contributor would
   without it (and that decision is sent). Its reading counts from the next tick. A TRV that was
   driving keeps driving on that tick if there's no room reading for it (`recovering` in
   `apply_schedule_to_entity`), so it isn't sent the target and then `max_temp` again; with no
-  reading on the next tick either, driving stops.
+  reading for it since, driving stops: the hold happens once per reading, so a TRV that keeps
+  dropping out doesn't stay driven.
 
 ## Gotchas
 - `smart::decide` has early returns (no room temperature, no weather) for falling back to the

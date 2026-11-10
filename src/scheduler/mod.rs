@@ -531,8 +531,8 @@ pub async fn apply_schedule_to_entity<T: ClimateEntity>(
     let driving = match (target, cached.max_temp) {
         (Some(target), Some(_)) if !frost && boost_max.is_none() => {
             // The tick a failed TRV comes back has no reading for it yet: keep driving for that
-            // one tick rather than sending the target and then `max_temp` again
-            memory.driving && recovering && scheduled.room_c.is_none()
+            // tick (once per reading) rather than sending the target and then `max_temp` again
+            memory.driving && recovering && memory.room_c.is_some() && scheduled.room_c.is_none()
                 || drive(target, scheduled.room_c, memory.driving)
         }
         _ => false,
@@ -2960,6 +2960,42 @@ mod tests {
         drive_tick(&mut entity, &on_in_room(20.0, None), &mut last, &mut memory).await;
         assert!(!memory.driving);
         assert_eq!(sent(&entity), vec![28.0, 20.0]);
+    }
+
+    #[tokio::test]
+    async fn test_a_trv_that_keeps_dropping_out_is_held_once_then_stops_driving() {
+        let mut entity = trv(Some(28.0));
+        let (mut last, mut memory) = (None, EntityMemory::default());
+        drive_tick(
+            &mut entity,
+            &on_in_room(20.0, Some(18.0)),
+            &mut last,
+            &mut memory,
+        )
+        .await;
+        let unreachable = ApiClient::new(
+            reqwest::Url::parse("http://127.0.0.1:1").unwrap(),
+            "fake_token".to_string(),
+            None,
+        );
+        let mut failing = crate::climate::DefaultClimate::new("climate.test".to_string());
+        // A failed fetch, then a good tick with no room reading, over and over, while the room
+        // is warm: the hold doesn't re-arm without a reading in between
+        for _ in 0..20 {
+            apply_schedule_to_entity(
+                &mut failing,
+                &on_in_room(20.0, Some(25.0)),
+                20.0,
+                &unreachable,
+                &mut last,
+                &mut memory,
+                &|| true,
+            )
+            .await;
+            drive_tick(&mut entity, &on_in_room(20.0, None), &mut last, &mut memory).await;
+        }
+        assert!(!memory.driving);
+        assert_eq!(sent(&entity).last(), Some(&20.0));
     }
 
     #[tokio::test]
