@@ -25,6 +25,10 @@ add to it in the same change when you learn something the next contributor would
 - `apply_schedule_to_entity` is the unit to test what's sent: tick a `MockClimate` with
   `Scheduled` values and check `set_temperatures`. Carry `last_sent` and `EntityMemory` across
   ticks when the behaviour depends on the previous tick (put-back, driving).
+- `tests/router.rs` drives the real router (`server::router`) with `oneshot`, over mock state in a
+  temp dir. Add every new route to its `ROUTES` table (method and path); a route missing from the
+  table isn't covered. It checks each route isn't a router 404/405 (a handler's own "not found"
+  has a body, so it passes), that other methods on the path give 405, and that unknown paths give 404.
 - An unreachable `ApiClient` (`http://127.0.0.1:1`) with a `DefaultClimate` makes a failed fetch.
 
 ## How the scheduler loop works (src/scheduler/mod.rs)
