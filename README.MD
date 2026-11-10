@@ -81,7 +81,7 @@ On first run, an existing `data/schedule.json` becomes the only (active) set and
 - `PUT /schedule_sets/{id}/days` - Assign a set to exactly these days: `{"days": ["Sat", "Sun"]}` (`Mon` to `Sun`;
   full names and any case work too). Days the set had that aren't listed go back to the active set, and `[]`
   unassigns it. 409, naming the day and its set, if a day is already assigned to another set (unassign it there
-  first); 404 for an unknown set. Returns all sets
+  first); 404 for an unknown set; 422 for a day name it doesn't know. Returns all sets
 - `POST /schedule_sets` - Create a set: `{"name": "Holiday", "copy_from": "<set id>"}` (`copy_from` optional; without it the set is Off all day). Returns the set
 - `PATCH /schedule_sets/{id}` - Rename: `{"name": "Away"}`. Returns the set
 - `DELETE /schedule_sets/{id}` - Delete a set (409 for the active or last set, a set a zone follows, or a set
