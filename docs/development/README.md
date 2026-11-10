@@ -58,9 +58,11 @@ add to it in the same change when you learn something the next contributor would
 
 ## Gotchas
 - `smart::decide` has early returns (no room temperature, no weather) for falling back to the
-  schedule. A fallback that comes before the "begun" check cancels a warm-up under way: the
-  no-room-temperature one keeps a begun Heat (and its `Lead` reason, which is what marks it
-  begun), but the no-weather one doesn't yet. Keep a begun warm-up in any new fallback.
+  schedule. A fallback that ignores the "begun" check cancels a warm-up under way: both of
+  these keep a begun Heat (and its `Lead` reason, which is what marks it begun). Keep a begun
+  warm-up in any new fallback, and copy the whole three-arm `match` (inside the comfort time,
+  then begun, then `between`): the order matters, because inside the comfort time it's the
+  schedule's Heat, not the begun one, that must win.
 - `ComfortTime` has no date, so tomorrow's same period compares equal. A warm-up stops counting
   as begun only because every tick inside the comfort time drops the `Lead` reason; keep that
   true if you change the decision inside the comfort time.

@@ -227,29 +227,32 @@ pub fn decide(inputs: &Inputs) -> Decision {
                 .any(|r| matches!(r, Factor::Setback { .. }))
     });
 
+    // Heating that has begun carries on as it is, from when it began. Its lead is kept so it
+    // still counts as begun on the next tick.
+    let carry_on = |begun: &Decision, mut reasons: Vec<Factor>| {
+        reasons.extend(
+            begun
+                .reasons
+                .iter()
+                .filter(|r| matches!(r, Factor::Lead { .. }))
+                .cloned(),
+        );
+        Decision {
+            action: Action::Heat,
+            target: Some(comfort.target),
+            start_at: begun.start_at,
+            comfort,
+            reasons,
+        }
+    };
+
     // Without the room temperature there's nothing to go on: do what the schedule does, but keep
-    // heating that has begun (a TRV that can't be read for a tick mustn't cancel it). Its lead is
-    // kept so it still counts as begun on the next tick.
+    // heating that has begun (a TRV that can't be read for a tick mustn't cancel it).
     let Some(room_c) = inputs.room_c else {
-        let mut reasons = vec![Factor::NoRoomTemperature];
+        let reasons = vec![Factor::NoRoomTemperature];
         return match begun {
             _ if inputs.inside => scheduled(Action::Heat, reasons),
-            Some(begun) => {
-                reasons.extend(
-                    begun
-                        .reasons
-                        .iter()
-                        .filter(|r| matches!(r, Factor::Lead { .. }))
-                        .cloned(),
-                );
-                Decision {
-                    action: Action::Heat,
-                    target: Some(comfort.target),
-                    start_at: begun.start_at,
-                    comfort,
-                    reasons,
-                }
-            }
+            Some(begun) => carry_on(begun, reasons),
             None => between(comfort.start, reasons),
         };
     };
@@ -285,10 +288,11 @@ pub fn decide(inputs: &Inputs) -> Decision {
     let Some((weather, from_forecast)) = outside else {
         reasons.push(Factor::Indoors { c: room_c });
         reasons.push(Factor::NoWeather);
-        return if inputs.inside {
-            scheduled(Action::Heat, reasons)
-        } else {
-            between(comfort.start, reasons)
+        // Likewise for weather that can't be read: a begun warm-up isn't dropped for it
+        return match begun {
+            _ if inputs.inside => scheduled(Action::Heat, reasons),
+            Some(begun) => carry_on(begun, reasons),
+            None => between(comfort.start, reasons),
         };
     };
     let outside_c = round1(weather.temperature.unwrap_or_default());
@@ -809,6 +813,69 @@ mod tests {
         case.previous = Some(d);
         let d = case.evening();
         assert_eq!((d.action, d.start_at), (Action::Heat, begun.start_at));
+    }
+
+    #[test]
+    fn test_no_weather_keeps_heating_that_has_begun() {
+        // 16:00, 2 °C outside, room 17 °C: heating begins
+        let mut case = Case::new(at(16, 0), 17.0, weather(2.0, 0.0, None, 100.0));
+        let begun = case.evening();
+        assert_eq!(begun.action, Action::Heat);
+
+        // 16:20 the weather can't be read: heating carries on for the same comfort time, from
+        // when it began
+        case.now = at(16, 20);
+        case.room_c = Some(18.0);
+        case.weather = None;
+        case.previous = Some(begun.clone());
+        let d = case.evening();
+        assert_eq!(
+            (d.action, d.target, d.start_at, d.comfort),
+            (Action::Heat, Some(20.0), begun.start_at, begun.comfort)
+        );
+        assert!(d.reasons.contains(&NoWeather));
+
+        // and still counts as begun on the next tick, when the weather is back
+        case.now = at(16, 40);
+        case.room_c = Some(19.9);
+        case.weather = Some(weather(2.0, 0.0, None, 100.0));
+        case.previous = Some(d);
+        let d = case.evening();
+        assert_eq!((d.action, d.start_at), (Action::Heat, begun.start_at));
+    }
+
+    #[test]
+    fn test_no_weather_without_heating_begun_does_what_the_schedule_does() {
+        let mut case = Case::new(at(16, 20), 17.0, weather(2.0, 0.0, None, 100.0));
+        case.weather = None;
+        let expected = |action, target, start_at| Decision {
+            action,
+            target,
+            start_at,
+            comfort: ComfortTime {
+                start: time(17, 0),
+                end: time(22, 0),
+                target: 20.0,
+            },
+            reasons: vec![Indoors { c: 17.0 }, NoWeather],
+        };
+        let off = expected(Action::Off, None, time(17, 0));
+        assert_eq!(case.evening(), off);
+
+        // Nor after a decision that wasn't a begun warm-up: off, or another comfort time's
+        // heating with a setback
+        case.previous = Some(off.clone());
+        assert_eq!(case.evening(), off);
+        let mut setback = expected(Action::Heat, Some(15.0), time(15, 30));
+        setback.reasons = vec![
+            Lead {
+                minutes: 90,
+                capped: false,
+            },
+            Setback { c: 15.0 },
+        ];
+        case.previous = Some(setback);
+        assert_eq!(case.evening(), off);
     }
 
     #[test]
