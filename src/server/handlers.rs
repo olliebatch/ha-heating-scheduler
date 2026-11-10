@@ -315,6 +315,47 @@ pub async fn boost<T: ClimateEntity + Clone>(
     ))
 }
 
+pub async fn boost_all_cancel<T: ClimateEntity + Clone>(
+    State(state): State<AppState<T>>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    if let Ok(mut climates) = state.climate_entities.write() {
+        for entity in climates.iter_mut() {
+            entity.set_boost(None);
+        }
+        return Ok(StatusCode::OK);
+    }
+    Err((
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "Error Locking".to_string(),
+    ))
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct BoostCancelInput {
+    #[serde(default)]
+    climate_names: Vec<String>,
+}
+pub async fn boost_cancel<T: ClimateEntity + Clone>(
+    State(state): State<AppState<T>>,
+    Json(cancel): Json<BoostCancelInput>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    if let Ok(mut climates) = state.climate_entities.write() {
+        for entity in climates.iter_mut() {
+            if cancel
+                .climate_names
+                .contains(&entity.get_entity_id().to_string())
+            {
+                entity.set_boost(None);
+            }
+        }
+        return Ok(StatusCode::OK);
+    }
+    Err((
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "Error Locking".to_string(),
+    ))
+}
+
 #[derive(Serialize, Deserialize)]
 pub struct ClimateEntityInfo {
     pub entity_id: String,
@@ -622,6 +663,83 @@ mod tests {
         .await
         .unwrap()
         .0
+    }
+
+    fn with_entities(state: &AppState<MockClimate>, ids: &[&str]) {
+        *state.climate_entities.write().unwrap() = ids
+            .iter()
+            .map(|id| MockClimate::new(id.to_string(), HeatingState::Off))
+            .collect();
+    }
+
+    async fn boosted(state: &AppState<MockClimate>) -> Vec<(String, bool)> {
+        get_entities(State(state.clone()))
+            .await
+            .unwrap()
+            .0
+            .into_iter()
+            .map(|e| (e.entity_id, e.boost_active))
+            .collect()
+    }
+
+    fn names(ids: &[&str]) -> Json<BoostCancelInput> {
+        Json(BoostCancelInput {
+            climate_names: ids.iter().map(|s| s.to_string()).collect(),
+        })
+    }
+
+    #[tokio::test]
+    async fn test_boost_cancel_clears_only_the_named_entities() {
+        let (state, _dir) = test_state();
+        with_entities(&state, &["climate.a", "climate.b"]);
+        boost_all(State(state.clone())).await.unwrap();
+
+        let status = boost_cancel(State(state.clone()), names(&["climate.a", "climate.nope"]))
+            .await
+            .unwrap();
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            boosted(&state).await,
+            vec![
+                ("climate.a".to_string(), false),
+                ("climate.b".to_string(), true)
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_boost_cancel_with_no_names_cancels_nothing() {
+        let (state, _dir) = test_state();
+        with_entities(&state, &["climate.a"]);
+        boost_all(State(state.clone())).await.unwrap();
+
+        boost_cancel(State(state.clone()), names(&[]))
+            .await
+            .unwrap();
+        let omitted: BoostCancelInput = serde_json::from_str("{}").unwrap();
+        boost_cancel(State(state.clone()), Json(omitted))
+            .await
+            .unwrap();
+
+        assert_eq!(boosted(&state).await, vec![("climate.a".to_string(), true)]);
+    }
+
+    #[tokio::test]
+    async fn test_boost_all_cancel_clears_every_boost_and_is_a_no_op_without_one() {
+        let (state, _dir) = test_state();
+        with_entities(&state, &["climate.a", "climate.b"]);
+
+        assert_eq!(
+            boost_all_cancel(State(state.clone())).await.unwrap(),
+            StatusCode::OK
+        );
+        assert!(boosted(&state).await.iter().all(|(_, b)| !b));
+
+        boost_all(State(state.clone())).await.unwrap();
+        assert!(boosted(&state).await.iter().all(|(_, b)| *b));
+        boost_all_cancel(State(state.clone())).await.unwrap();
+        assert!(boosted(&state).await.iter().all(|(_, b)| !b));
     }
 
     #[tokio::test]

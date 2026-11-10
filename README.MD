@@ -236,6 +236,8 @@ stays off Debug builds' mock TRVs warm while On and cool while Off, so decisions
 ### Boost
 - `POST /boost_all` - Boost all entities (45 min)
 - `POST /boost` - Boost specific entities: `{"climate_names": ["climate.living_room"], "time_length": 30}`
+- `POST /boost_all/cancel` - Cancel every entity's boost; heating returns to the schedule on the next tick. 200 even if nothing was boosted
+- `POST /boost/cancel` - Cancel the boost on specific entities: `{"climate_names": ["climate.living_room"]}`. Unknown names are ignored; an empty or omitted list cancels nothing
 
 ## Running
 

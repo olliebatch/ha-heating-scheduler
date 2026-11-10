@@ -26,6 +26,9 @@ add to it in the same change when you learn something the next contributor would
   `Scheduled` values and check `set_temperatures`. Carry `last_sent` and `EntityMemory` across
   ticks when the behaviour depends on the previous tick (put-back, driving).
 - An unreachable `ApiClient` (`http://127.0.0.1:1`) with a `DefaultClimate` makes a failed fetch.
+- Handler tests call the handler functions directly (`test_state()` in `src/server/handlers.rs`),
+  so routes and request-body parsing in `start_server` are untested. Known gap: extract the router
+  into `fn router(state)` so routes can be tested with tower's `oneshot`.
 
 ## How the scheduler loop works (src/scheduler/mod.rs)
 - Every 15 s it copies the entities, reads the weather, forecast and room sensors, works out each
@@ -70,6 +73,9 @@ add to it in the same change when you learn something the next contributor would
   `max_temp` known gets the scheduled or default target, as before. The only reader of
   `memory.driving`/`drive_setpoint` outside the scheduler is `zone_drive` (`GET /zones`), which
   reports a boosted TRV as not driven.
+- Cancelling a boost (`POST /boost/cancel`, `POST /boost_all/cancel`) is just `set_boost(None)`. The
+  next tick sees an unboosted entity whose `last_sent` is the boost's `max_temp`, so the usual target
+  differs and is sent. An empty `climate_names` cancels nothing, unlike `/boost_all/cancel`.
 - Driving TRVs harder: the TRV offset applies only to the drive reading. Smart and
   Shadow decisions use `smart_reading`, which has no offset. A zone with a room sensor
   is driven only by that sensor and never falls back to its TRVs.

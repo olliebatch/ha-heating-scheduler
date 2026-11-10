@@ -3012,6 +3012,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_a_cancelled_boost_sends_the_usual_target_on_the_next_tick() {
+        let mut entity = boosted_trv(Some(28.0));
+        let (mut last, mut memory) = (None, EntityMemory::default());
+        let on = scheduled(HeatingState::On, Some(18.0));
+
+        drive_tick(&mut entity, &on, &mut last, &mut memory).await;
+        assert_eq!(last, Some(28.0));
+
+        entity.set_boost(None);
+        drive_tick(&mut entity, &on, &mut last, &mut memory).await;
+
+        assert_eq!(sent(&entity), vec![28.0, 18.0]);
+        assert_eq!(last, Some(18.0));
+    }
+
+    #[tokio::test]
     async fn test_a_boost_while_driving_sends_the_max_temp_and_driving_resumes_after() {
         let mut entity = trv(Some(28.0));
         let (mut last, mut memory) = (None, EntityMemory::default());
