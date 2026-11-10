@@ -69,13 +69,23 @@ CLIMATE_ENTITY=climate.living_room,climate.bedroom
 ## API Endpoints
 
 ### Schedule sets
-Schedules are kept as named sets in `data/schedule_sets.json`; one is active and drives the heating.
+Schedules are kept as named sets in `data/schedule_sets.json`. A set can be assigned to days of the week
+(say "Weekday" on Mon-Fri and "Weekend" on Sat-Sun): on those days it drives the heating. On a day with no set
+assigned, the active set does, so with no assignments the active set drives every day. A zone following its own
+set (`schedule_set_id`) keeps following it on every day. The day is the local date: at midnight the next day's set
+takes over, even part way through a period that crosses midnight.
 On first run, an existing `data/schedule.json` becomes the only (active) set and is left on disk as a backup.
 
-- `GET /schedule_sets` - All sets and the `active_id`
+- `GET /schedule_sets` - All sets, the `active_id`, and `day_sets`: the set assigned to each day, e.g.
+  `{"Sat": "<set id>", "Sun": "<set id>"}` (left out when no day is assigned)
+- `PUT /schedule_sets/{id}/days` - Assign a set to exactly these days: `{"days": ["Sat", "Sun"]}` (`Mon` to `Sun`;
+  full names and any case work too). Days the set had that aren't listed go back to the active set, and `[]`
+  unassigns it. 409, naming the day and its set, if a day is already assigned to another set (unassign it there
+  first); 404 for an unknown set. Returns all sets
 - `POST /schedule_sets` - Create a set: `{"name": "Holiday", "copy_from": "<set id>"}` (`copy_from` optional; without it the set is Off all day). Returns the set
 - `PATCH /schedule_sets/{id}` - Rename: `{"name": "Away"}`. Returns the set
-- `DELETE /schedule_sets/{id}` - Delete a set (409 for the active or last set). Returns all sets
+- `DELETE /schedule_sets/{id}` - Delete a set (409 for the active or last set, a set a zone follows, or a set
+  assigned to days). Returns all sets
 - `POST /schedule_sets/{id}/activate` - Make a set active. Returns all sets
 - `POST /schedule_sets/{id}/entries` - Add an entry to a set (400 if start equals end, except 00:00 - 00:00). Returns the set.
   On entries need a `target_temp` between 5 and 30 °C; Off entries have none, e.g.

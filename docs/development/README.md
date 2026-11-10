@@ -56,6 +56,18 @@ add to it in the same change when you learn something the next contributor would
   without it (and that decision is sent); driving also pauses for that tick. Its reading counts
   from the next tick.
 
+## Schedule sets and days (src/schedule/sets.rs)
+- Which schedule an entity follows: its zone's `schedule_set_id` if set, else `ScheduleSets::for_day`
+  (the set assigned to today's weekday in `day_sets`, else the active set). `zone_status` and
+  `shadow::zone_tick` both resolve it this way; a new caller should too, not `sets.active()`.
+  `active()` alone is right only for the legacy `/schedule` routes, which edit the active set.
+- `day_sets` maps each weekday to at most one set, so overlap can't be stored; `assign_days`
+  refuses a day held by another set. Deleting a set with days is refused, like one a zone follows.
+- `day_sets` is skipped when empty, so files from before it existed aren't rewritten by
+  `load_or_migrate` (which saves whenever the loaded JSON differs from what's on disk).
+- The set is picked by the date of `now`. A smart or weather early start, or a period crossing
+  midnight, looks ahead within today's set; at midnight the next day's set takes over.
+
 ## Gotchas
 - `smart::decide` has early returns (no room temperature, no weather) for falling back to the
   schedule. A fallback that ignores the "begun" check cancels a warm-up under way: both of

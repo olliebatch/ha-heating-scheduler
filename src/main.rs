@@ -110,6 +110,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         schedule_sets.sets.len(),
         schedule.name
     );
+    for set in &schedule_sets.sets {
+        let days = schedule_sets.days_of(set.id);
+        if !days.is_empty() {
+            let days: Vec<String> = days.iter().map(|d| d.to_string()).collect();
+            println!("    {} on {}", set.name, days.join(", "));
+        }
+    }
     println!("Total entries: {}", schedule.entries.len());
     for (i, entry) in schedule.entries.iter().enumerate() {
         println!(
