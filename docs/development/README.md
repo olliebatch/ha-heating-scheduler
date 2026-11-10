@@ -30,6 +30,8 @@ add to it in the same change when you learn something the next contributor would
   table isn't covered. It checks each route isn't a router 404/405 (a handler's own "not found"
   has a body, so it passes), that other methods on the path give 405, and that unknown paths give 404.
 - An unreachable `ApiClient` (`http://127.0.0.1:1`) with a `DefaultClimate` makes a failed fetch.
+  Loop it with good ticks to test a TRV that keeps dropping out: any hold that depends on "the last
+  fetch failed" re-arms on every failure, so check what stops it (see the recovery hold above).
 - Handler tests call the handler functions directly (`test_state()` in `src/server/handlers.rs`),
   so routes and request-body parsing in `start_server` are untested. Known gap: extract the router
   into `fn router(state)` so routes can be tested with tower's `oneshot`.
