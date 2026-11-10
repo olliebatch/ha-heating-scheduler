@@ -104,13 +104,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
-    let schedule = schedule_sets.active();
+    let today = chrono::Datelike::weekday(&chrono::Local::now());
+    let schedule = schedule_sets.for_day(today);
     println!(
-        "=== Loaded {} schedule set(s), active: {} ===",
+        "=== Loaded {} schedule set(s), active: {}, today ({}): {} ===",
         schedule_sets.sets.len(),
+        schedule_sets.active().name,
+        today,
         schedule.name
     );
-    println!("Total entries: {}", schedule.entries.len());
+    for set in &schedule_sets.sets {
+        let days = schedule_sets.days_of(set.id);
+        if !days.is_empty() {
+            let days: Vec<String> = days.iter().map(|d| d.to_string()).collect();
+            println!("    {} on {}", set.name, days.join(", "));
+        }
+    }
+    println!("Today's entries: {}", schedule.entries.len());
     for (i, entry) in schedule.entries.iter().enumerate() {
         println!(
             "  {}. {} | {} | {:?}",

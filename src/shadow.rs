@@ -11,7 +11,7 @@ use crate::smart::{
 };
 use crate::weather::{Weather, WeatherStatus};
 use crate::zones::Zone;
-use chrono::{DateTime, Local, NaiveTime, TimeDelta, Timelike};
+use chrono::{DateTime, Datelike, Local, NaiveTime, TimeDelta, Timelike};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
 use std::io::Write;
@@ -40,7 +40,7 @@ pub fn zone_tick(
     let schedule = zone
         .schedule_set_id
         .and_then(|id| sets.get(id))
-        .unwrap_or_else(|| sets.active());
+        .unwrap_or_else(|| sets.for_day(now.weekday()));
     let (comfort, inside) = comfort_time(schedule, now.time(), sets.default_target_temp)?;
     let decision = decide(&Inputs {
         now,
@@ -609,6 +609,61 @@ mod tests {
         let t = tick(&zone, &early).unwrap();
         assert_eq!(t.decision.schedule_start, time(16, 30));
         assert!(t.schedule_heating);
+    }
+
+    #[test]
+    fn test_zone_tick_follows_the_days_set() {
+        use chrono::Weekday::Sat;
+        let weather = WeatherStatus::default();
+        // Active set "Evenings": On 17:00-22:00. "Weekend": On 09:00-12:00, assigned to Sat.
+        // "Own": On 13:00-15:00, followed by a zone of its own.
+        let (zone, mut sets) = shadow_zone(ZoneMode::Shadow);
+        let on = |name: &str, start: u32, end: u32, target: f64| {
+            ScheduleEntry::new(name, TimePeriod::new(start, 0, end, 0), HeatingState::On)
+                .with_target(target)
+        };
+        let weekend = sets.create("Weekend", None).unwrap().id;
+        sets.get_mut(weekend)
+            .unwrap()
+            .add_entry(on("Morning", 9, 12, 21.0));
+        let own = sets.create("Own", None).unwrap().id;
+        sets.get_mut(own)
+            .unwrap()
+            .add_entry(on("Afternoon", 13, 15, 18.0));
+        sets.assign_days(weekend, &[Sat]).unwrap();
+        let mut own_zone = zone.clone();
+        own_zone.schedule_set_id = Some(own);
+
+        let saturday = Local.with_ymd_and_hms(2026, 11, 14, 8, 0, 0).unwrap();
+        let monday = Local.with_ymd_and_hms(2026, 11, 16, 8, 0, 0).unwrap();
+        assert_eq!(saturday.weekday(), Sat);
+        let tick = |zone: &Zone, now| {
+            zone_tick(zone, &sets, &off(), None, &weather, Some(18.0), None, now).unwrap()
+        };
+        let weekend_morning = ComfortTime {
+            start: time(9, 0),
+            end: time(12, 0),
+            target: 21.0,
+        };
+        let own_afternoon = ComfortTime {
+            start: time(13, 0),
+            end: time(15, 0),
+            target: 18.0,
+        };
+
+        let t = tick(&zone, saturday);
+        assert_eq!(t.decision.decision.comfort, weekend_morning);
+        assert_eq!(t.decision.schedule_start, time(9, 0));
+        // Monday has no set assigned: the active set
+        let t = tick(&zone, monday);
+        assert_eq!(t.decision.decision.comfort, EVENING);
+        assert_eq!(t.decision.schedule_start, time(17, 0));
+        // A zone following its own set ignores the day
+        for now in [saturday, monday] {
+            let t = tick(&own_zone, now);
+            assert_eq!(t.decision.decision.comfort, own_afternoon);
+            assert_eq!(t.decision.schedule_start, time(13, 0));
+        }
     }
 
     #[test]

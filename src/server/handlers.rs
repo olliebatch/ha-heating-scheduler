@@ -191,6 +191,26 @@ pub async fn activate_schedule_set<T: ClimateEntity + Clone>(
     Ok(Json(sets))
 }
 
+#[derive(Serialize, Deserialize)]
+pub struct AssignDaysRequest {
+    /// "Mon" to "Sun" (full names and any case also work)
+    pub days: Vec<chrono::Weekday>,
+}
+
+/// Assign a set to exactly these days of the week (an empty list unassigns it). A day already
+/// assigned to another set is refused with 409, naming the day and the set. Returns all sets.
+pub async fn assign_schedule_set_days<T: ClimateEntity + Clone>(
+    State(state): State<AppState<T>>,
+    Path(set_id): Path<Uuid>,
+    Json(payload): Json<AssignDaysRequest>,
+) -> Result<Json<ScheduleSets>, ApiError> {
+    let sets = update_sets(&state, |sets| {
+        sets.assign_days(set_id, &payload.days).map_err(set_error)?;
+        Ok(sets.clone())
+    })?;
+    Ok(Json(sets))
+}
+
 /// The checks an added or edited entry must pass: its target, and no zero-length period (400)
 fn check_set_entry(payload: &ScheduleEntryRequest) -> Result<(), ApiError> {
     payload
@@ -759,6 +779,45 @@ mod tests {
 
         let saved = persistence::load_sets(&state.schedule_sets_file_path).unwrap();
         assert_eq!(saved.get(holiday.id).unwrap().entries.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_assign_days_persists_and_rejects_overlap() {
+        use chrono::Weekday::{Fri, Sat, Sun};
+        let (state, _dir) = test_state();
+        let weekend = create(&state, "Weekend").await;
+        let holiday = create(&state, "Holiday").await;
+        let days = |days: Vec<chrono::Weekday>| Json(AssignDaysRequest { days });
+
+        let sets =
+            assign_schedule_set_days(State(state.clone()), Path(weekend.id), days(vec![Sat, Sun]))
+                .await
+                .unwrap()
+                .0;
+        assert_eq!(sets.days_of(weekend.id), vec![Sat, Sun]);
+        let saved = persistence::load_sets(&state.schedule_sets_file_path).unwrap();
+        assert_eq!(saved.days_of(weekend.id), vec![Sat, Sun]);
+
+        let err =
+            assign_schedule_set_days(State(state.clone()), Path(holiday.id), days(vec![Fri, Sun]))
+                .await
+                .unwrap_err();
+        assert_eq!(err.0, StatusCode::CONFLICT);
+        assert!(err.1.contains("Sun (\"Weekend\")"), "{}", err.1);
+        let saved = persistence::load_sets(&state.schedule_sets_file_path).unwrap();
+        assert!(saved.days_of(holiday.id).is_empty());
+
+        let err =
+            assign_schedule_set_days(State(state.clone()), Path(Uuid::new_v4()), days(vec![Fri]))
+                .await
+                .unwrap_err();
+        assert_eq!(err.0, StatusCode::NOT_FOUND);
+
+        // Request bodies take day names
+        let request: AssignDaysRequest =
+            serde_json::from_str(r#"{"days": ["Mon", "tue", "Wednesday"]}"#).unwrap();
+        assert_eq!(request.days.len(), 3);
+        assert!(serde_json::from_str::<AssignDaysRequest>(r#"{"days": ["Funday"]}"#).is_err());
     }
 
     #[tokio::test]

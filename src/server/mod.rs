@@ -1,10 +1,11 @@
 use crate::climate::{ClimateEntity, ClimateEntityWrapper};
 use crate::dry_run::DryRun;
 use crate::server::handlers::{
-    activate_schedule_set, add_entities, add_schedule_entry, add_set_entry, boost, boost_all,
-    boost_all_cancel, boost_cancel, create_schedule_set, delete_schedule_entry,
-    delete_schedule_set, delete_set_entry, get_available_entities, get_dry_run, get_entities,
-    get_schedule, get_schedule_sets, remove_entity, rename_schedule_set, update_set_entry,
+    activate_schedule_set, add_entities, add_schedule_entry, add_set_entry,
+    assign_schedule_set_days, boost, boost_all, boost_all_cancel, boost_cancel,
+    create_schedule_set, delete_schedule_entry, delete_schedule_set, delete_set_entry,
+    get_available_entities, get_dry_run, get_entities, get_schedule, get_schedule_sets,
+    remove_entity, rename_schedule_set, update_set_entry,
 };
 use crate::server::zones::{
     create_zone, delete_zone, get_zones, merge_zones, refresh_zones, update_zone,
@@ -71,6 +72,10 @@ pub fn router(app_state: AppState<ClimateEntityWrapper>) -> Router {
         .route(
             "/schedule_sets/{id}/activate",
             post(activate_schedule_set::<ClimateEntityWrapper>),
+        )
+        .route(
+            "/schedule_sets/{id}/days",
+            put(assign_schedule_set_days::<ClimateEntityWrapper>),
         )
         .route(
             "/schedule_sets/{id}/entries",
