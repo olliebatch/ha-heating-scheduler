@@ -15,7 +15,7 @@ use crate::weather::{
 };
 use crate::zones::{Zone, Zones};
 use crate::{ScheduleState, ShadowState, WeatherState, ZonesState};
-use chrono::Local;
+use chrono::{Datelike, Local};
 use serde::Serialize;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
@@ -208,7 +208,7 @@ pub fn zone_status(
     let schedule = zone
         .and_then(|z| z.schedule_set_id)
         .and_then(|id| sets.get(id))
-        .unwrap_or_else(|| sets.active());
+        .unwrap_or_else(|| sets.for_day(time.weekday()));
     let mut entry = schedule.get_active_entry(time);
 
     // Start the next On period early when it's cold or windy (weather adjust zones only)
@@ -1614,6 +1614,70 @@ mod tests {
             tick(&mut entity, &scheduled, &mut last).await;
 
             assert_eq!(sent(&entity), vec![expected], "{scheduled:?}");
+        }
+    }
+
+    #[test]
+    fn test_scheduled_follows_the_days_set() {
+        use crate::schedule::{Schedule, ScheduleEntry, TimePeriod};
+        use crate::zones::areas::Area;
+        use chrono::TimeZone;
+
+        // Active set: Off all day. "Weekend": On 21.0 all day, assigned to Sat and Sun.
+        // "Study": On 18.0 all day, followed by the study zone.
+        let mut sets = ScheduleSets::from_schedule(Schedule::new("Weekday"));
+        let all_day = |target| {
+            ScheduleEntry::new("All day", TimePeriod::new(0, 0, 0, 0), HeatingState::On)
+                .with_target(target)
+        };
+        let weekend = sets.create("Weekend", None).unwrap().id;
+        sets.get_mut(weekend).unwrap().add_entry(all_day(21.0));
+        let own = sets.create("Study", None).unwrap().id;
+        sets.get_mut(own).unwrap().add_entry(all_day(18.0));
+
+        let managed = vec!["climate.study".to_string(), "climate.loft".to_string()];
+        let mut zones = Zones::default();
+        let study_area = Area {
+            id: "study".to_string(),
+            name: "Study".to_string(),
+            entities: vec!["climate.study".to_string()],
+        };
+        zones.reconcile(Some(vec![study_area]), &managed);
+        let study = zones.zone_for("climate.study").unwrap().id;
+        zones.set_schedule_set(study, Some(own)).unwrap();
+
+        let saturday = Local.with_ymd_and_hms(2026, 11, 14, 12, 0, 0).unwrap();
+        let monday = Local.with_ymd_and_hms(2026, 11, 16, 12, 0, 0).unwrap();
+        assert_eq!(saturday.weekday(), chrono::Weekday::Sat);
+
+        // No assignments: the active set every day
+        assert_eq!(
+            scheduled_for("climate.loft", &sets, &zones, None, &saturday),
+            scheduled(HeatingState::Off, None)
+        );
+
+        sets.assign_days(weekend, &[chrono::Weekday::Sat, chrono::Weekday::Sun])
+            .unwrap();
+        assert_eq!(
+            scheduled_for("climate.loft", &sets, &zones, None, &saturday),
+            scheduled(HeatingState::On, Some(21.0))
+        );
+        assert_eq!(
+            scheduled_for("climate.unknown", &sets, &zones, None, &saturday),
+            scheduled(HeatingState::On, Some(21.0)),
+            "an entity in no zone follows the day's set too"
+        );
+        // Monday has no set assigned: back to the active set
+        assert_eq!(
+            scheduled_for("climate.loft", &sets, &zones, None, &monday),
+            scheduled(HeatingState::Off, None)
+        );
+        // A zone following its own set ignores day assignments
+        for day in [saturday, monday] {
+            assert_eq!(
+                scheduled_for("climate.study", &sets, &zones, None, &day),
+                scheduled(HeatingState::On, Some(18.0))
+            );
         }
     }
 

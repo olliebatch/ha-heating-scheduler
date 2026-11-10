@@ -11,7 +11,7 @@ use crate::smart::{
 };
 use crate::weather::{Weather, WeatherStatus};
 use crate::zones::Zone;
-use chrono::{DateTime, Local, NaiveTime, TimeDelta, Timelike};
+use chrono::{DateTime, Datelike, Local, NaiveTime, TimeDelta, Timelike};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
 use std::io::Write;
@@ -40,7 +40,7 @@ pub fn zone_tick(
     let schedule = zone
         .schedule_set_id
         .and_then(|id| sets.get(id))
-        .unwrap_or_else(|| sets.active());
+        .unwrap_or_else(|| sets.for_day(now.weekday()));
     let (comfort, inside) = comfort_time(schedule, now.time(), sets.default_target_temp)?;
     let decision = decide(&Inputs {
         now,

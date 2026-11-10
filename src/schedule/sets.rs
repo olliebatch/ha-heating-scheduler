@@ -1,12 +1,24 @@
 use super::{HeatingState, Schedule};
-use serde::{Deserialize, Serialize};
+use chrono::Weekday;
+use serde::{Deserialize, Serialize, Serializer};
+use std::collections::HashMap;
 use uuid::Uuid;
 
-/// Named schedules, one of which is active and drives the heating.
+/// Named schedules. On a day of the week assigned to a set (`day_sets`), that set drives the
+/// heating; on any other day the active set does.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScheduleSets {
     pub active_id: Uuid,
     pub sets: Vec<Schedule>,
+    /// The set assigned to each day of the week ("Mon" to "Sun"); a day can have at most one.
+    /// Days not listed use the active set. Left out of the JSON when no day is assigned, so a
+    /// file saved before day assignments existed loads and saves unchanged.
+    #[serde(
+        default,
+        serialize_with = "days_in_order",
+        skip_serializing_if = "HashMap::is_empty"
+    )]
+    pub day_sets: HashMap<Weekday, Uuid>,
     /// Comfort temperature (°C) given to On entries saved before targets existed, and used by
     /// boost when no On entry is active
     #[serde(default = "default_target_temp")]
@@ -35,6 +47,7 @@ impl ScheduleSets {
         let mut sets = ScheduleSets {
             active_id: schedule.id,
             sets: vec![schedule],
+            day_sets: HashMap::new(),
             default_target_temp: DEFAULT_TARGET_TEMP,
         };
         sets.normalise();
@@ -44,6 +57,53 @@ impl ScheduleSets {
     pub fn active(&self) -> &Schedule {
         self.get(self.active_id)
             .expect("active_id always names a set")
+    }
+
+    /// The set that drives the heating on `day`: the set assigned to it, or the active set
+    pub fn for_day(&self, day: Weekday) -> &Schedule {
+        self.day_sets
+            .get(&day)
+            .and_then(|id| self.get(*id))
+            .unwrap_or_else(|| self.active())
+    }
+
+    /// The days assigned to a set, Monday first
+    pub fn days_of(&self, id: Uuid) -> Vec<Weekday> {
+        ALL_DAYS
+            .into_iter()
+            .filter(|day| self.day_sets.get(day) == Some(&id))
+            .collect()
+    }
+
+    /// Assign a set to exactly `days`: days it had that aren't listed go back to the active set.
+    /// A day already assigned to another set is refused, and nothing changes.
+    pub fn assign_days(&mut self, id: Uuid, days: &[Weekday]) -> Result<(), SetError> {
+        if self.get(id).is_none() {
+            return Err(SetError::NotFound);
+        }
+        let taken: Vec<String> = ALL_DAYS
+            .into_iter()
+            .filter(|day| days.contains(day))
+            .filter_map(|day| {
+                let other = *self.day_sets.get(&day)?;
+                if other == id {
+                    return None;
+                }
+                let name = self.get(other).map(|s| s.name.as_str()).unwrap_or("?");
+                Some(format!("{} (\"{}\")", day, name))
+            })
+            .collect();
+        if !taken.is_empty() {
+            return Err(SetError::Conflict(format!(
+                "Already assigned to another set: {}; unassign them there first",
+                taken.join(", ")
+            )));
+        }
+        self.day_sets.retain(|_, set| *set != id);
+        for day in days {
+            self.day_sets.insert(*day, id);
+        }
+        Ok(())
     }
 
     pub fn active_mut(&mut self) -> &mut Schedule {
@@ -85,7 +145,7 @@ impl ScheduleSets {
         Ok(schedule)
     }
 
-    /// Delete a set. The active set and the last set can't be deleted.
+    /// Delete a set. The active set, the last set and a set assigned to days can't be deleted.
     pub fn delete(&mut self, id: Uuid) -> Result<(), SetError> {
         if self.get(id).is_none() {
             return Err(SetError::NotFound);
@@ -94,6 +154,14 @@ impl ScheduleSets {
             return Err(SetError::Conflict(
                 "Cannot delete the active schedule set".to_string(),
             ));
+        }
+        let days = self.days_of(id);
+        if !days.is_empty() {
+            let days: Vec<String> = days.iter().map(|d| d.to_string()).collect();
+            return Err(SetError::Conflict(format!(
+                "Schedule set is assigned to {}; unassign its days first",
+                days.join(", ")
+            )));
         }
         if self.sets.len() == 1 {
             return Err(SetError::Conflict(
@@ -114,7 +182,8 @@ impl ScheduleSets {
 
     /// Repair sets loaded from disk: give On entries without a target the default target (and
     /// drop targets on Off entries), normalise each schedule, give duplicate set ids a new id,
-    /// and point `active_id` at the first set if it names none.
+    /// point `active_id` at the first set if it names none, and drop day assignments to sets
+    /// that aren't there.
     pub fn normalise(&mut self) {
         if self.sets.is_empty() {
             self.sets.push(Schedule::new("Default Heating Schedule"));
@@ -135,7 +204,31 @@ impl ScheduleSets {
         if self.get(self.active_id).is_none() {
             self.active_id = self.sets[0].id;
         }
+        let ids: std::collections::HashSet<Uuid> = self.sets.iter().map(|s| s.id).collect();
+        self.day_sets.retain(|_, id| ids.contains(id));
     }
+}
+
+pub const ALL_DAYS: [Weekday; 7] = [
+    Weekday::Mon,
+    Weekday::Tue,
+    Weekday::Wed,
+    Weekday::Thu,
+    Weekday::Fri,
+    Weekday::Sat,
+    Weekday::Sun,
+];
+
+/// Save `day_sets` Monday first, so the file doesn't reorder itself on every save
+fn days_in_order<S: Serializer>(
+    day_sets: &HashMap<Weekday, Uuid>,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    serializer.collect_map(
+        ALL_DAYS
+            .iter()
+            .filter_map(|day| day_sets.get(day).map(|id| (day, id))),
+    )
 }
 
 fn valid_name(name: &str) -> Result<String, SetError> {
@@ -252,5 +345,115 @@ mod tests {
 
         assert_ne!(sets.sets[0].id, sets.sets[1].id);
         assert_eq!(sets.active_id, sets.sets[0].id);
+    }
+
+    use chrono::Weekday::{Fri, Mon, Sat, Sun, Thu, Tue, Wed};
+
+    /// "Work week" (active), "Weekend" and "Holiday"
+    fn three_sets() -> (ScheduleSets, Uuid, Uuid) {
+        let mut sets = ScheduleSets::from_schedule(Schedule::new("Work week"));
+        let weekend = sets.create("Weekend", None).unwrap().id;
+        let holiday = sets.create("Holiday", None).unwrap().id;
+        (sets, weekend, holiday)
+    }
+
+    #[test]
+    fn test_for_day_uses_assigned_set_and_falls_back_to_active() {
+        let (mut sets, weekend, _) = three_sets();
+        let active = sets.active_id;
+
+        // No assignments: the active set every day, as before day assignments
+        for day in ALL_DAYS {
+            assert_eq!(sets.for_day(day).id, active);
+        }
+
+        sets.assign_days(weekend, &[Sat, Sun]).unwrap();
+
+        assert_eq!(sets.for_day(Sat).id, weekend);
+        assert_eq!(sets.for_day(Sun).id, weekend);
+        for day in [Mon, Tue, Wed, Thu, Fri] {
+            assert_eq!(sets.for_day(day).id, active, "{day} falls back");
+        }
+        assert_eq!(sets.days_of(weekend), vec![Sat, Sun]);
+    }
+
+    #[test]
+    fn test_assign_days_replaces_the_sets_days() {
+        let (mut sets, weekend, _) = three_sets();
+        sets.assign_days(weekend, &[Fri, Sat, Sun]).unwrap();
+
+        sets.assign_days(weekend, &[Sun, Sat]).unwrap();
+        assert_eq!(sets.days_of(weekend), vec![Sat, Sun]);
+        assert_eq!(sets.for_day(Fri).id, sets.active_id);
+
+        sets.assign_days(weekend, &[]).unwrap();
+        assert!(sets.day_sets.is_empty());
+    }
+
+    #[test]
+    fn test_overlapping_assignment_is_rejected_and_changes_nothing() {
+        let (mut sets, weekend, holiday) = three_sets();
+        sets.assign_days(weekend, &[Sat, Sun]).unwrap();
+
+        let err = sets.assign_days(holiday, &[Fri, Sat]).unwrap_err();
+
+        assert_eq!(
+            err,
+            SetError::Conflict(
+                "Already assigned to another set: Sat (\"Weekend\"); unassign them there first"
+                    .to_string()
+            )
+        );
+        assert_eq!(sets.days_of(weekend), vec![Sat, Sun]);
+        assert!(sets.days_of(holiday).is_empty(), "Fri not assigned either");
+        assert_eq!(
+            sets.assign_days(Uuid::new_v4(), &[Mon]),
+            Err(SetError::NotFound)
+        );
+    }
+
+    #[test]
+    fn test_delete_refuses_a_set_with_days() {
+        let (mut sets, weekend, _) = three_sets();
+        sets.assign_days(weekend, &[Sat, Sun]).unwrap();
+
+        assert_eq!(
+            sets.delete(weekend),
+            Err(SetError::Conflict(
+                "Schedule set is assigned to Sat, Sun; unassign its days first".to_string()
+            ))
+        );
+        sets.assign_days(weekend, &[]).unwrap();
+        sets.delete(weekend).unwrap();
+    }
+
+    #[test]
+    fn test_normalise_drops_days_of_missing_sets() {
+        let (mut sets, weekend, _) = three_sets();
+        sets.day_sets.insert(Mon, Uuid::new_v4());
+        sets.day_sets.insert(Sat, weekend);
+
+        sets.normalise();
+
+        assert_eq!(sets.day_sets.len(), 1);
+        assert_eq!(sets.for_day(Mon).id, sets.active_id);
+    }
+
+    #[test]
+    fn test_day_sets_json() {
+        let (mut sets, weekend, holiday) = three_sets();
+        // None assigned: the field is left out, as in files saved before it existed
+        let json = serde_json::to_value(&sets).unwrap();
+        assert!(json.get("day_sets").is_none());
+
+        sets.assign_days(holiday, &[Wed]).unwrap();
+        sets.assign_days(weekend, &[Sun, Sat]).unwrap();
+        let text = serde_json::to_string(&sets).unwrap();
+        let expected =
+            format!(r#""day_sets":{{"Wed":"{holiday}","Sat":"{weekend}","Sun":"{weekend}"}}"#);
+        assert!(text.contains(&expected), "{text}");
+
+        let loaded: ScheduleSets = serde_json::from_str(&text).unwrap();
+        assert_eq!(loaded.day_sets, sets.day_sets);
     }
 }
