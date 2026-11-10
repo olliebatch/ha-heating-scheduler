@@ -45,7 +45,8 @@ pub struct AppState<T: ClimateEntity + Clone> {
     pub shadow: crate::ShadowState,
 }
 
-pub async fn start_server(app_state: AppState<ClimateEntityWrapper>, port: u16) {
+/// Every route the API serves, with its state and CORS layer
+pub fn router(app_state: AppState<ClimateEntityWrapper>) -> Router {
     let cors_layer = CorsLayer::permissive();
     let app = Router::new()
         .route("/schedule", get(get_schedule::<ClimateEntityWrapper>))
@@ -129,7 +130,11 @@ pub async fn start_server(app_state: AppState<ClimateEntityWrapper>, port: u16) 
         post(weather::set_mock_weather::<ClimateEntityWrapper>),
     );
 
-    let app = app.layer(cors_layer).with_state(app_state);
+    app.layer(cors_layer).with_state(app_state)
+}
+
+pub async fn start_server(app_state: AppState<ClimateEntityWrapper>, port: u16) {
+    let app = router(app_state);
 
     // Listen on every interface
     let listener = tokio::net::TcpListener::bind(("0.0.0.0", port))
