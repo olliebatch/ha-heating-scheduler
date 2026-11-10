@@ -461,6 +461,8 @@ pub async fn apply_schedule_to_entity<T: ClimateEntity>(
     still_managed: &(dyn Fn() -> bool + Sync),
 ) {
     let now = Local::now();
+    // Its last fetch failed, so this tick's room reading (built from last tick's reads) lacks it
+    let recovering = !memory.read;
     memory.read = false;
     if let Err(e) = entity.fetch_and_update_state(api_client).await {
         eprintln!(
@@ -528,7 +530,10 @@ pub async fn apply_schedule_to_entity<T: ClimateEntity>(
     // Never for the frost floor, which heats to exactly its target, nor while boosted at max
     let driving = match (target, cached.max_temp) {
         (Some(target), Some(_)) if !frost && boost_max.is_none() => {
-            drive(target, scheduled.room_c, memory.driving)
+            // The tick a failed TRV comes back has no reading for it yet: keep driving for that
+            // one tick rather than sending the target and then `max_temp` again
+            memory.driving && recovering && scheduled.room_c.is_none()
+                || drive(target, scheduled.room_c, memory.driving)
         }
         _ => false,
     };
@@ -2910,6 +2915,51 @@ mod tests {
         let mut entity = trv(Some(28.0));
         drive_tick(&mut entity, &on_in_room(20.0, None), &mut None, &mut memory).await;
         assert!(memory.read);
+    }
+
+    #[tokio::test]
+    async fn test_a_driven_trv_coming_back_from_a_failed_fetch_stays_at_max_temp() {
+        let mut entity = trv(Some(28.0));
+        let (mut last, mut memory) = (None, EntityMemory::default());
+        drive_tick(
+            &mut entity,
+            &on_in_room(20.0, Some(18.0)),
+            &mut last,
+            &mut memory,
+        )
+        .await;
+        assert_eq!(sent(&entity), vec![28.0]);
+
+        // Its fetch fails: nothing sent, and its memory is kept
+        let unreachable = ApiClient::new(
+            reqwest::Url::parse("http://127.0.0.1:1").unwrap(),
+            "fake_token".to_string(),
+            None,
+        );
+        let mut failing = crate::climate::DefaultClimate::new("climate.test".to_string());
+        apply_schedule_to_entity(
+            &mut failing,
+            &on_in_room(20.0, Some(18.0)),
+            20.0,
+            &unreachable,
+            &mut last,
+            &mut memory,
+            &|| true,
+        )
+        .await;
+        assert!(!memory.read);
+        assert!(memory.driving);
+
+        // It comes back, with no room reading for the tick: still driven, nothing resent
+        drive_tick(&mut entity, &on_in_room(20.0, None), &mut last, &mut memory).await;
+        assert_eq!(sent(&entity), vec![28.0], "no extra set_temperature");
+        assert!(memory.driving);
+        assert_eq!(last, Some(28.0));
+
+        // The next tick has no reading either: driving doesn't hold on without one
+        drive_tick(&mut entity, &on_in_room(20.0, None), &mut last, &mut memory).await;
+        assert!(!memory.driving);
+        assert_eq!(sent(&entity), vec![28.0, 20.0]);
     }
 
     #[tokio::test]
