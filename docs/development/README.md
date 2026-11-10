@@ -12,7 +12,8 @@ add to it in the same change when you learn something the next contributor would
 - `src/zones/` (`room.rs` for a zone's mode and room settings) and `src/server/zones.rs` (the zone
   API: `GET /zones` builds each status, `PATCH /zones/{id}` takes the room).
 - `src/server/handlers.rs`: entities add and remove; `src/main.rs` wires the shared state.
-- `tests/dry_run.rs`: the fake HA. `README.md` documents every API field; update it with the code.
+- `tests/dry_run.rs`: the fake HA. `README.md` documents every API field and every status each route can return (including
+  axum's 422 when a JSON body doesn't parse); update it with the code.
 
 ## Testing and checking
 - `cargo fmt --check && cargo test` is the check; `cargo build --all-targets` builds the tests too.
@@ -58,17 +59,35 @@ add to it in the same change when you learn something the next contributor would
 
 ## Schedule sets and days (src/schedule/sets.rs)
 - Which schedule an entity follows: its zone's `schedule_set_id` if set, else `ScheduleSets::for_day`
-  (the set assigned to today's weekday in `day_sets`, else the active set). `zone_status` and
-  `shadow::zone_tick` both resolve it this way; a new caller should too, not `sets.active()`.
-  `active()` alone is right only for the legacy `/schedule` routes, which edit the active set.
+  (the set assigned to today's weekday in `day_sets`, else the active set). Only two places
+  resolve it: `scheduler::zone_status` (the loop, `GET /zones`, the zone preview) and
+  `shadow::zone_tick` (Smart and Shadow). Any new heating decision must resolve it the same way,
+  with `for_day`, not `sets.active()`, and needs its own test: swapping either existing line back
+  to `active()` fails only that line's test (`test_scheduled_follows_the_days_set`,
+  `test_zone_tick_follows_the_days_set`).
+- `active()` alone is right only for the legacy `/schedule` routes, which edit the active set.
 - `day_sets` maps each weekday to at most one set, so overlap can't be stored; `assign_days`
-  refuses a day held by another set. Deleting a set with days is refused, like one a zone follows.
-- `day_sets` is skipped when empty, so files from before it existed aren't rewritten by
-  `load_or_migrate` (which saves whenever the loaded JSON differs from what's on disk).
-- The set is picked by the date of `now`. A smart or weather early start, or a period crossing
-  midnight, looks ahead within today's set; at midnight the next day's set takes over.
+  checks every day before changing anything and refuses a day held by another set. Deleting a
+  set with days is refused, like one a zone follows.
+- Days are `chrono::Weekday`, saved as "Mon".."Sun"; requests also take full names and any case.
+
+### Midnight
+- The set is picked by the date of `now`; at 00:00 the next day's set takes over, so a period
+  crossing midnight switches sets part way through.
+- Early starts (weather and Smart) look ahead only within today's set: an early start that
+  would begin before midnight for a period in tomorrow's (different) set doesn't happen.
+- A weather late finish (`continue_late_finish`) begun for a period ending at 00:00 stops at
+  midnight if the next day's set has no On period ending at 00:00. Consistent with the rule
+  above, but a known edge if heating is reported stopping at midnight.
 
 ## Gotchas
+- A new optional field in a `data/*.json` file needs `#[serde(default)]` and
+  `skip_serializing_if` for its empty value. `load_or_migrate` saves whenever the loaded JSON
+  differs from the file, so without the skip every existing install's file is rewritten on its
+  next start (`day_sets` does this). Check by restarting on the same data: the file's sha and
+  mtime should not change.
+- Tests that depend on the date pin it with `Local.with_ymd_and_hms` (2026-11-14 is a Saturday,
+  2026-11-16 a Monday) and assert the weekday, rather than using `Local::now()`.
 - `smart::decide` has early returns (no room temperature, no weather) for falling back to the
   schedule. A fallback that ignores the "begun" check cancels a warm-up under way: both of
   these keep a begun Heat (and its `Lead` reason, which is what marks it begun). Keep a begun
