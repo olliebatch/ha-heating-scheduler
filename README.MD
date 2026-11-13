@@ -239,6 +239,25 @@ stays off Debug builds' mock TRVs warm while On and cool while Off, so decisions
 - `DELETE /entities` - Remove entity: `{"entity_id": "climate.living_room"}`. It stops being controlled and is left as it is
 - `GET /entities/available` - Every climate entity Home Assistant has (read-only, also in dry run): its name, state, Area, whether it's managed, and the zone it's in or would land in. Managed entities Home Assistant no longer lists are included without a name or state. 502 if Home Assistant can't be reached
 
+### Next heat sensors (Home Assistant)
+Each tick (every 15 seconds) the scheduler posts one sensor per zone to Home Assistant's REST states API
+(`POST /api/states/sensor.<zone>_next_heat`), so a dashboard card can show "19:00 → 22°". `<zone>` is the zone's name
+in lower case with underscores (`Master Bedroom` → `sensor.master_bedroom_next_heat`).
+- State: the start of the zone's next On period, as a timestamp (`2026-11-11T19:00:00+00:00`; the sensor's
+  `device_class` is `timestamp`, so a card shows it as a time). A period already under way doesn't count, only the next
+  to start. Days assigned their own schedule set count: after the last period today, it's the first one on the next
+  day that has one, from that day's set. `unknown` when no day in the coming week has an On period.
+- Attributes: `target_temperature` (the scheduled target, before weather adjustment), `period` (`"19:00-22:00"`),
+  `schedule_set` and `schedule_set_id` (the set that period is from, which can differ from the active set), `zone`,
+  `mode` (`schedule`, `shadow` or `smart`) and `friendly_name`. With state `unknown` there is no target, period or set.
+- Schedule, Shadow and Smart zones all report their schedule's On periods; Smart's comfort times are the same periods.
+- Home Assistant doesn't save states posted this way, so the sensors disappear when it restarts. They come back on the
+  scheduler's next tick, within 15 seconds, which is why they're posted every tick. Nothing needs configuring.
+- A post that fails (Home Assistant down or refusing) is logged and tried again next tick. It never affects the heating:
+  the sensors are posted last in the tick, after every TRV has been dealt with.
+- Dry run does **not** post them: a sensor is a change to Home Assistant, so `GET /dry_run` lists it as a would-be
+  call (`would call /api/states/sensor.lounge_next_heat with ...`) and nothing is sent.
+
 ### Dry run
 - `GET /dry_run` - `{"dry_run": true|false, "calls": [...]}`: the calls a dry run would have made, newest first. Each
   has `summary`, `context` (why), `method`, `endpoint`, `body`, `at`, `last_at` and `repeats`
@@ -284,7 +303,8 @@ Dry run reads your Home Assistant (areas, climates, weather, the forecast, `sun.
 exactly what it would do, without changing anything. Use it to check zones, weather adjustment and smart decisions on
 your own house before trusting them.
 
-Every request that would change Home Assistant (`/api/services/...`) is cut at the HA client: it's recorded instead
+Every request that would change Home Assistant (`/api/services/...`, and the next-heat sensors posted to
+`/api/states/sensor...`) is cut at the HA client: it's recorded instead
 of sent, and the scheduler carries on as if HA had accepted it. Only reads reach HA:
 - `GET /api/states/...`: climates, the weather entity, `sun.sun` and room sensors;
 - `POST /api/template`, which renders a template (areas);
