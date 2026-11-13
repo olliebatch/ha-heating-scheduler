@@ -31,6 +31,8 @@ add to it in the same change when you learn something the next contributor would
   table isn't covered. It checks each route isn't a router 404/405 (a handler's own "not found"
   has a body, so it passes), that other methods on the path give 405, and that unknown paths give 404.
 - An unreachable `ApiClient` (`http://127.0.0.1:1`) with a `DefaultClimate` makes a failed fetch.
+  Loop it with good ticks to test a TRV that keeps dropping out: any hold that depends on "the last
+  fetch failed" re-arms on every failure, so check what stops it (see the recovery hold above).
 - Handler tests call the handler functions directly (`test_state()` in `src/server/handlers.rs`),
   so routes and request-body parsing in `start_server` are untested. Known gap: extract the router
   into `fn router(state)` so routes can be tested with tower's `oneshot`.
@@ -54,8 +56,11 @@ add to it in the same change when you learn something the next contributor would
 - `run_scheduler` has no test harness. Keep logic out of it, in functions you can test
   (`smart_reading`, `smart_waiting`), and check anything left inline against a fake HA.
 - Decisions are made before the tick's fetch, so the tick on which a TRV comes back still decides
-  without it (and that decision is sent); driving also pauses for that tick. Its reading counts
-  from the next tick.
+  without it (and that decision is sent). Its reading counts from the next tick. A TRV that was
+  driving keeps driving on that tick if there's no room reading for it (`recovering` in
+  `apply_schedule_to_entity`), so it isn't sent the target and then `max_temp` again; with no
+  reading for it since, driving stops: the hold happens once per reading, so a TRV that keeps
+  dropping out doesn't stay driven.
 
 ## Schedule sets and days (src/schedule/sets.rs)
 - Which schedule an entity follows: its zone's `schedule_set_id` if set, else `ScheduleSets::for_day`
