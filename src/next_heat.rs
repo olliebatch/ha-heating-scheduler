@@ -10,6 +10,7 @@ use crate::api_client::ApiClient;
 use crate::schedule::HeatingState;
 use crate::schedule::sets::ScheduleSets;
 use crate::zones::{Zone, Zones};
+use crate::{ScheduleState, ZonesState};
 use chrono::{DateTime, Datelike, Days, Local};
 use serde_json::{Value, json};
 
@@ -26,8 +27,9 @@ pub struct NextHeat {
     pub attributes: Value,
 }
 
-/// `sensor.<zone>_next_heat`, the zone's name as Home Assistant spells entity ids: lower case,
-/// letters and digits with single underscores between words
+/// `sensor.<zone>_next_heat`: the zone's name in lower case, keeping ASCII letters and digits with
+/// single underscores between words. Other characters are dropped, so a name like "Küche" gives
+/// `k_che` and one with none falls back to the zone id.
 pub fn entity_id(zone: &Zone) -> String {
     let mut slug = String::new();
     for c in zone.name.chars().flat_map(char::to_lowercase) {
@@ -112,6 +114,22 @@ pub fn next_heat(zone: &Zone, sets: &ScheduleSets, now: DateTime<Local>) -> Next
         state,
         attributes,
     }
+}
+
+/// Work out every zone's sensor from the shared state and post them. The locks are released
+/// before anything is sent.
+pub async fn publish_for(
+    api_client: &ApiClient,
+    zones: &ZonesState,
+    sets: &ScheduleState,
+    now: DateTime<Local>,
+) {
+    let sensors = {
+        let sets = sets.read().unwrap();
+        let zones = zones.read().unwrap();
+        next_heats(&zones, &sets, now)
+    };
+    publish(api_client, &sensors).await;
 }
 
 /// Post each sensor. A failed post is logged and skipped, to be retried next tick; this never
