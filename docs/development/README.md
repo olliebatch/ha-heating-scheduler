@@ -64,7 +64,8 @@ add to it in the same change when you learn something the next contributor would
 
 ## Next heat sensors (src/next_heat.rs)
 - `next_heats` builds one `NextHeat` per zone (`sensor.<slug of name>_next_heat`; a name with no letters or digits
-  falls back to the zone id). `publish` POSTs each to `/api/states/<entity_id>` as `{"state", "attributes"}`.
+  falls back to the zone id). Slugging is ASCII-only (`Küche` gives `k_che`, unlike HA's own `kuche`), and
+  zones whose names slug the same share one sensor (the last post wins). `publish` POSTs each to `/api/states/<entity_id>` as `{"state", "attributes"}`.
   `run_scheduler` calls `publish_for` (both) at the very end of every tick, after all heating, so a slow or failing HA can't delay it.
 - "Next" = the first On period starting after `now` in the zone's set, looking up to 7 days ahead. The set per day
   is the zone's `schedule_set_id` if set, else `ScheduleSets::for_day` (so day assignments apply, per the rule in the
