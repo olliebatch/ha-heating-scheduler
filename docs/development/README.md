@@ -33,6 +33,10 @@ add to it in the same change when you learn something the next contributor would
 - An unreachable `ApiClient` (`http://127.0.0.1:1`) with a `DefaultClimate` makes a failed fetch.
   Loop it with good ticks to test a TRV that keeps dropping out: any hold that depends on "the last
   fetch failed" re-arms on every failure, so check what stops it (see the recovery hold above).
+- Every `ApiClient` request has a timeout (`api_client::REQUEST_TIMEOUT`, 10 s, covering the whole answer), set once
+  where the client is built; a timed-out call is an ordinary `Err`, so callers handle it like any failed call.
+  `tests/ha_timeout.rs` runs a server that accepts connections and never answers, with `ApiClient::with_timeout`
+  and a short timeout so the test is fast. It needs no fixed port.
 - Handler tests call the handler functions directly (`test_state()` in `src/server/handlers.rs`),
   so routes and request-body parsing in `start_server` are untested. Known gap: extract the router
   into `fn router(state)` so routes can be tested with tower's `oneshot`.

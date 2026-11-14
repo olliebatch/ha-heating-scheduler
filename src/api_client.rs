@@ -5,6 +5,12 @@ use anyhow::anyhow;
 use reqwest::{Client, Method, Response, Url};
 use serde_json::Value;
 use std::sync::Arc;
+use std::time::Duration;
+
+/// How long any one request to Home Assistant may take, from sending it to reading the whole
+/// answer. Without it a Home Assistant that accepts a connection and never answers would hang the
+/// scheduler tick forever.
+pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub struct ApiClient {
     client: Client,
@@ -20,8 +26,22 @@ impl ApiClient {
     /// Required, so no client can be live just because someone forgot to pass it.
     #[must_use]
     pub fn new(base_url: Url, token: String, dry_run: Option<Arc<DryRun>>) -> Self {
+        Self::with_timeout(base_url, token, dry_run, REQUEST_TIMEOUT)
+    }
+
+    /// As `new`, with its own request timeout (a test uses a short one)
+    #[must_use]
+    pub fn with_timeout(
+        base_url: Url,
+        token: String,
+        dry_run: Option<Arc<DryRun>>,
+        timeout: Duration,
+    ) -> Self {
         ApiClient {
-            client: Client::new(),
+            client: Client::builder()
+                .timeout(timeout)
+                .build()
+                .expect("Failed to build the HTTP client"),
             base_url,
             token,
             dry_run,
