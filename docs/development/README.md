@@ -41,6 +41,10 @@ add to it in the same change when you learn something the next contributor would
 - Every 15 s it copies the entities, reads the weather, forecast and room sensors, works out each
   entity's `Scheduled` (zone status, or the smart decision for smart zones), then applies each one
   outside the locks.
+- Lock order: `schedule` (the sets) before `zones`, everywhere (the tick, `next_heat::publish_for`,
+  `GET /zones`, preview, set delete, `assign_zone_days`); nothing takes zones then sets.
+  `climate_entities` is read and dropped on its own (`managed_entity_ids`), never held while
+  taking another lock. Don't hold a guard across `.await`.
 - What's kept per entity between ticks: `LastSentTargets` (the last target sent) and
   `EntityMemories` (put-back time, driving, the room reading, whether it was read). Both are
   shared with the API. `add_entities` and `remove_entity` (src/server/handlers.rs) must forget an
@@ -94,6 +98,10 @@ add to it in the same change when you learn something the next contributor would
   as for one a zone is pinned to (`Zones::using_set`). The zone's map is saved with the zone in
   zones.json, left out when empty and written Monday first (`sets::days_in_order`), so it is
   also absent from `GET /zones` for a zone with no days: clients must treat absent as none.
+- For an "unchanged when the new thing is unused" criterion, move the duplicated logic into one
+  function and test it against the old expression, kept inline in the test, over every input
+  combination (`test_for_zone_without_own_days_is_unchanged`: every day × pin, including a
+  deleted set). Cheap, and it fails on any drift.
 - Adding a level to the order: change `for_zone` only, then add a step to both path tests. A
   new way for a zone to reference a set also needs a delete refusal next to `using_set` and
   `mapping_set` in `delete_schedule_set`, or deleting the set silently drops that level.
@@ -116,10 +124,10 @@ add to it in the same change when you learn something the next contributor would
 - A new optional field in a `data/*.json` file needs `#[serde(default)]` and
   `skip_serializing_if` for its empty value. `load_or_migrate` saves whenever the loaded JSON
   differs from the file, so without the skip every existing install's file is rewritten on its
-  next start (`day_sets` does this). Check by restarting on the same data: the file's sha and
-  mtime should not change. Exception: `zones.json` is saved on every start anyway (`main` saves
-  after `reconcile`), so its mtime always changes; check its contents, and prove the skip with a
-  serde round-trip test (`test_day_sets_json_is_written_only_when_set`) instead.
+  next start (`day_sets` does this). Check by restarting on the same data and comparing the
+  file's contents (`shasum`), not its mtime: `zones.json` is saved on every start anyway (`main`
+  saves right after `reconcile`), so its mtime always changes. Also prove the skip with a serde
+  round-trip test (`test_day_sets_json_is_written_only_when_set`).
 - Tests that depend on the date pin it with `Local.with_ymd_and_hms` (2026-11-14 is a Saturday,
   2026-11-16 a Monday) and assert the weekday, rather than using `Local::now()`.
 - `smart::decide` has early returns (no room temperature, no weather) for falling back to the
