@@ -1105,6 +1105,9 @@ pub async fn run_scheduler<T: ClimateEntity + Clone>(state: SchedulerState<T>) {
         if let Ok(mut climates) = state.climate_entities.write() {
             merge_tick_results(&mut climates, &entities_clone, &boosts_at_start);
         }
+        // Last, so it can't delay the heating: each zone's next heat for HA's dashboards, posted
+        // every tick because HA forgets them on a restart. Failures are logged.
+        crate::next_heat::publish_for(&state.api_client, &state.zones, &state.schedule, now).await;
         first_tick = false;
     }
 }

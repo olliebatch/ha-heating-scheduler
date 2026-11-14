@@ -62,6 +62,23 @@ add to it in the same change when you learn something the next contributor would
   reading for it since, driving stops: the hold happens once per reading, so a TRV that keeps
   dropping out doesn't stay driven.
 
+## Next heat sensors (src/next_heat.rs)
+- `next_heats` builds one `NextHeat` per zone (`sensor.<slug of name>_next_heat`; a name with no letters or digits
+  falls back to the zone id). Slugging is ASCII-only (`Küche` gives `k_che`, unlike HA's own `kuche`), and
+  zones whose names slug the same share one sensor (the last post wins). `publish` POSTs each to `/api/states/<entity_id>` as `{"state", "attributes"}`.
+  `run_scheduler` calls `publish_for` (both) at the very end of every tick, after all heating, so a slow or failing HA can't delay it.
+- "Next" = the first On period starting after `now` in the zone's set, looking up to 7 days ahead. The set per day
+  is the zone's `schedule_set_id` if set, else `ScheduleSets::for_day` (so day assignments apply, per the rule in the
+  section below). The target is the entry's own (or `default_target_temp`), not weather-adjusted: the
+  status API has no "next" field (it only describes now), so this is its own computation.
+- States posted this way aren't persisted by HA: a restart drops them, hence re-posting every tick. There is no
+  "have I posted" memory to keep; the post is idempotent.
+- Errors are logged (`eprintln!`) and swallowed per sensor; `publish` returns `()`.
+- Dry run: `is_read` doesn't list POST `/api/states/...`, so `ApiClient::send` records it instead of sending. Proved in
+  `tests/next_heat.rs` (`test_a_dry_run_posts_nothing`). Tests: unit tests in the module for entity id, state and
+  attributes (incl. a day's set differing from the active set), the zone's own set, shadow/smart and no-upcoming-heat;
+  `tests/next_heat.rs` for the posts, dry run and failures against a fake HA. The loop itself has no test.
+
 ## Schedule sets and days (src/schedule/sets.rs)
 - Which schedule an entity follows: its zone's `schedule_set_id` if set, else `ScheduleSets::for_day`
   (the set assigned to today's weekday in `day_sets`, else the active set). Only two places
