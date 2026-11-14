@@ -1230,10 +1230,11 @@ mod tests {
 
         // Once the zone's mapping is removed, it can be deleted
         state.zones.write().unwrap().clear_days(whole).unwrap();
-        delete_schedule_set(State(state.clone()), Path(holiday.id))
+        let sets = delete_schedule_set(State(state.clone()), Path(holiday.id))
             .await
-            .unwrap();
-        assert!(state.schedule.read().unwrap().get(holiday.id).is_none());
+            .unwrap()
+            .0;
+        assert!(sets.get(holiday.id).is_none());
     }
 
     #[tokio::test]
