@@ -35,6 +35,8 @@ const ROUTES: &[(&str, &str)] = &[
     ("POST", "/zones/{id}/preview"),
     ("PATCH", "/zones/{id}"),
     ("DELETE", "/zones/{id}"),
+    ("PUT", "/zones/{id}/schedule_sets/{set_id}/days"),
+    ("DELETE", "/zones/{id}/days"),
     ("GET", "/weather"),
     ("PUT", "/weather"),
     ("GET", "/entities"),
@@ -96,7 +98,9 @@ async fn send(app: &axum::Router, method: &str, path: &str) -> (StatusCode, bool
 }
 
 fn fill(path: &str) -> String {
-    path.replace("{id}", ID).replace("{entry_id}", ID)
+    path.replace("{id}", ID)
+        .replace("{entry_id}", ID)
+        .replace("{set_id}", ID)
 }
 
 /// The router's own 404 and 405 have an empty body. A handler's "not found" (an unknown zone, say)

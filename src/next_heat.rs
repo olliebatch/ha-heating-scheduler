@@ -71,10 +71,7 @@ pub fn next_heat(zone: &Zone, sets: &ScheduleSets, now: DateTime<Local>) -> Next
     });
     let found = (0..=LOOK_AHEAD_DAYS).find_map(|offset| {
         let date = now.date_naive().checked_add_days(Days::new(offset))?;
-        let set = zone
-            .schedule_set_id
-            .and_then(|id| sets.get(id))
-            .unwrap_or_else(|| sets.for_day(date.weekday()));
+        let set = sets.for_zone(Some(zone), date.weekday());
         set.entries
             .iter()
             .filter(|e| e.heating_state == HeatingState::On)
@@ -250,6 +247,30 @@ mod tests {
         let sensor = next_heat(&z, &sets, wed(12));
         assert_eq!(sensor.attributes["schedule_set"], "Study");
         assert_eq!(sensor.attributes["target_temperature"], 18.0);
+    }
+
+    #[test]
+    fn test_a_zones_own_days_win_over_its_set() {
+        let active = schedule("Normal", &[(7, 9, 20.0)]);
+        let own = schedule("Study", &[(15, 16, 18.0)]);
+        let thursday = schedule("Thursday", &[(10, 11, 19.0)]);
+        let (own_id, thursday_id) = (own.id, thursday.id);
+        let mut sets = ScheduleSets::from_schedule(active);
+        sets.sets.extend([own, thursday]);
+        let mut z = zone("Study");
+        z.schedule_set_id = Some(own_id);
+        z.day_sets.insert(chrono::Weekday::Wed, thursday_id);
+        z.day_sets.insert(chrono::Weekday::Thu, thursday_id);
+        // Wednesday 12:00: today's own set is past its 10:00, so the next is Thursday's 10:00
+        let sensor = next_heat(&z, &sets, wed(12));
+        assert_eq!(sensor.attributes["schedule_set"], "Thursday");
+        assert_eq!(
+            sensor.state,
+            Local
+                .with_ymd_and_hms(2026, 11, 12, 10, 0, 0)
+                .unwrap()
+                .to_rfc3339()
+        );
     }
 
     #[test]

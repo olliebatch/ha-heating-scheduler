@@ -153,6 +153,8 @@ pub struct Scheduled {
 /// What a zone is doing right now and why
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct ZoneStatus {
+    /// The schedule set the zone is following today (see [`ScheduleSets::for_zone`])
+    pub schedule_set_id: Uuid,
     pub state: HeatingState,
     /// The active entry's target from the zone's schedule set (On only)
     pub scheduled_target: Option<f64>,
@@ -205,10 +207,7 @@ pub fn zone_status(
     time: &chrono::DateTime<Local>,
 ) -> ZoneStatus {
     let begun_early = begun.and_then(|b| b.early_start.as_ref());
-    let schedule = zone
-        .and_then(|z| z.schedule_set_id)
-        .and_then(|id| sets.get(id))
-        .unwrap_or_else(|| sets.for_day(time.weekday()));
+    let schedule = sets.for_zone(zone, time.weekday());
     let mut entry = schedule.get_active_entry(time);
 
     // Start the next On period early when it's cold or windy (weather adjust zones only)
@@ -330,6 +329,7 @@ pub fn zone_status(
         _ => false,
     };
     ZoneStatus {
+        schedule_set_id: schedule.id,
         state,
         scheduled_target,
         target: match (&adjusted, held) {
@@ -1121,6 +1121,7 @@ mod tests {
     fn test_call_context() {
         use crate::weather::adjust::{Cause, Reason};
         let on = ZoneStatus {
+            schedule_set_id: Uuid::nil(),
             state: HeatingState::On,
             scheduled_target: Some(20.0),
             target: Some(21.5),
@@ -1687,6 +1688,73 @@ mod tests {
                 scheduled(HeatingState::On, Some(18.0))
             );
         }
+    }
+
+    /// Resolution order on the schedule path: the zone's own set for the day, else its pinned
+    /// set, else the house's set for the day, else the active set
+    #[test]
+    fn test_scheduled_follows_the_zones_own_days() {
+        use crate::schedule::{Schedule, ScheduleEntry, TimePeriod};
+        use chrono::TimeZone;
+        use chrono::Weekday::{Mon, Sat, Sun};
+
+        // Active "Base": Off all day. Each other set: On all day at its own target.
+        let mut sets = ScheduleSets::from_schedule(Schedule::new("Base"));
+        let mut all_day = |name: &str, target| {
+            let id = sets.create(name, None).unwrap().id;
+            sets.get_mut(id).unwrap().add_entry(
+                ScheduleEntry::new("All day", TimePeriod::new(0, 0, 0, 0), HeatingState::On)
+                    .with_target(target),
+            );
+            id
+        };
+        let house_weekend = all_day("House weekend", 21.0);
+        let pinned = all_day("Pinned", 18.0);
+        let own_weekend = all_day("Own weekend", 19.0);
+        sets.assign_days(house_weekend, &[Sat, Sun]).unwrap();
+
+        let mut zones = Zones::default();
+        zones.reconcile(None, &["climate.study".to_string()]);
+        let study = zones.zones[0].id;
+        let saturday = Local.with_ymd_and_hms(2026, 11, 14, 12, 0, 0).unwrap();
+        let monday = Local.with_ymd_and_hms(2026, 11, 16, 12, 0, 0).unwrap();
+        assert_eq!(saturday.weekday(), Sat);
+        assert_eq!(monday.weekday(), Mon);
+        let status = |zones: &Zones, now| {
+            let status = zone_status(Some(&zones.zones[0]), &sets, None, None, None, now);
+            (status.schedule_set_id, status.state, status.target)
+        };
+        use HeatingState::{Off, On};
+
+        // 4. Active set (no mapping anywhere on Monday)
+        assert_eq!(status(&zones, &monday), (sets.active_id, Off, None));
+        // 3. The house's set for the day
+        assert_eq!(status(&zones, &saturday), (house_weekend, On, Some(21.0)));
+        // 2. The pinned set beats the house's days
+        zones.set_schedule_set(study, Some(pinned)).unwrap();
+        assert_eq!(status(&zones, &saturday), (pinned, On, Some(18.0)));
+        assert_eq!(status(&zones, &monday), (pinned, On, Some(18.0)));
+        // 1. The zone's own set for the day beats both; other days are unchanged
+        zones
+            .assign_days(study, &sets, own_weekend, &[Sat, Sun])
+            .unwrap();
+        assert_eq!(status(&zones, &saturday), (own_weekend, On, Some(19.0)));
+        assert_eq!(status(&zones, &monday), (pinned, On, Some(18.0)));
+        // Without the pin, its other days follow the house again
+        zones.set_schedule_set(study, None).unwrap();
+        zones
+            .assign_days(study, &sets, own_weekend, &[Mon])
+            .unwrap();
+        assert_eq!(status(&zones, &monday), (own_weekend, On, Some(19.0)));
+        assert_eq!(status(&zones, &saturday), (house_weekend, On, Some(21.0)));
+        // Another zone (or no zone) isn't affected by this zone's days
+        let mut other = zones.clone();
+        other.zones[0].day_sets.clear();
+        assert_eq!(status(&other, &monday), (sets.active_id, Off, None));
+        assert_eq!(
+            zone_status(None, &sets, None, None, None, &saturday).schedule_set_id,
+            house_weekend
+        );
     }
 
     #[test]

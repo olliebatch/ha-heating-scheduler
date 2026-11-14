@@ -150,7 +150,8 @@ pub async fn rename_schedule_set<T: ClimateEntity + Clone>(
     Ok(Json(renamed))
 }
 
-/// Delete a set; the active set, the last set and a set zones follow are refused with 409.
+/// Delete a set; the active set, the last set, a set zones follow and a set a zone maps days to
+/// are refused with 409.
 /// (Refusing, rather than moving those zones to the active set, means a room's heating never
 /// changes as a side effect of tidying up sets.)
 pub async fn delete_schedule_set<T: ClimateEntity + Clone>(
@@ -171,6 +172,20 @@ pub async fn delete_schedule_set<T: ClimateEntity + Clone>(
                 format!(
                     "Schedule set is used by zone(s) {}; move them to another set first",
                     users.join(", ")
+                ),
+            ));
+        }
+        let mappers: Vec<String> = zones
+            .mapping_set(set_id)
+            .iter()
+            .map(|z| format!("\"{}\"", z.name))
+            .collect();
+        if !mappers.is_empty() {
+            return Err((
+                StatusCode::CONFLICT,
+                format!(
+                    "Schedule set is mapped to days in zone(s) {}; remove those days first",
+                    mappers.join(", ")
                 ),
             ));
         }
@@ -1188,6 +1203,37 @@ mod tests {
 
         assert_eq!(err.0, StatusCode::CONFLICT);
         assert!(err.1.contains("Whole house"), "{}", err.1);
+    }
+
+    #[tokio::test]
+    async fn test_delete_set_a_zone_maps_days_to_is_conflict() {
+        let (state, _dir) = test_state();
+        let holiday = create(&state, "Holiday").await;
+        let whole = {
+            let sets = state.schedule.read().unwrap();
+            let mut zones = state.zones.write().unwrap();
+            zones.reconcile(Some(vec![]), &[]);
+            let whole = zones.zones[0].id;
+            zones
+                .assign_days(whole, &sets, holiday.id, &[chrono::Weekday::Sat])
+                .unwrap();
+            whole
+        };
+
+        let err = delete_schedule_set(State(state.clone()), Path(holiday.id))
+            .await
+            .unwrap_err();
+        assert_eq!(err.0, StatusCode::CONFLICT);
+        assert!(err.1.contains("mapped to days"), "{}", err.1);
+        assert!(err.1.contains("Whole house"), "{}", err.1);
+        assert!(state.schedule.read().unwrap().get(holiday.id).is_some());
+
+        // Once the zone's mapping is removed, it can be deleted
+        state.zones.write().unwrap().clear_days(whole).unwrap();
+        delete_schedule_set(State(state.clone()), Path(holiday.id))
+            .await
+            .unwrap();
+        assert!(state.schedule.read().unwrap().get(holiday.id).is_none());
     }
 
     #[tokio::test]
