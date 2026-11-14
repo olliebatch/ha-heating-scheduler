@@ -72,7 +72,8 @@ CLIMATE_ENTITY=climate.living_room,climate.bedroom
 Schedules are kept as named sets in `data/schedule_sets.json`. A set can be assigned to days of the week
 (say "Weekday" on Mon-Fri and "Weekend" on Sat-Sun): on those days it drives the heating. On a day with no set
 assigned, the active set does, so with no assignments the active set drives every day. A zone following its own
-set (`schedule_set_id`) keeps following it on every day. The day is the local date: at midnight the next day's set
+set (`schedule_set_id`) keeps following it on every day, unless the zone maps days to sets of its own (see Zones).
+The day is the local date: at midnight the next day's set
 takes over, even part way through a period that crosses midnight.
 On first run, an existing `data/schedule.json` becomes the only (active) set and is left on disk as a backup.
 
@@ -84,8 +85,8 @@ On first run, an existing `data/schedule.json` becomes the only (active) set and
   first); 404 for an unknown set; 422 for a day name it doesn't know. Returns all sets
 - `POST /schedule_sets` - Create a set: `{"name": "Holiday", "copy_from": "<set id>"}` (`copy_from` optional; without it the set is Off all day). Returns the set
 - `PATCH /schedule_sets/{id}` - Rename: `{"name": "Away"}`. Returns the set
-- `DELETE /schedule_sets/{id}` - Delete a set (409 for the active or last set, a set a zone follows, or a set
-  assigned to days). Returns all sets
+- `DELETE /schedule_sets/{id}` - Delete a set (409 for the active or last set, a set a zone follows, a set
+  assigned to days, or a set a zone maps days to). Returns all sets
 - `POST /schedule_sets/{id}/activate` - Make a set active. Returns all sets
 - `POST /schedule_sets/{id}/entries` - Add an entry to a set (400 if start equals end, except 00:00 - 00:00). Returns the set.
   On entries need a `target_temp` between 5 and 30 °C; Off entries have none, e.g.
@@ -107,12 +108,25 @@ Each managed entity is in exactly one zone: a manual zone first, else its area's
 follows its own schedule set, or the active set when `schedule_set_id` is null (the default). A schedule set that a
 zone follows can't be deleted (409 naming the zones).
 
-- `GET /zones` - All zones
+A zone can also map days of the week to sets of its own (`day_sets`, e.g. "Weekday" on Mon-Fri and "Weekend" on
+Sat-Sun for the study only). The set a zone runs on a day is, in order: the set the zone maps that day to; else its
+`schedule_set_id`; else the set assigned to that day for the whole house; else the active set. This applies to
+Schedule, Shadow and Smart zones alike. A set a zone maps days to can't be deleted until the zone's days are removed
+(409 naming the zones).
+
+- `GET /zones` - All zones. A zone with days of its own has `day_sets`, e.g. `{"Mon": "<set id>", ...}` (left out
+  when it has none)
 - `POST /zones/refresh` - Fetch areas from Home Assistant again and rebuild the zones (502 if HA can't be reached)
 - `PATCH /zones/{id}` - `{"name": "Office", "schedule_set_id": "<set id>"}`; both optional, `null` set id follows the active set
 - `POST /zones/merge` - Merge area zones into the first: `{"zone_ids": ["<id>", "<id>"], "name": "Downstairs"}`
 - `POST /zones` - Manual zone: `{"name": "Loft", "entity_ids": ["climate.loft"]}` (its entities leave their area zones)
 - `DELETE /zones/{id}` - Delete a manual or merged zone; its entities fall back to their area zones or Whole house
+- `PUT /zones/{id}/schedule_sets/{set_id}/days` - Map exactly these days to a set for this zone only:
+  `{"days": ["Sat", "Sun"]}` (`Mon` to `Sun`; full names and any case work too). Days the zone mapped to that set
+  that aren't listed are unmapped, and `[]` unmaps the set. 409, naming the day and its set, if the zone already maps
+  a day to another set (unmap it there first); 404 for an unknown zone or set; 422 for a day name it doesn't know.
+  Returns the zone
+- `DELETE /zones/{id}/days` - Remove all of a zone's own day mappings. Returns the zone
 
 ### Weather
 With "weather adjust" on, a zone's On target is adjusted for the weather from a Home Assistant weather entity
@@ -185,7 +199,7 @@ it isn't counted as driven during the boost; driving starts afresh when the boos
   `sensor_entity_id` null (use the TRVs) or a `sensor.*` entity, and `trv_offset_c` -5 to 5 °C (added to the TRVs'
   average when deciding whether to drive them harder; never to a sensor's reading). Anything else is a 400 naming the field. Schedule and
   shadow zones are heated by their schedule, and smart zones by their smart decision (below)
-- `GET /zones` includes each zone's `status`: `state`, `scheduled_target`, adjusted `target`, `reasons`,
+- `GET /zones` includes each zone's `status`: `schedule_set_id` (the set it is running today), `state`, `scheduled_target`, adjusted `target`, `reasons`,
   `raw_target` (before clamping, rounding and holding), `held` and `early_start` (`period_start`, `lead_minutes`
   allowed by the weather, `minutes_early` it actually started, and `causes`) while a period is being started early, and
   `late_finish` (`period_end`, `extra_minutes`, `causes`) while one is kept going past its end, and `warm_up`
