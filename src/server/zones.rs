@@ -334,6 +334,49 @@ pub async fn update_zone<T: ClimateEntity + Clone>(
 }
 
 #[derive(Serialize, Deserialize)]
+pub struct ZoneDaysRequest {
+    /// "Mon" to "Sun" (full names and any case also work)
+    pub days: Vec<chrono::Weekday>,
+}
+
+/// Map exactly these days of the week to a set for this zone only (an empty list unmaps the set).
+/// On those days the zone follows that set, whatever set it's pinned to and whatever the house's
+/// day assignments say. 404 for an unknown zone or set; a day the zone already maps to another set
+/// is refused with 409, naming the day and the set. Returns the zone.
+pub async fn assign_zone_days<T: ClimateEntity + Clone>(
+    State(state): State<AppState<T>>,
+    Path((zone_id, set_id)): Path<(Uuid, Uuid)>,
+    Json(payload): Json<ZoneDaysRequest>,
+) -> Result<Json<Zone>, ApiError> {
+    // Lock order everywhere: schedule sets, then zones. Holding the sets until the zones are
+    // saved means the set can't be deleted in between.
+    let sets = state.schedule.read().unwrap();
+    if sets.get(set_id).is_none() {
+        return Err((StatusCode::NOT_FOUND, "Schedule set not found".to_string()));
+    }
+    let zone = update_zones(&state, |zones, _| {
+        zones
+            .assign_days(zone_id, &sets, set_id, &payload.days)
+            .map_err(zone_error)?;
+        Ok(zones.get(zone_id).unwrap().clone())
+    })?;
+    Ok(Json(zone))
+}
+
+/// Remove all of a zone's own day mappings, so it follows its pinned set or the house's days
+/// again. Returns the zone.
+pub async fn clear_zone_days<T: ClimateEntity + Clone>(
+    State(state): State<AppState<T>>,
+    Path(zone_id): Path<Uuid>,
+) -> Result<Json<Zone>, ApiError> {
+    let zone = update_zones(&state, |zones, _| {
+        zones.clear_days(zone_id).map_err(zone_error)?;
+        Ok(zones.get(zone_id).unwrap().clone())
+    })?;
+    Ok(Json(zone))
+}
+
+#[derive(Serialize, Deserialize)]
 pub struct MergeZonesRequest {
     pub zone_ids: Vec<Uuid>,
     pub name: Option<String>,
@@ -476,6 +519,137 @@ mod tests {
         let err = refresh_zones(State(state)).await.unwrap_err();
 
         assert_eq!(err.0, StatusCode::BAD_GATEWAY);
+    }
+
+    #[tokio::test]
+    async fn test_zone_days_set_clear_and_persist() {
+        use chrono::Weekday::{Fri, Mon, Sat, Sun};
+        let (state, _dir) = test_state();
+        let zones = refresh_zones(State(state.clone())).await.unwrap().0;
+        let study = zone_named(&zones, "Study").id;
+        let (weekday, weekend) = {
+            let mut sets = state.schedule.write().unwrap();
+            (
+                sets.create("Weekday", None).unwrap().id,
+                sets.create("Weekend", None).unwrap().id,
+            )
+        };
+        let assign = |set_id: Uuid, days: &str| {
+            let body = format!(r#"{{"days": {days}}}"#);
+            assign_zone_days(
+                State(state.clone()),
+                Path((study, set_id)),
+                Json::<ZoneDaysRequest>::from_bytes(body.as_bytes()).unwrap(),
+            )
+        };
+        let saved = || {
+            let zones = crate::zones::load_zones(&state.zones_file_path).unwrap();
+            zones.get(study).unwrap().day_sets.clone()
+        };
+
+        let zone = assign(weekday, r#"["Mon","tuesday","WED","Thu","Fri"]"#)
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(zone.day_sets.len(), 5);
+        assert_eq!(zone.day_sets[&Mon], weekday);
+        assert_eq!(
+            assign(weekend, r#"["Sat","Sun"]"#)
+                .await
+                .unwrap()
+                .0
+                .day_sets[&Sun],
+            weekend
+        );
+        let on_disk = saved();
+        assert_eq!(on_disk.len(), 7);
+        assert_eq!(on_disk[&Fri], weekday);
+        assert_eq!(on_disk[&Sat], weekend);
+
+        // A day the zone maps to another set is refused, naming it, and nothing changes
+        let err = assign(weekend, r#"["Fri","Sat","Sun"]"#).await.unwrap_err();
+        assert_eq!(err.0, StatusCode::CONFLICT);
+        assert!(err.1.contains("Fri (\"Weekday\")"), "{}", err.1);
+        assert_eq!(saved(), on_disk);
+
+        // Other zones keep no mapping of their own
+        let lounge = state
+            .zones
+            .read()
+            .unwrap()
+            .zones
+            .iter()
+            .find(|z| z.name == "Lounge")
+            .unwrap()
+            .day_sets
+            .clone();
+        assert!(lounge.is_empty());
+
+        // Unknown set or zone: 404
+        assert_eq!(
+            assign(Uuid::new_v4(), r#"["Mon"]"#).await.unwrap_err().0,
+            StatusCode::NOT_FOUND
+        );
+        let err = assign_zone_days(
+            State(state.clone()),
+            Path((Uuid::new_v4(), weekday)),
+            Json(ZoneDaysRequest { days: vec![Mon] }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.0, StatusCode::NOT_FOUND);
+
+        // An empty list unmaps one set; DELETE clears the rest
+        let zone = assign(weekday, "[]").await.unwrap().0;
+        assert_eq!(zone.day_sets.len(), 2);
+        assert_eq!(saved().len(), 2);
+        let zone = clear_zone_days(State(state.clone()), Path(study))
+            .await
+            .unwrap()
+            .0;
+        assert!(zone.day_sets.is_empty());
+        assert!(saved().is_empty());
+        let raw = std::fs::read_to_string(&state.zones_file_path).unwrap();
+        assert!(!raw.contains("day_sets"), "written only when set");
+    }
+
+    #[tokio::test]
+    async fn test_get_zones_reports_todays_set() {
+        let (state, _dir) = test_state();
+        let zones = refresh_zones(State(state.clone())).await.unwrap().0;
+        let study = zone_named(&zones, "Study").id;
+        let (active, every_day) = {
+            let mut sets = state.schedule.write().unwrap();
+            (sets.active_id, sets.create("Every day", None).unwrap().id)
+        };
+        {
+            let sets = state.schedule.read().unwrap();
+            let mut zones = state.zones.write().unwrap();
+            zones
+                .assign_days(study, &sets, every_day, &crate::schedule::sets::ALL_DAYS)
+                .unwrap();
+        }
+        let views = get_zones(State(state.clone())).await.0;
+        for view in &views {
+            let expected = if view.zone.id == study {
+                every_day
+            } else {
+                active
+            };
+            assert_eq!(view.status.schedule_set_id, expected, "{}", view.zone.name);
+        }
+        let json = serde_json::to_value(&views).unwrap();
+        let study_json = json
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|v| v["name"] == "Study")
+            .unwrap();
+        assert_eq!(
+            study_json["status"]["schedule_set_id"],
+            every_day.to_string()
+        );
+        assert_eq!(study_json["day_sets"]["Mon"], every_day.to_string());
     }
 
     #[tokio::test]

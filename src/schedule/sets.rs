@@ -1,4 +1,5 @@
 use super::{HeatingState, Schedule};
+use crate::zones::Zone;
 use chrono::Weekday;
 use serde::{Deserialize, Serialize, Serializer};
 use std::collections::HashMap;
@@ -65,6 +66,21 @@ impl ScheduleSets {
             .get(&day)
             .and_then(|id| self.get(*id))
             .unwrap_or_else(|| self.active())
+    }
+
+    /// The set that drives a zone's heating on `day`, in this order: the set the zone maps `day`
+    /// to (its own `day_sets`), else the set the zone is pinned to (`schedule_set_id`), else
+    /// [`Self::for_day`] (the house's set for `day`, else the active set). A set that no longer
+    /// exists is skipped. The one place a zone's set is resolved: the scheduler, Smart, Shadow
+    /// and the next-heat sensors all use it.
+    pub fn for_zone(&self, zone: Option<&Zone>, day: Weekday) -> &Schedule {
+        zone.and_then(|z| z.day_sets.get(&day))
+            .and_then(|id| self.get(*id))
+            .or_else(|| {
+                zone.and_then(|z| z.schedule_set_id)
+                    .and_then(|id| self.get(id))
+            })
+            .unwrap_or_else(|| self.for_day(day))
     }
 
     /// The days assigned to a set, Monday first
@@ -220,7 +236,7 @@ pub const ALL_DAYS: [Weekday; 7] = [
 ];
 
 /// Save `day_sets` Monday first, so the file doesn't reorder itself on every save
-fn days_in_order<S: Serializer>(
+pub fn days_in_order<S: Serializer>(
     day_sets: &HashMap<Weekday, Uuid>,
     serializer: S,
 ) -> Result<S::Ok, S::Error> {
@@ -455,5 +471,60 @@ mod tests {
 
         let loaded: ScheduleSets = serde_json::from_str(&text).unwrap();
         assert_eq!(loaded.day_sets, sets.day_sets);
+    }
+
+    /// A Whole house zone with nothing set
+    fn plain_zone() -> Zone {
+        let mut zones = crate::zones::Zones::default();
+        zones.reconcile(None, &["climate.a".to_string()]);
+        zones.zones[0].clone()
+    }
+
+    #[test]
+    fn test_for_zone_resolution_order() {
+        let (mut sets, weekend, holiday) = three_sets();
+        let own = sets.create("Own", None).unwrap().id;
+        let mut zone = plain_zone();
+        // 4. The active set
+        assert_eq!(sets.for_zone(Some(&zone), Sat).id, sets.active_id);
+        // 3. The house's set for the day
+        sets.assign_days(weekend, &[Sat]).unwrap();
+        assert_eq!(sets.for_zone(Some(&zone), Sat).id, weekend);
+        // 2. The pinned set
+        zone.schedule_set_id = Some(holiday);
+        assert_eq!(sets.for_zone(Some(&zone), Sat).id, holiday);
+        // 1. The zone's own set for the day; other days fall through
+        zone.day_sets.insert(Sat, own);
+        assert_eq!(sets.for_zone(Some(&zone), Sat).id, own);
+        assert_eq!(sets.for_zone(Some(&zone), Mon).id, holiday);
+        // No zone: the house's days, else the active set
+        assert_eq!(sets.for_zone(None, Sat).id, weekend);
+        assert_eq!(sets.for_zone(None, Mon).id, sets.active_id);
+        // A mapped or pinned set that no longer exists is skipped
+        zone.day_sets.insert(Sat, Uuid::new_v4());
+        assert_eq!(sets.for_zone(Some(&zone), Sat).id, holiday);
+        zone.schedule_set_id = Some(Uuid::new_v4());
+        assert_eq!(sets.for_zone(Some(&zone), Sat).id, weekend);
+    }
+
+    /// With no per-zone days, every zone gets the same set as before they existed: its pinned
+    /// set, else the house's set for the day
+    #[test]
+    fn test_for_zone_without_own_days_is_unchanged() {
+        let (mut sets, weekend, holiday) = three_sets();
+        sets.assign_days(weekend, &[Sat, Sun]).unwrap();
+        let before = |zone: &Zone, day| {
+            zone.schedule_set_id
+                .and_then(|id| sets.get(id))
+                .unwrap_or_else(|| sets.for_day(day))
+                .id
+        };
+        for pinned in [None, Some(holiday), Some(weekend), Some(Uuid::new_v4())] {
+            let mut zone = plain_zone();
+            zone.schedule_set_id = pinned;
+            for day in ALL_DAYS {
+                assert_eq!(sets.for_zone(Some(&zone), day).id, before(&zone, day));
+            }
+        }
     }
 }

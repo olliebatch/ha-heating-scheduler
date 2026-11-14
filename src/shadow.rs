@@ -37,10 +37,7 @@ pub fn zone_tick(
     previous: Option<&Decision>,
     now: DateTime<Local>,
 ) -> Option<Tick> {
-    let schedule = zone
-        .schedule_set_id
-        .and_then(|id| sets.get(id))
-        .unwrap_or_else(|| sets.for_day(now.weekday()));
+    let schedule = sets.for_zone(Some(zone), now.weekday());
     let (comfort, inside) = comfort_time(schedule, now.time(), sets.default_target_temp)?;
     let decision = decide(&Inputs {
         now,
@@ -664,6 +661,54 @@ mod tests {
             assert_eq!(t.decision.decision.comfort, own_afternoon);
             assert_eq!(t.decision.schedule_start, time(13, 0));
         }
+    }
+
+    /// Resolution order on the Smart/Shadow path: the zone's own set for the day, else its pinned
+    /// set, else the house's set for the day, else the active set
+    #[test]
+    fn test_zone_tick_follows_the_zones_own_days() {
+        use chrono::Weekday::{Mon, Sat};
+        let weather = WeatherStatus::default();
+        // Active "Evenings": On 17:00-22:00. Each other set has one On period of its own.
+        let (mut zone, mut sets) = shadow_zone(ZoneMode::Smart);
+        let mut add = |name: &str, start: u32, end: u32| {
+            let id = sets.create(name, None).unwrap().id;
+            sets.get_mut(id).unwrap().add_entry(
+                ScheduleEntry::new(name, TimePeriod::new(start, 0, end, 0), HeatingState::On)
+                    .with_target(20.0),
+            );
+            id
+        };
+        let house = add("House Saturday", 9, 12);
+        let pinned = add("Pinned", 13, 15);
+        let own = add("Own Saturday", 6, 8);
+        sets.assign_days(house, &[Sat]).unwrap();
+
+        let saturday = Local.with_ymd_and_hms(2026, 11, 14, 5, 0, 0).unwrap();
+        let monday = Local.with_ymd_and_hms(2026, 11, 16, 5, 0, 0).unwrap();
+        assert_eq!(saturday.weekday(), Sat);
+        assert_eq!(monday.weekday(), Mon);
+        let start = |zone: &Zone, sets: &ScheduleSets, now| {
+            zone_tick(zone, sets, &off(), None, &weather, Some(18.0), None, now)
+                .unwrap()
+                .decision
+                .schedule_start
+        };
+
+        // 4. The active set
+        assert_eq!(start(&zone, &sets, monday), time(17, 0));
+        // 3. The house's set for the day
+        assert_eq!(start(&zone, &sets, saturday), time(9, 0));
+        // 2. The pinned set
+        zone.schedule_set_id = Some(pinned);
+        assert_eq!(start(&zone, &sets, saturday), time(13, 0));
+        // 1. The zone's own set for the day; other days keep the pin
+        zone.day_sets.insert(Sat, own);
+        assert_eq!(start(&zone, &sets, saturday), time(6, 0));
+        assert_eq!(start(&zone, &sets, monday), time(13, 0));
+        // Shadow zones resolve the same way
+        zone.mode = ZoneMode::Shadow;
+        assert_eq!(start(&zone, &sets, saturday), time(6, 0));
     }
 
     #[test]

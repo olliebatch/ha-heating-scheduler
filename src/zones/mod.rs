@@ -1,11 +1,13 @@
 use anyhow::{Context, Result};
+use chrono::Weekday;
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::Path;
 use uuid::Uuid;
 
 use crate::schedule::TimePeriod;
+use crate::schedule::sets::{ALL_DAYS, ScheduleSets, days_in_order};
 use crate::weather::adjust::WindExposure;
 use crate::weather::warmup::ColdWarmups;
 
@@ -38,6 +40,16 @@ pub struct Zone {
     /// The schedule set this zone follows; None follows the active set
     #[serde(default)]
     pub schedule_set_id: Option<Uuid>,
+    /// The zone's own set for each day of the week ("Mon" to "Sun"); a day can have at most one.
+    /// A day listed here beats `schedule_set_id` and the house's day assignments (see
+    /// [`ScheduleSets::for_zone`]). Left out of the JSON when empty, so zones saved before it
+    /// existed load and save unchanged.
+    #[serde(
+        default,
+        serialize_with = "days_in_order",
+        skip_serializing_if = "HashMap::is_empty"
+    )]
+    pub day_sets: HashMap<Weekday, Uuid>,
     /// Times of day the zone usually gets direct sun
     #[serde(default)]
     pub sun_windows: Vec<TimePeriod>,
@@ -104,6 +116,7 @@ impl Zone {
             area_ids: Vec::new(),
             entity_ids: Vec::new(),
             schedule_set_id: None,
+            day_sets: HashMap::new(),
             sun_windows: Vec::new(),
             wind_exposure: WindExposure::default(),
             weather_adjust: false,
@@ -159,6 +172,14 @@ impl Zones {
         let mut zones = self.clone();
         zones.reconcile(Some(areas.to_vec()), &managed);
         zones.zone_for(entity_id).map(|z| z.name.clone())
+    }
+
+    /// Zones that map a day of the week to the given schedule set
+    pub fn mapping_set(&self, set_id: Uuid) -> Vec<&Zone> {
+        self.zones
+            .iter()
+            .filter(|z| z.day_sets.values().any(|id| *id == set_id))
+            .collect()
     }
 
     /// Zones following the given schedule set
@@ -440,6 +461,63 @@ impl Zones {
             .find(|z| z.id == id)
             .ok_or(ZoneError::NotFound)?;
         zone.schedule_set_id = set_id;
+        Ok(())
+    }
+
+    /// Map exactly `days` of a zone to `set_id`: days the zone mapped to it that aren't listed
+    /// are unmapped (an empty list unmaps the set). A day the zone already maps to another set is
+    /// refused, and nothing changes. The set must be in `sets`.
+    pub fn assign_days(
+        &mut self,
+        id: Uuid,
+        sets: &ScheduleSets,
+        set_id: Uuid,
+        days: &[Weekday],
+    ) -> Result<(), ZoneError> {
+        if sets.get(set_id).is_none() {
+            return Err(ZoneError::Invalid(format!(
+                "Schedule set {} not found",
+                set_id
+            )));
+        }
+        let zone = self
+            .zones
+            .iter_mut()
+            .find(|z| z.id == id)
+            .ok_or(ZoneError::NotFound)?;
+        let taken: Vec<String> = ALL_DAYS
+            .into_iter()
+            .filter(|day| days.contains(day))
+            .filter_map(|day| {
+                let other = *zone.day_sets.get(&day)?;
+                if other == set_id {
+                    return None;
+                }
+                let name = sets.get(other).map(|s| s.name.as_str()).unwrap_or("?");
+                Some(format!("{} (\"{}\")", day, name))
+            })
+            .collect();
+        if !taken.is_empty() {
+            return Err(ZoneError::Conflict(format!(
+                "Already mapped to another set in this zone: {}; unmap them there first",
+                taken.join(", ")
+            )));
+        }
+        zone.day_sets.retain(|_, set| *set != set_id);
+        for day in days {
+            zone.day_sets.insert(*day, set_id);
+        }
+        Ok(())
+    }
+
+    /// Remove all of a zone's own day mappings
+    pub fn clear_days(&mut self, id: Uuid) -> Result<(), ZoneError> {
+        let zone = self
+            .zones
+            .iter_mut()
+            .find(|z| z.id == id)
+            .ok_or(ZoneError::NotFound)?;
+        zone.day_sets.clear();
         Ok(())
     }
 }
@@ -855,5 +933,66 @@ mod tests {
         );
         assert!(!zones.get(id).unwrap().weather_adjust, "nothing changed");
         assert_eq!(zones.get(id).unwrap().max_late_finish_minutes, 45);
+    }
+
+    #[test]
+    fn test_assign_days_refuses_overlap_and_changes_nothing() {
+        use chrono::Weekday::{Fri, Mon, Sat, Sun};
+        let mut sets = ScheduleSets::from_schedule(crate::schedule::Schedule::new("Base"));
+        let weekday = sets.create("Weekday", None).unwrap().id;
+        let weekend = sets.create("Weekend", None).unwrap().id;
+        let mut zones = Zones::default();
+        zones.reconcile(None, &all_managed());
+        let id = zones.zones[0].id;
+
+        zones.assign_days(id, &sets, weekday, &[Mon, Fri]).unwrap();
+        zones.assign_days(id, &sets, weekend, &[Sat, Sun]).unwrap();
+        let before = zones.clone();
+        assert_eq!(
+            zones.assign_days(id, &sets, weekend, &[Fri, Sat]),
+            Err(ZoneError::Conflict(
+                "Already mapped to another set in this zone: Fri (\"Weekday\"); unmap them there first"
+                    .to_string()
+            ))
+        );
+        assert_eq!(zones.zones, before.zones);
+        // Reassigning a set's own days replaces them
+        zones.assign_days(id, &sets, weekend, &[Sun]).unwrap();
+        assert_eq!(zones.zones[0].day_sets.get(&Sat), None);
+        assert_eq!(zones.mapping_set(weekday).len(), 1);
+        assert!(zones.mapping_set(sets.active_id).is_empty());
+        // Unknown set or zone
+        assert!(matches!(
+            zones.assign_days(id, &sets, Uuid::new_v4(), &[Mon]),
+            Err(ZoneError::Invalid(_))
+        ));
+        assert_eq!(
+            zones.assign_days(Uuid::new_v4(), &sets, weekday, &[Mon]),
+            Err(ZoneError::NotFound)
+        );
+    }
+
+    #[test]
+    fn test_day_sets_json_is_written_only_when_set() {
+        use chrono::Weekday::{Sat, Wed};
+        let mut zones = Zones::default();
+        zones.reconcile(None, &all_managed());
+        // An existing file, saved before per-zone days: loads and saves byte for byte
+        let old = serde_json::to_string_pretty(&zones).unwrap();
+        assert!(!old.contains("day_sets"));
+        let loaded: Zones = serde_json::from_str(&old).unwrap();
+        assert!(loaded.zones[0].day_sets.is_empty());
+        assert_eq!(serde_json::to_string_pretty(&loaded).unwrap(), old);
+
+        let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
+        zones.zones[0].day_sets.insert(Sat, a);
+        zones.zones[0].day_sets.insert(Wed, b);
+        let text = serde_json::to_string(&zones).unwrap();
+        assert!(
+            text.contains(&format!(r#""day_sets":{{"Wed":"{b}","Sat":"{a}"}}"#)),
+            "Monday first: {text}"
+        );
+        let loaded: Zones = serde_json::from_str(&text).unwrap();
+        assert_eq!(loaded.zones[0].day_sets, zones.zones[0].day_sets);
     }
 }

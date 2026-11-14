@@ -104,6 +104,14 @@ pub fn router(app_state: AppState<ClimateEntityWrapper>) -> Router {
             patch(update_zone::<ClimateEntityWrapper>).delete(delete_zone::<ClimateEntityWrapper>),
         )
         .route(
+            "/zones/{id}/schedule_sets/{set_id}/days",
+            put(zones::assign_zone_days::<ClimateEntityWrapper>),
+        )
+        .route(
+            "/zones/{id}/days",
+            delete(zones::clear_zone_days::<ClimateEntityWrapper>),
+        )
+        .route(
             "/weather",
             get(weather::get_weather::<ClimateEntityWrapper>)
                 .put(weather::set_weather_entity::<ClimateEntityWrapper>),

@@ -80,13 +80,23 @@ add to it in the same change when you learn something the next contributor would
   `tests/next_heat.rs` for the posts, dry run and failures against a fake HA. The loop itself has no test.
 
 ## Schedule sets and days (src/schedule/sets.rs)
-- Which schedule an entity follows: its zone's `schedule_set_id` if set, else `ScheduleSets::for_day`
-  (the set assigned to today's weekday in `day_sets`, else the active set). Only two places
-  resolve it: `scheduler::zone_status` (the loop, `GET /zones`, the zone preview) and
-  `shadow::zone_tick` (Smart and Shadow). Any new heating decision must resolve it the same way,
-  with `for_day`, not `sets.active()`, and needs its own test: swapping either existing line back
-  to `active()` fails only that line's test (`test_scheduled_follows_the_days_set`,
-  `test_zone_tick_follows_the_days_set`).
+- Which schedule an entity follows is `ScheduleSets::for_zone(zone, weekday)`, in this order: the
+  zone's own `day_sets` entry for the day, else its `schedule_set_id`, else `ScheduleSets::for_day`
+  (the house's `day_sets` entry for the day, else the active set). A set id that no longer exists
+  is skipped. Three callers: `scheduler::zone_status` (the loop, `GET /zones`, the zone preview,
+  and `status.schedule_set_id`), `shadow::zone_tick` (Smart and Shadow) and `next_heat`. Any new
+  heating decision must call `for_zone`, not `for_day` or `sets.active()`, and needs its own test:
+  reverting either decision line fails its test (`test_scheduled_follows_the_zones_own_days`,
+  `test_zone_tick_follows_the_zones_own_days`, and the older `..._follows_the_days_set` pair).
+- A zone's `day_sets` (`PUT /zones/{id}/schedule_sets/{set_id}/days`, `DELETE /zones/{id}/days`)
+  works like the house's: `Zones::assign_days` refuses a day the zone maps to another set and
+  changes nothing. Deleting a set is refused while a zone maps a day to it (`Zones::mapping_set`),
+  as for one a zone is pinned to (`Zones::using_set`). The zone's map is saved with the zone in
+  zones.json, left out when empty and written Monday first (`sets::days_in_order`), so it is
+  also absent from `GET /zones` for a zone with no days: clients must treat absent as none.
+- Adding a level to the order: change `for_zone` only, then add a step to both path tests. A
+  new way for a zone to reference a set also needs a delete refusal next to `using_set` and
+  `mapping_set` in `delete_schedule_set`, or deleting the set silently drops that level.
 - `active()` alone is right only for the legacy `/schedule` routes, which edit the active set.
 - `day_sets` maps each weekday to at most one set, so overlap can't be stored; `assign_days`
   checks every day before changing anything and refuses a day held by another set. Deleting a
@@ -107,7 +117,9 @@ add to it in the same change when you learn something the next contributor would
   `skip_serializing_if` for its empty value. `load_or_migrate` saves whenever the loaded JSON
   differs from the file, so without the skip every existing install's file is rewritten on its
   next start (`day_sets` does this). Check by restarting on the same data: the file's sha and
-  mtime should not change.
+  mtime should not change. Exception: `zones.json` is saved on every start anyway (`main` saves
+  after `reconcile`), so its mtime always changes; check its contents, and prove the skip with a
+  serde round-trip test (`test_day_sets_json_is_written_only_when_set`) instead.
 - Tests that depend on the date pin it with `Local.with_ymd_and_hms` (2026-11-14 is a Saturday,
   2026-11-16 a Monday) and assert the weekday, rather than using `Local::now()`.
 - `smart::decide` has early returns (no room temperature, no weather) for falling back to the
